@@ -1,36 +1,79 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Billora
 
-## Getting Started
+Billora is an invoice operations application built with Next.js and Supabase. The repository currently contains the web foundation and the initial Supabase schema. Authentication, workspace screens, invoice upload, and processing workers are not implemented yet; do not deploy it as a working invoice service until those workflows and their security controls are complete.
 
-First, run the development server:
+## Requirements
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- Node.js 20.9 or newer
+- npm
+- A Supabase project for database-backed development
+
+## Local development
+
+1. Install dependencies with `npm ci`.
+2. Copy `.env.example` to `.env.local` and fill in the values required by your environment.
+3. Start the Next.js development server with `npm run dev`.
+4. Open `http://localhost:3001`.
+
+Keep secret keys server-side, never add a secret to a `NEXT_PUBLIC_` variable, and use separate credentials for local, preview, and production environments. The publishable key is designed for client use when a browser integration is added; access control must still rely on authenticated sessions and database row-level security.
+
+## Project structure
+
+```text
+app/
+  api/health/route.ts            # liveness probe (no dependencies)
+  api/health/supabase/route.ts   # Supabase connectivity check (service_role, no secrets in output)
+  lib/env.ts                     # zod-validated env, single readable error when misconfigured
+  lib/logger.ts                  # JSON logs with automatic secret redaction
+  lib/api-response.ts            # ok()/fail() envelope, generic client error messages
+  lib/validation.ts              # shared zod schemas (UUIDs, pagination)
+  lib/supabase/admin.ts          # lazy service_role client (server only)
+  lib/supabase/server.ts         # back-compat re-export (lazy Proxy)
+  lib/supabase/client.ts         # browser client (publishable key only)
+middleware.ts                    # request id + basic in-memory /api rate limiting
+scripts/smoke.mjs                # `npm run smoke` — hits both health endpoints
+scripts/secret-scan.mjs          # `npm run secret-scan` — blocks secret-looking staged diffs
+supabase/migrations/             # workspace-scoped schema + RLS (source of truth)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Quality checks
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `npm run lint` runs ESLint.
+- `npm run typecheck` runs the TypeScript compiler without emitting files.
+- `npm run secret-scan` fails on secret-looking staged diffs.
+- `npm run check` runs secret-scan, lint, and typecheck.
+- `npm run build` creates an optimized production build.
+- `npm run start` serves the production build.
+- `npm run smoke` hits `/api/health` and `/api/health/supabase` (dev server must be running).
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`GET /api/health` is a process liveness check only. `GET /api/health/supabase` verifies service_role connectivity with a `workspaces` count query and returns `{ ok, data }` or a generic `{ ok:false, error }` envelope — never stack traces or secrets.
 
-## Learn More
+## Security baseline (implemented)
 
-To learn more about Next.js, take a look at the following resources:
+- Zod-validated env at request time (`app/lib/env.ts`); one clear error instead of `supabaseUrl is required` crashes.
+- Lazy Supabase admin client; no secrets in browser bundles, no `NEXT_PUBLIC_` secrets.
+- Generic API error envelope; logs carry `x-request-id`, secrets auto-redacted by `app/lib/logger.ts`.
+- Security headers in `next.config.ts` (+ CSP and HSTS in production), `middleware.ts` rate-limits `/api/*` (60 req/min/IP, in-memory — use Redis/Upstash for multi-instance prod).
+- `robots.ts` disallows indexing; error boundaries never render internals.
+- CI runs secret-scan + lint + typecheck + build; build uses placeholder public env only.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Supabase
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The initial migration is in `supabase/migrations`. It defines workspace-scoped records, private storage buckets, and row-level security policies. Review the migration and test the policies against an isolated development project before applying it to production. Never disable RLS to make an application query work. Application endpoints and server actions must independently authenticate each request, authorize the workspace operation, validate input, and avoid returning invoice contents or secrets in errors and logs.
 
-## Deploy on Vercel
+`supabase/config.toml` points its seed path at `./seed.sql`, which is intentionally absent — `supabase db reset` will warn but still work. Add a `supabase/seed.sql` with non-sensitive fixture rows if you want deterministic local resets.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The schema expects invoice content to be encrypted by a trusted server or worker before storage. Key management, upload validation, retention enforcement, job execution, backups, and restore procedures are not implemented in this repository.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Deployment gate
+
+Before serving real users or financial documents:
+
+- Implement and test sign-in, session handling, workspace authorization, and account recovery.
+- Add authenticated invoice upload and processing paths with strict size/type validation, malware scanning, rate limits, and private object access.
+- Verify RLS behavior with tests for cross-workspace access and role changes.
+- Establish encryption-key storage and rotation, retention/deletion jobs, audit logging, monitoring, and backup/restore drills.
+- Configure production environment variables, HTTPS, Supabase redirect allow-lists, email delivery, and operational alerting.
+- Add end-to-end tests for critical user and data-isolation workflows.
+
+The app sets baseline response security headers and does not expose stack traces in its error pages. Review headers and the platform configuration together before deployment; security headers alone do not replace authentication, authorization, or application-specific content security policy.
