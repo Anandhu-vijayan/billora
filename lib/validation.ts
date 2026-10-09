@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { getEnv } from '@/app/lib/env'
+import { getEnv } from '@/lib/env'
 
 export const workspaceIdSchema = z.string().uuid('workspaceId must be a UUID')
 

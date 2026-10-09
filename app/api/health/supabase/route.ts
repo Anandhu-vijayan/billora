@@ -1,8 +1,8 @@
-import { fail, ok, toPublicErrorMessage } from '@/app/lib/api-response'
-import { getPublicEnvInfo } from '@/app/lib/env'
-import { logger } from '@/app/lib/logger'
-import { getSupabaseAdmin } from '@/app/lib/supabase/admin'
-import { requireServerEnv } from '@/app/lib/validation'
+import { fail, ok, toPublicErrorMessage } from '@/lib/api-response'
+import { getPublicEnvInfo } from '@/lib/env'
+import { logger } from '@/lib/logger'
+import { getSupabaseAdmin } from '@/lib/supabase/server'
+import { requireServerEnv } from '@/lib/validation'
 
 export const dynamic = 'force-dynamic'
 

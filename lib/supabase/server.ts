@@ -1,5 +1,6 @@
+// lib/supabase/server.ts — Privileged service role execution pool.
 import { createClient } from '@supabase/supabase-js'
-import { getEnv } from '@/app/lib/env'
+import { getEnv } from '@/lib/env'
 
 // Server-side only — uses the secret key. NEVER import from client components.
 let cached: ReturnType<typeof createClient> | null = null
@@ -15,3 +16,12 @@ export function getSupabaseAdmin() {
   })
   return cached
 }
+
+// Back-compat: lazy Proxy so importing this module never throws
+// ("supabaseUrl is required"). New server code should call getSupabaseAdmin().
+type Admin = ReturnType<typeof createClient>
+export const supabaseAdmin = new Proxy({} as Admin, {
+  get(_t, prop) {
+    return Reflect.get(getSupabaseAdmin(), prop)
+  },
+})

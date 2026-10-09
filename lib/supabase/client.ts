@@ -1,5 +1,6 @@
+// lib/supabase/client.ts — Anonymous client instantiation layer.
 import { createBrowserClient } from '@supabase/ssr'
-import { getEnv } from '@/app/lib/env'
+import { getEnv } from '@/lib/env'
 
 export const createClient = () => {
   // Validated lazily so a missing env throws one clear error, not "supabaseUrl is required".

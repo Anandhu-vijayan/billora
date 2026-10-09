@@ -50,9 +50,9 @@ supabase/migrations/             # workspace-scoped schema + RLS (source of trut
 
 ## Security baseline (implemented)
 
-- Zod-validated env at request time (`app/lib/env.ts`); one clear error instead of `supabaseUrl is required` crashes.
+- Zod-validated env at request time (`lib/env.ts`); one clear error instead of `supabaseUrl is required` crashes.
 - Lazy Supabase admin client; no secrets in browser bundles, no `NEXT_PUBLIC_` secrets.
-- Generic API error envelope; logs carry `x-request-id`, secrets auto-redacted by `app/lib/logger.ts`.
+- Generic API error envelope; logs carry `x-request-id`, secrets auto-redacted by `lib/logger.ts`.
 - Security headers in `next.config.ts` (+ CSP and HSTS in production), `middleware.ts` rate-limits `/api/*` (60 req/min/IP, in-memory — use Redis/Upstash for multi-instance prod).
 - `robots.ts` disallows indexing; error boundaries never render internals.
 - CI runs secret-scan + lint + typecheck + build; build uses placeholder public env only.

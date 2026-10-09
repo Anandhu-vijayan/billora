@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --port 3001",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --port 3001",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "check": "npm run secret-scan && npm run lint && npm run typecheck",
@@ -16,6 +16,7 @@
     "node": ">=20.9.0"
   },
   "dependencies": {
+    "@google/genai": "^2.28.0",
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.109.0",
     "exceljs": "^4.4.0",
