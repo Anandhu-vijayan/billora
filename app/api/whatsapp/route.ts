@@ -1,111 +1,104 @@
+// app/api/whatsapp/route.ts — Fast gateway + WhatsApp media intake.
 import { NextResponse } from 'next/server';
 import { getSupabaseAdmin } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
+import { downloadWhatsAppMedia } from '@/lib/whatsapp/media';
 
 export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url)
-  const mode = searchParams.get('hub.mode')
-  const receivedToken = searchParams.get('hub.verify_token')
-  const expectedConfigured = (process.env.WHATSAPP_VERIFY_TOKEN?? '').length > 0
+  const { searchParams } = new URL(req.url);
+  const mode = searchParams.get('hub.mode');
+  const receivedToken = searchParams.get('hub.verify_token');
+  const expectedConfigured = (process.env.WHATSAPP_VERIFY_TOKEN ?? '').length > 0;
   console.log('Verify attempt:', JSON.stringify({
-    mode, hasToken:!!receivedToken, receivedLen: receivedToken?.length?? 0,
-    expectedConfigured, match:!!receivedToken && receivedToken === process.env.WHATSAPP_VERIFY_TOKEN,
-  }))
-  if (mode === 'subscribe' &&!!receivedToken && receivedToken === process.env.WHATSAPP_VERIFY_TOKEN) {
-    return new Response(searchParams.get('hub.challenge') || '', { status: 200, headers: { 'Content-Type': 'text/plain' } })
+    mode, hasToken: !!receivedToken, receivedLen: receivedToken?.length ?? 0,
+    expectedConfigured, match: !!receivedToken && receivedToken === process.env.WHATSAPP_VERIFY_TOKEN,
+  }));
+  if (mode === 'subscribe' && !!receivedToken && receivedToken === process.env.WHATSAPP_VERIFY_TOKEN) {
+    return new Response(searchParams.get('hub.challenge') || '', {
+      status: 200, headers: { 'Content-Type': 'text/plain' },
+    });
   }
-  return new Response('Forbidden', { status: 403 })
+  return new Response('Forbidden', { status: 403 });
+}
+
+interface IncomingMedia { id?: string; mime_type?: string; caption?: string; filename?: string }
+interface IncomingMessage {
+  id?: string; type?: string; from?: string; timestamp?: string;
+  text?: { body?: string }; image?: IncomingMedia; document?: IncomingMedia;
 }
 
 export async function POST(request: Request) {
   try {
     const rawText = await request.text();
-    if (!rawText?.trim()) return NextResponse.json({ status: 'SKIPPED_EMPTY_BODY' }, { status: 200 });
-
-    let payload: any;
+    if (!rawText || rawText.trim().length === 0) {
+      return NextResponse.json({ status: 'SKIPPED_EMPTY_BODY' }, { status: 200 });
+    }
+    let payload: { entry?: Array<{ changes?: Array<{ value?: {
+      messages?: IncomingMessage[]; statuses?: Array<{ status?: string }>;
+    } }> }> };
     try { payload = JSON.parse(rawText); }
-    catch { return NextResponse.json({ status: 'SKIPPED_NON_JSON_BODY' }, { status: 200 }); }
-
-    const value = payload.entry?.[0]?.changes?.[0]?.value?? {};
-    const message = value?.messages?.[0] as any;
-
+    catch {
+      logger.info('[WhatsApp] non-JSON body skipped', {
+        preview: rawText.slice(0, 200), contentType: request.headers.get('content-type'),
+      });
+      return NextResponse.json({ status: 'SKIPPED_NON_JSON_BODY' }, { status: 200 });
+    }
+    const value = payload.entry?.[0]?.changes?.[0]?.value;
+    const message = value?.messages?.[0];
     logger.info('[WhatsApp] webhook received', {
-      hasMessages:!!value?.messages,
-      messageId: message?.id?? null,
-      messageType: message?.type?? null,
-      from: message?.from?? null,
+      hasMessages: !!value?.messages, messageId: message?.id ?? null,
+      messageType: message?.type ?? null, from: message?.from ?? null,
+      statuses: value?.statuses?.[0]?.status ?? null,
     });
-
-    if (!message?.id) return NextResponse.json({ status: 'SKIPPED_UNSUPPORTED_PAYLOAD' }, { status: 200 });
-
-    const supabase = getSupabaseAdmin();
+    if (!message || !message.id) {
+      return NextResponse.json({ status: 'SKIPPED_UNSUPPORTED_PAYLOAD' }, { status: 200 });
+    }
     const providerMessageId: string = message.id;
-
-    // DEDUP - your existing logic
-    const { error: insertError } = await (supabase.from('webhook_events') as any).insert({
-      provider_message_id: providerMessageId,
-      payload: value // save full payload for debugging
+    logger.info('[WhatsApp] message received', {
+      providerMessageId, messageType: message.type ?? null, from: message.from ?? null,
+      timestamp: message.timestamp ?? null, hasImage: !!message.image,
+      hasDocument: !!message.document, hasText: !!message.text,
     });
-    if (insertError?.code === '23505') {
+    const db = getSupabaseAdmin();
+    const { error: dedupError } = await (db.from('webhook_events') as unknown as {
+      insert: (row: { provider_message_id: string }) => Promise<{ error: { code?: string; message: string } | null }>;
+    }).insert({ provider_message_id: providerMessageId });
+    if (dedupError && dedupError.code === '23505') {
+      logger.info('[WhatsApp] duplicate event aborted', { providerMessageId });
       return NextResponse.json({ status: 'ABORTED_DUPLICATE_EVENT' }, { status: 200 });
     }
-    if (insertError) throw new Error(insertError.message);
-
-    // === NEW: HANDLE IMAGE FROM TEST NUMBER ===
-    if (message.type === 'image' && message.image?.id) {
-      const imageId = message.image.id;
-      const from = message.from;
-      const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-
-      logger.info('[WhatsApp] downloading image', { imageId, from });
-
+    if (dedupError) throw new Error(dedupError.message);
+    // Media intake: image/* + document(pdf) via mime_type mapping.
+    const media = message.type === 'image' ? message.image
+      : message.type === 'document' ? message.document : undefined;
+    const mediaId = media?.id;
+    if (mediaId) {
+      const declaredMime = media?.mime_type;
+      logger.info('[WhatsApp] media id extracted', { providerMessageId, mediaId, declaredMime: declaredMime ?? null });
       try {
-        // Step 1: Get temporary URL from Meta
-        const mediaMetaRes = await fetch(`https://graph.facebook.com/v25.0/${imageId}`, {
-          headers: { Authorization: `Bearer ${accessToken}` }
+        const downloaded = await downloadWhatsAppMedia({
+          mediaId, accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '', declaredMime,
         });
-        const mediaMeta = await mediaMetaRes.json();
-
-        if (!mediaMeta.url) throw new Error(`Meta media error: ${JSON.stringify(mediaMeta)}`);
-
-        // Step 2: Download image bytes
-        const imageRes = await fetch(mediaMeta.url, {
-          headers: { Authorization: `Bearer ${accessToken}` }
-        });
-        const buffer = Buffer.from(await imageRes.arrayBuffer());
-
-        // Step 3: Upload to Supabase Storage (create bucket 'invoices' if not exists)
-        const fileName = `${from}/${Date.now()}_${imageId}.jpg`;
-        const { error: uploadError } = await supabase.storage
-         .from('billora-invoices')
-         .upload(fileName, buffer, { contentType: 'image/jpeg' });
-
-        if (uploadError) throw uploadError;
-
-        // Step 4: Insert into your invoices queue table
-        await (supabase.from('billora-invoices') as any).insert({
-          provider_message_id: providerMessageId,
-          from_number: from,
-          image_path: fileName,
-          status: 'received',
-          phone_number_id: '1432096079978954' // test number from your screenshot
-        });
-
-        logger.info('[WhatsApp] image saved', { fileName, size: buffer.length });
-
-      } catch (imgErr: any) {
-        logger.error('[WhatsApp] image download failed', { error: imgErr.message, imageId });
-        // Don't throw - still return 200 so Meta doesn't retry storm
+        const safeFrom = (message.from || 'unknown').replace(/[^0-9a-zA-Z+_-]/g, '');
+        const objectPath = `whatsapp/${safeFrom}/${Date.now()}_${mediaId}.${downloaded.extension}`;
+        const { error: uploadError } = await db.storage.from('billora-invoices')
+          .upload(objectPath, downloaded.buffer, { contentType: downloaded.contentType, upsert: false });
+        if (uploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${uploadError.message}`);
+        logger.info('[WhatsApp] media stored', { providerMessageId, objectPath, size: downloaded.size });
+      } catch (mediaError: unknown) {
+        logger.error('[WhatsApp] media intake failed', { providerMessageId, mediaId,
+          error: mediaError instanceof Error ? mediaError.message : String(mediaError) });
       }
+    } else if (message.type === 'image' || message.type === 'document') {
+      logger.info('[WhatsApp] media message without media id', { providerMessageId });
     }
-
+    logger.info('[WhatsApp] accepted for queue', { providerMessageId });
     return NextResponse.json({ status: 'ACCEPTED_FOR_QUEUE' }, { status: 200 });
-
-  } catch (error: any) {
-    const detail = error?.message?? String(error);
-    logger.error("[Gateway Interface Router] Intercepted runtime disruption anomaly", { error: detail });
-    const code = /Missing Supabase env|Invalid environment/i.test(detail)? 'CONFIG_ERROR'
-      : /webhook_events|relation.* does not exist/i.test(detail)? 'DB_TABLE_MISSING'
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    logger.error('[Gateway Interface Router] runtime anomaly', { error: detail });
+    const code = /Missing Supabase env|Invalid environment/i.test(detail) ? 'CONFIG_ERROR'
+      : /webhook_events|relation .* does not exist/i.test(detail) ? 'DB_TABLE_MISSING'
       : 'SYSTEM_ROUTING_FAULT';
     return NextResponse.json({ status: code, detail }, { status: 200 });
   }

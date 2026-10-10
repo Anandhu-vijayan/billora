@@ -8,8 +8,11 @@ const serverSchema = z.object({
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: z.string().min(1, 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is required'),
   SUPABASE_SECRET_KEY: z.string().min(1, 'SUPABASE_SECRET_KEY is required').optional(),
   SUPABASE_JWKS_URL: z.string().url().optional(),
-  // WhatsApp webhook verification token (Meta hub.verify_token handshake).
+  // WhatsApp Cloud API credentials (media download + verification).
   WHATSAPP_VERIFY_TOKEN: z.string().min(1, 'WHATSAPP_VERIFY_TOKEN is required').optional(),
+  WHATSAPP_ACCESS_TOKEN: z.string().min(1).optional(),
+  WHATSAPP_PHONE_NUMBER_ID: z.string().min(1).optional(),
+  WHATSAPP_GRAPH_VERSION: z.string().min(1).default('v21.0'),
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
   GEMINI_API_KEY: z.string().min(1).optional(),
   GEMINI_MODEL: z.string().min(1).default('gemini-1.5-flash'),
@@ -46,6 +49,7 @@ export function getPublicEnvInfo() {
     hasPublishableKey: (process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? '').length > 0,
     hasSecret: (process.env.SUPABASE_SECRET_KEY ?? '').length > 0,
     hasWhatsappToken: (process.env.WHATSAPP_VERIFY_TOKEN ?? '').length > 0,
+    hasWhatsappAccessToken: (process.env.WHATSAPP_ACCESS_TOKEN ?? '').length > 0,
     hasGeminiKey: (process.env.GEMINI_API_KEY ?? '').length > 0,
     urlHost: safeHost(url),
   }
