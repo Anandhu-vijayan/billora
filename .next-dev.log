@@ -1,0 +1,23 @@
+
+> billora@0.1.0 dev
+> next dev --port 3001
+
+▲ Next.js 16.3.8 (Turbopack)
+- Local:         http://localhost:3001
+- Network:       http://10.221.236.206:3001
+- Environments: .env
+✓ Ready in 3.5s
+✓ Running next.config.ts took 248ms
+
+ GET /api/health 200 in 4.2s (next.js: 3.0s, proxy.ts: 1014ms, application-code: 160ms)
+○ Compiling /api/health ...
+ POST /api/whatsapp 200 in 5.1s (next.js: 4.6s, proxy.ts: 57ms, application-code: 446ms)
+{"ts":"2026-10-11T13:59:03.335Z","level":"info","service":"billora","msg":"[WhatsApp] verify attempt","fields":{"mode":"subscribe","verified":false}}
+ GET /api/whatsapp?hub.mode=subscribe&hub.verify_token=x&hub.challenge=1 403 in 5.2s (next.js: 5.1s, proxy.ts: 72ms, application-code: 57ms)
+ GET /api/health 200 in 94ms (next.js: 31ms, proxy.ts: 32ms, application-code: 31ms)
+{"ts":"2026-10-11T14:12:56.462Z","level":"info","service":"billora","msg":"[WhatsApp] webhook received","fields":{"hasMessages":true,"shortId":"NUE3NjUA","messageType":"text","statuses":null}}
+{"ts":"2026-10-11T14:13:00.138Z","level":"info","service":"billora","msg":"[WhatsApp] onboarding transition","fields":{"sender":"wa:c1ddc6cb96","note":"collecting-passthrough"}}
+{"ts":"2026-10-11T14:13:00.753Z","level":"info","service":"billora","msg":"[WhatsApp] onboarding persisted","fields":{"sender":"wa:c1ddc6cb96","state":"collecting"}}
+{"ts":"2026-10-11T14:13:01.515Z","level":"info","service":"billora","msg":"[WhatsApp] accepted for queue","fields":{"shortId":"NUE3NjUA"}}
+ POST /api/whatsapp 200 in 5.2s (next.js: 21ms, proxy.ts: 25ms, application-code: 5.1s)
+[?25h

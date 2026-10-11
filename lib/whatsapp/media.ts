@@ -36,6 +36,19 @@ async function fetchWithTimeout(url: string, token: string): Promise<Response> {
   }
 }
 
+// Graph API codes where retrying is futile — the credential itself is broken
+// (same families as send.ts): an expired token never becomes valid again.
+const PERMANENT_GRAPH_CODES = new Set([102, 190, 200, 210, 463, 464, 2068])
+
+export function isPermanentMediaFailure(error: unknown): boolean {
+  return error instanceof Error && error.name === 'MediaPermanentError'
+}
+
+/** Media will never download for this delivery: expired/blocked credential. */
+export class MediaPermanentError extends Error {
+  override name = 'MediaPermanentError'
+}
+
 export interface DownloadedMedia {
   buffer: Buffer
   mimeType: string
@@ -67,12 +80,28 @@ export async function downloadWhatsAppMedia(args: {
     error?: { message?: string; code?: number }
   } | null
   if (!metaRes.ok || !meta?.url) {
-    throw new Error(`META_MEDIA_ERROR: ${meta?.error?.message || `Graph API ${metaRes.status} with no url`}`)
+    // Surface Meta's message + numeric code (never the token or signed URL).
+    // Credential-blocked codes throw MediaPermanentError: retrying cannot help,
+    // so callers must NOT return 503 (that would loop Meta redeliveries).
+    const detail = `${meta?.error?.message || `Graph API ${metaRes.status} with no url`}`
+      + (meta?.error?.code !== undefined ? ` (graph code ${meta?.error.code})` : '')
+    if (meta?.error?.code !== undefined && PERMANENT_GRAPH_CODES.has(meta.error.code)) {
+      throw new MediaPermanentError(`META_MEDIA_UNRECOVERABLE: ${detail}`)
+    }
+    if (!metaRes.ok && (metaRes.status === 401 || metaRes.status === 403)) {
+      throw new MediaPermanentError(`META_MEDIA_UNRECOVERABLE: ${detail} (http ${metaRes.status})`)
+    }
+    throw new Error(`META_MEDIA_ERROR: ${detail}`)
   }
 
   // Step 2 — download raw bytes (verification: non-empty buffer).
   const fileRes = await fetchWithTimeout(meta.url, accessToken)
-  if (!fileRes.ok) throw new Error(`MEDIA_DOWNLOAD_ERROR: HTTP ${fileRes.status}`)
+  if (!fileRes.ok) {
+    if (fileRes.status === 401 || fileRes.status === 403) {
+      throw new MediaPermanentError(`MEDIA_DOWNLOAD_ERROR: HTTP ${fileRes.status} (credential rejected)`)
+    }
+    throw new Error(`MEDIA_DOWNLOAD_ERROR: HTTP ${fileRes.status}`)
+  }
   const bytes = await fileRes.arrayBuffer()
   if (bytes.byteLength === 0) throw new Error('MEDIA_DOWNLOAD_ERROR: empty body')
 

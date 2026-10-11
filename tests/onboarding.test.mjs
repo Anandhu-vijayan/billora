@@ -31,6 +31,14 @@ const lifecycleSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261011000000_phase1_status_lifecycle.sql', import.meta.url), 'utf8')
 const p2SqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261011150000_phase2_onboarding.sql', import.meta.url), 'utf8')
+const mediaSrc = () => readFileSync(new URL('../lib/whatsapp/media.ts', import.meta.url), 'utf8')
+const initialSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261002143735_initial_schema.sql', import.meta.url), 'utf8')
+const p3SqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261011190000_phase3_job_queue.sql', import.meta.url), 'utf8')
+const queueSrc = () => readFileSync(new URL('../lib/jobs/queue.ts', import.meta.url), 'utf8')
+const workerSrc = () => readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
+const workerRouteSrc = () => readFileSync(new URL('../app/api/jobs/worker/route.ts', import.meta.url), 'utf8')
 
 test('A1 reply-id namespace is validated (prefix + uuid shape)', () => {
   const good = 'billora:client:123e4567-e89b-12d3-a456-426614174000'
@@ -200,6 +208,12 @@ test('D2 typed status enums match the DB CHECK constraints exactly', () => {
   for (const s of list('PENDING_UPLOAD_STATUSES')) {
     assert.ok(p2SqlSrc().includes(`'${s}'`), `pending upload status ${s} missing from SQL`)
   }
+  for (const s of list('JOB_STATUSES')) {
+    assert.ok(initialSqlSrc().includes(`'${s}'`), `job status ${s} missing from initial SQL`)
+  }
+  for (const s of list('JOB_TYPES')) {
+    assert.ok(p3SqlSrc().includes(`'${s}'`), `job type ${s} missing from phase3 SQL`)
+  }
 })
 
 test('D3 state machine completes setup into ready states, then promotes to collecting', () => {
@@ -274,4 +288,154 @@ test('E4 pending-assignment confirmation: asked before applying any client', () 
   const p2 = p2SqlSrc()
   assert.match(p2, /pending_client_id uuid/)
   assert.match(p2, /'awaiting_pending_confirm'/)
+})
+
+test('E5 credential-blocked media never loops Meta retries and surfaces the real reason', () => {
+  const media = mediaSrc()
+  // Expired/blocked Graph codes (190 family) are permanent, not retryable.
+  assert.match(media, /PERMANENT_GRAPH_CODES/)
+  for (const c of ['190', '102', '200']) assert.ok(media.includes(c), `graph code ${c} must be permanent`)
+  assert.match(media, /MediaPermanentError/)
+  assert.match(media, /META_MEDIA_UNRECOVERABLE/)
+  // The thrown error carries Meta's message + numeric code (no token, no URL).
+  assert.match(media, /graph code \$\{meta\?\.error\.code\}/)
+  const src = routeSrc()
+  assert.match(src, /isPermanentMediaFailure\(e\)/)
+  assert.match(src, /MEDIA_CREDENTIAL_BLOCKED/)
+  assert.match(src, /return 'processed'/)
+  // Retry-path logs carry the full detail (truncating to the code prefix hid
+  // the root cause during the expired-token incident).
+  assert.match(src, /error: code, detail: detail\.slice\(0, 200\)/)
+  assert.ok(!src.includes("const code = detail.split(':')[0]"), 'retry path must not truncate the error to its code prefix')
+})
+
+test('E6 a freshly-filed invoice is acknowledged; redelivery stays silent', () => {
+  const src = routeSrc()
+  // Clean filing must confirm receipt (was previously silent, confusing users).
+  assert.match(src, /Invoice received and queued for processing/)
+  // Guarded so a Meta webhook redelivery of the same media never double-pings.
+  assert.match(src, /if \(!deduped\)/)
+  const dedupIdx = src.indexOf('if (!deduped)')
+  const sendIdx = src.indexOf('Invoice received and queued', dedupIdx)
+  const acceptIdx = src.indexOf('accepted for queue')
+  assert.ok(dedupIdx > 0 && sendIdx > dedupIdx, 'acknowledgment must fire inside the !deduped guard')
+  // Rule 5: delivery is best-effort and never rewinds the accepted intake.
+  assert.ok(acceptIdx > 0, 'intake still reports accepted for queue')
+})
+
+// ---- Phase 3: durable job queue (claims, leases, retries, recovery) -------
+
+test('F1 claims are atomic: SKIP LOCKED over due queued rows only', () => {
+  const sql = p3SqlSrc()
+  assert.match(sql, /for update skip locked/)
+  // Only a due, unclaimed job is eligible, and the claim stamps a lease.
+  const claim = sql.slice(sql.indexOf('create or replace function public.claim_processing_jobs'),
+    sql.indexOf('create or replace function public.renew_processing_job_lease'))
+  assert.match(claim, /j\.status = 'queued'/)
+  assert.match(claim, /j\.available_at <= now\(\)/)
+  assert.match(claim, /status = 'processing'/)
+  assert.match(claim, /attempts = j\.attempts \+ 1/)
+  assert.match(claim, /lease_expires_at = now\(\)/)
+  // Batch + lease are clamped so one caller cannot take the whole queue.
+  assert.match(claim, /limit least\(greatest\(1, p_limit\), 25\)/)
+})
+
+test('F2 writes are fenced on ownership: a zombie worker cannot overwrite live state', () => {
+  const sql = p3SqlSrc()
+  const fenced = ['create or replace function public.renew_processing_job_lease',
+    'create or replace function public.complete_processing_job',
+    'create or replace function public.fail_processing_job']
+  for (const name of fenced) {
+    const body = sql.slice(sql.indexOf(name), sql.indexOf(name) + 1600)
+    assert.match(body, /locked_by = p_worker/, `${name} must verify the owner`)
+    assert.match(body, /lease_expires_at > now\(\)/, `${name} must verify an unexpired lease`)
+    assert.match(body, /status = 'processing'/, `${name} must only touch in-flight jobs`)
+  }
+  // Claim/renew/complete/fail all lock the row they hand out or settle.
+  assert.match(sql, /fail_processing_job[\s\S]*?for update;/)
+})
+
+test('F3 retries back off, attempts settle, and expired leases are recovered', () => {
+  const sql = p3SqlSrc()
+  // A retry is the same row back in 'queued' with a future available_at — not a
+  // new status, and not an immediate re-run.
+  const failBody = sql.slice(
+    sql.indexOf('create or replace function public.fail_processing_job'),
+    sql.indexOf('create or replace function public.recover_stale_processing_jobs'))
+  assert.match(failBody, /case when v_settle then 'failed' else 'queued' end/)
+  assert.match(failBody, /j\.attempts >= j\.max_attempts/)
+  assert.match(failBody, /now\(\) \+ make_interval\(secs => greatest\(0, p_retry_in_seconds\)\)/)
+  // Invoice + job settle together, in one transaction (no torn pair).
+  assert.match(failBody, /update public\.invoices/)
+  assert.match(failBody, /FAIL_JOB_BAD_INVOICE_STATUS/)
+  const recover = sql.slice(sql.indexOf('create or replace function public.recover_stale_processing_jobs'))
+  assert.match(recover, /lease_expires_at <= now\(\)/)
+  assert.match(recover, /attempts < max_attempts/) // requeue live work
+  assert.match(recover, /attempts >= max_attempts/) // settle exhausted work
+  // Backoff is exponential and capped in the client.
+  assert.match(queueSrc(), /Math\.min\(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS \* 2 \*\* exp\)/)
+})
+
+test('F4 queue API is service-role only and runs with a locked search_path', () => {
+  const sql = p3SqlSrc()
+  const fns = ['claim_processing_jobs', 'renew_processing_job_lease', 'complete_processing_job',
+    'fail_processing_job', 'recover_stale_processing_jobs', 'processing_job_depth']
+  for (const fn of fns) {
+    assert.ok(sql.includes(`revoke all on function public.${fn}`), `${fn} must be revoked from anon/authenticated`)
+    assert.ok(sql.includes(`grant execute on function public.${fn}`), `${fn} must be granted to service_role`)
+    const def = sql.slice(sql.indexOf(`function public.${fn}`))
+    assert.match(def.slice(0, 400), /security definer/, `${fn} must be security definer`)
+    assert.match(def.slice(0, 400), /set search_path = ''/, `${fn} must pin search_path`)
+  }
+  // Grant STATEMENTS only (prose in comments is not a grant).
+  assert.ok(!/^\s*grant\b[^;]*\bto\s+(anon|authenticated)\b/m.test(sql), 'no grants to anon/authenticated')
+  assert.match(sql, /to service_role;/)
+})
+
+test('F5 intake and queueing are strictly idempotent: redelivery cannot double-file', () => {
+  const sql = p3SqlSrc()
+  assert.match(sql, /invoices_file_object_path_key unique \(file_object_path\)/)
+  assert.match(sql, /processing_jobs_target_uniq/)
+  assert.match(sql, /\(invoice_id, job_type\)/)
+  const intake = intakeSrc()
+  // Conflict -> read back and reuse, for BOTH the invoice and the job.
+  const rec = intake.slice(intake.indexOf('export async function recordMediaIntake'), intake.indexOf('// ---- Pending uploads'))
+  assert.ok((rec.match(/23505/g) || []).length >= 2, 'invoice and job must both handle unique conflicts')
+  assert.match(rec, /eq\('file_object_path', args\.objectPath\)/)
+  assert.match(rec, /eq\('job_type', 'invoice_extraction'\)/)
+  // Never upsert an invoice: that would rewind a processed row's status.
+  assert.ok(!rec.includes("from('invoices').upsert"), 'invoice must be insert-then-read, never upsert')
+  // Stored path is deterministic per provider media id.
+  assert.match(routeSrc(), /whatsapp\/invoices\/\$\{mediaId\}/)
+})
+
+test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes success', () => {
+  const worker = workerSrc()
+  const queue = queueSrc()
+  // No registered handler => no claim at all (pre-Phase-4 safety).
+  assert.match(worker, /if \(jobTypes\.length === 0\)/)
+  assert.match(queue, /if \(args\.jobTypes\.length === 0\) return \[\]/)
+  assert.match(worker, /registerJobHandler/)
+  // Lease is renewed while the handler runs, and released afterwards.
+  assert.match(worker, /startHeartbeat\(db, job, worker, leaseSeconds\)/)
+  assert.match(worker, /renewLease\(db, job\.id, worker, leaseSeconds\)/)
+  assert.match(worker, /stopHeartbeat\(\)/)
+  // A lost lease means our write is discarded, reported as fenced — not success.
+  assert.match(worker, /const owned = await completeJob\(db, job\.id, worker\)/)
+  assert.match(worker, /else result\.fenced \+= 1/)
+  // Permanent failures skip the retry ladder; others back off on attempts.
+  assert.match(worker, /isPermanentJobFailure\(e\)/)
+  assert.match(worker, /retryInSeconds: permanent \? 0 : backoffSeconds\(job\.attempts\)/)
+  // One broken handler cannot take the tick down.
+  assert.match(worker, /per-job|catch \(e: unknown\)/)
+  // Crash recovery runs at the start of every tick.
+  assert.match(worker, /await recoverStaleJobs\(db\)/)
+  // Trigger endpoint fails closed without WORKER_SECRET, and uses a
+  // constant-time compare with the secret only ever in a header.
+  const route = workerRouteSrc()
+  assert.match(route, /WORKER_DISABLED/)
+  assert.match(route, /status: 503/)
+  assert.match(route, /safeTokenEqual\(req\.headers\.get\('x-worker-token'\)/)
+  assert.ok(!route.includes('searchParams.get'), 'worker secret must never travel in a URL')
+  assert.match(route, /Math\.min\(Math\.max\(body\.limit as number, 1\), 25\)/)
 })

@@ -65,11 +65,15 @@ export function isDurablyAccepted(row: IntakeRow): boolean {
   return row.status === 'accepted' && row.processed_at !== null
 }
 
-export async function markIntakeAccepted(db: Db, providerMessageId: string): Promise<void> {
+/**
+ * Durably accept the event. `errorCode` accepts a permanent failure as final
+ * (recorded for audit) so Meta redelivery is suppressed without a retry loop.
+ */
+export async function markIntakeAccepted(db: Db, providerMessageId: string, errorCode?: string): Promise<void> {
   const { error } = (await (eventsTable(db).update({
     status: 'accepted',
     processed_at: new Date().toISOString(),
-    last_error_code: null,
+    last_error_code: errorCode ? errorCode.slice(0, 120) : null,
   }) as {
     eq: (c: string, v: string) => Promise<{ error: { message: string } | null }>
   }).eq('provider_message_id', providerMessageId))
@@ -89,7 +93,17 @@ export async function markIntakeFailed(db: Db, providerMessageId: string, code: 
   if (error) throw new Error(`INTAKE_FAIL_ERROR: ${error.message}`)
 }
 
-/** Media lifecycle: invoice (received) + processing job (queued) in one recoverable unit. */
+/**
+ * Media lifecycle: invoice (received) + processing job (queued) in one
+ * recoverable unit. STRICTLY IDEMPOTENT (Phase 3): a webhook redelivery that
+ * arrives between the insert and the intake accept must not create a second
+ * invoice row or a second job. Uniqueness is enforced in the database
+ * (invoices.file_object_path, one job per invoice_id+job_type); on a 23505 we
+ * read back the existing rows and reuse them.
+ *
+ * Never upsert here: overwriting an invoice that already progressed would
+ * rewind its status, which the queue interprets as work to redo.
+ */
 export async function recordMediaIntake(
   db: Db,
   args: {
@@ -100,8 +114,8 @@ export async function recordMediaIntake(
     contentType: string
     fileSha256Hex?: string | null
   },
-): Promise<{ invoiceId: string; jobId: string }> {
-  const invoice = (await db.from('invoices').insert({
+): Promise<{ invoiceId: string; jobId: string; invoicePreexisting: boolean; jobPreexisting: boolean }> {
+  const invoicePayload = {
     workspace_id: args.workspaceId,
     client_id: args.clientId,
     file_object_path: args.objectPath,
@@ -109,15 +123,57 @@ export async function recordMediaIntake(
     content_type: args.contentType,
     file_sha256: args.fileSha256Hex ? `\\x${args.fileSha256Hex}` : null,
     status: 'received',
-  }).select('id').single() as unknown as { data: { id: string } | null; error: { message: string } | null })
-  if (invoice.error || !invoice.data) throw new Error(`INVOICE_RECORD_ERROR: ${invoice.error?.message ?? 'missing id'}`)
-  const job = (await db.from('processing_jobs').insert({
+  }
+  const invoice = (await db.from('invoices').insert(invoicePayload).select('id').single() as unknown as {
+    data: { id: string } | null
+    error: { code?: string; message: string } | null
+  })
+  let invoiceId: string
+  let invoicePreexisting = false
+  if (!invoice.error && invoice.data) {
+    invoiceId = invoice.data.id
+  } else if (invoice.error?.code === '23505') {
+    const existing = (await db.from('invoices').select('id')
+      .eq('file_object_path', args.objectPath).limit(1).maybeSingle() as unknown as {
+      data: { id: string } | null; error: { message: string } | null
+    })
+    if (existing.error || !existing.data) {
+      throw new Error(`INVOICE_READ_ERROR: ${existing.error?.message ?? 'missing row after conflict'}`)
+    }
+    invoiceId = existing.data.id
+    invoicePreexisting = true
+  } else {
+    throw new Error(`INVOICE_RECORD_ERROR: ${invoice.error?.message ?? 'missing id'}`)
+  }
+
+  const jobPayload = {
     workspace_id: args.workspaceId,
-    invoice_id: invoice.data.id,
+    invoice_id: invoiceId,
+    job_type: 'invoice_extraction',
     status: 'queued',
-  }).select('id').single() as unknown as { data: { id: string } | null; error: { message: string } | null })
-  if (job.error || !job.data) throw new Error(`JOB_RECORD_ERROR: ${job.error?.message ?? 'missing id'}`)
-  return { invoiceId: invoice.data.id, jobId: job.data.id }
+  }
+  const job = (await db.from('processing_jobs').insert(jobPayload).select('id').single() as unknown as {
+    data: { id: string } | null
+    error: { code?: string; message: string } | null
+  })
+  let jobId: string
+  let jobPreexisting = false
+  if (!job.error && job.data) {
+    jobId = job.data.id
+  } else if (job.error?.code === '23505') {
+    const existing = (await db.from('processing_jobs').select('id')
+      .eq('invoice_id', invoiceId).eq('job_type', 'invoice_extraction').limit(1).maybeSingle() as unknown as {
+      data: { id: string } | null; error: { message: string } | null
+    })
+    if (existing.error || !existing.data) {
+      throw new Error(`JOB_READ_ERROR: ${existing.error?.message ?? 'missing row after conflict'}`)
+    }
+    jobId = existing.data.id
+    jobPreexisting = true
+  } else {
+    throw new Error(`JOB_RECORD_ERROR: ${job.error?.message ?? 'missing id'}`)
+  }
+  return { invoiceId, jobId, invoicePreexisting, jobPreexisting }
 }
 
 // ---- Pending uploads ("receive first, ask later") -------------------------

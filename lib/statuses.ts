@@ -16,6 +16,15 @@ export type InvoiceStatus = (typeof INVOICE_STATUSES)[number]
 export const JOB_STATUSES = ['queued', 'processing', 'completed', 'failed'] as const
 export type JobStatus = (typeof JOB_STATUSES)[number]
 
+// Queue job kinds (matches the processing_jobs.job_type CHECK). A retry is NOT
+// a status: it is the same row back in 'queued' with a future available_at.
+export const JOB_TYPES = ['invoice_extraction', 'register_generation'] as const
+export type JobType = (typeof JOB_TYPES)[number]
+
+// fail_processing_job only routes an invoice here when the job settles.
+export const JOB_FAILURE_INVOICE_STATUSES = ['failed', 'needs_review'] as const
+export type JobFailureInvoiceStatus = (typeof JOB_FAILURE_INVOICE_STATUSES)[number]
+
 export const WORKBOOK_STATUSES = ['ready', 'sent', 'expired', 'deleted'] as const
 export type WorkbookStatus = (typeof WORKBOOK_STATUSES)[number]
 

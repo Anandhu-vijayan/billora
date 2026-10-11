@@ -5,7 +5,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { getSupabaseAdmin } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { isAcceptedMediaType } from '@/lib/statuses';
-import { downloadWhatsAppMedia } from '@/lib/whatsapp/media';
+import { downloadWhatsAppMedia, isPermanentMediaFailure } from '@/lib/whatsapp/media';
 import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
@@ -287,10 +287,24 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
     await processMessage(db, message, providerMessageId, shortId);
     await markIntakeAccepted(db, providerMessageId);
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e);
-    const code = detail.split(':')[0] || 'PROCESSING_ERROR';
+    const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    const code = (e instanceof Error ? e.message : detail).split(':')[0] || 'PROCESSING_ERROR';
+    if (isPermanentMediaFailure(e)) {
+      // Expired/blocked credential: 503 would loop Meta redeliveries forever
+      // and a retry can never succeed. Accept the event as final (audit code
+      // recorded), alert the operator, and ask the sender to resend once the
+      // token is reissued. Delivery itself is best-effort (rule 5).
+      logger.error('[WhatsApp] MEDIA_CREDENTIAL_BLOCKED: media unrecoverable with current token; operator must reissue WHATSAPP_ACCESS_TOKEN', {
+        shortId, error: code, detail: detail.slice(0, 200),
+      });
+      if (message.from) {
+        await sendText(message.from, 'I could not retrieve that file right now (a system credential expired). Please resend the invoice in a few minutes.').catch(() => undefined);
+      }
+      await markIntakeAccepted(db, providerMessageId, detail.slice(0, 120)).catch(() => undefined);
+      return 'processed';
+    }
     await markIntakeFailed(db, providerMessageId, code).catch(() => undefined);
-    logger.error('[WhatsApp] processing failed, retryable', { shortId, error: code });
+    logger.error('[WhatsApp] processing failed, retryable', { shortId, error: code, detail: detail.slice(0, 200) });
     return 'retryable';
   }
   logger.info('[WhatsApp] accepted for queue', { shortId });
@@ -409,9 +423,12 @@ async function processMessage(
     return;
   }
 
-  const objectPath = `whatsapp/${Date.now()}_${mediaId}.${downloaded.extension}`;
+  // Assigned path is deterministic too (per provider media id): combined with
+  // the invoices.file_object_path unique constraint, a redelivery can never
+  // store or queue the same file twice, whatever the retry timing.
+  const objectPath = `whatsapp/invoices/${mediaId}.${downloaded.extension}`;
   const { error: uploadError } = await db.storage.from('billora-invoices')
-    .upload(objectPath, downloaded.buffer, { contentType: downloaded.contentType, upsert: false });
+    .upload(objectPath, downloaded.buffer, { contentType: downloaded.contentType, upsert: true });
   if (uploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${uploadError.message}`);
   const recorded = await recordMediaIntake(db, {
     workspaceId, clientId, objectPath,
@@ -419,12 +436,21 @@ async function processMessage(
     fileSha256Hex: sha256Hex,
   });
   const waiting = await countWaitingUploads(db, mHmac).catch(() => 0);
-  if (waiting > 0 && clientId) {
-    await sendText(message.from, `Note: ${waiting} earlier file(s) are still held for a client. Send Change client to assign them.`);
-  }
+  const deduped = recorded.invoicePreexisting || recorded.jobPreexisting;
   logger.info('[WhatsApp] media intake recorded', {
     shortId, size: downloaded.size,
     invoice: recorded.invoiceId.slice(0, 8), job: recorded.jobId.slice(0, 8),
+    deduped,
   });
+  // Acknowledge a freshly-filed invoice so a clean upload is never silent
+  // (rule 5: send is best-effort — a delivery failure never rewinds the
+  // accepted intake). A webhook redelivery dedups to the same invoice/job and
+  // stays quiet, so Meta retries never double-ping the sender.
+  if (!deduped) {
+    const held = waiting > 0 && clientId
+      ? ` Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them.`
+      : '';
+    await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
+  }
 }
 

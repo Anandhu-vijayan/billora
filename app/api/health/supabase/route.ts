@@ -2,6 +2,7 @@ import { fail, ok, toPublicErrorMessage } from '@/lib/api-response'
 import { getPublicEnvInfo } from '@/lib/env'
 import { logger } from '@/lib/logger'
 import { getSupabaseAdmin } from '@/lib/supabase/server'
+import { queueDepth } from '@/lib/jobs/queue'
 import { requireServerEnv } from '@/lib/validation'
 
 export const dynamic = 'force-dynamic'
@@ -16,8 +17,17 @@ export async function GET(req: Request) {
     // service_role bypasses RLS so a count query is a pure connectivity check.
     const { count, error } = await admin.from('workspaces').select('id', { count: 'exact', head: true })
     if (error) throw new Error(error.message)
+    // Queue depth is counts only (no invoice content, no identifiers). A
+    // missing/older schema must not fail the connectivity check, so this is
+    // advisory.
+    let queue: Record<string, number> | null = null
+    try {
+      queue = await queueDepth(admin)
+    } catch (e: unknown) {
+      logger.warn('queue depth unavailable', { error: e instanceof Error ? e.message.split(':')[0] : String(e) })
+    }
     logger.info('supabase health ok', { requestId, ms: Date.now() - started })
-    return ok({ connected: true, ...getPublicEnvInfo(), count }, { requestId })
+    return ok({ connected: true, ...getPublicEnvInfo(), count, queue }, { requestId })
   } catch (e) {
     logger.error('supabase health failed', { requestId, ms: Date.now() - started })
     const info = getPublicEnvInfo()

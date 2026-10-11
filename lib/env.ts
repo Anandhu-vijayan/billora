@@ -29,6 +29,15 @@ const serverSchema = z.object({
     .string()
     .regex(HEX_64, 'ENCRYPTION_MASTER_KEY must be a 32-byte hex string (64 hex chars)')
     .optional(),
+  // Durable job queue. The queue lives in Postgres; WORKER_SECRET only guards
+  // the external trigger endpoint. Unset = endpoint disabled (fail closed).
+  WORKER_SECRET: z.string().min(16, 'WORKER_SECRET must be at least 16 chars').optional(),
+  // Numeric knobs, parsed with defaults + clamps in lib/jobs/*.ts.
+  JOB_LEASE_SECONDS: z.string().optional(),
+  JOB_TICK_LIMIT: z.string().optional(),
+  JOB_TICK_BUDGET_MS: z.string().optional(),
+  JOB_BACKOFF_BASE_SECONDS: z.string().optional(),
+  JOB_BACKOFF_CAP_SECONDS: z.string().optional(),
 })
 
 export type ServerEnv = z.infer<typeof serverSchema>
@@ -60,6 +69,7 @@ export function getPublicEnvInfo() {
     hasWhatsappAppSecret: (process.env.WHATSAPP_APP_SECRET ?? '').length > 0,
     hasWhatsappAccessToken: (process.env.WHATSAPP_ACCESS_TOKEN ?? '').length > 0,
     hasGeminiKey: (process.env.GEMINI_API_KEY ?? '').length > 0,
+    hasWorkerSecret: (process.env.WORKER_SECRET ?? '').length > 0,
     urlHost: safeHost(url),
   }
 }
