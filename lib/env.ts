@@ -10,9 +10,17 @@ const serverSchema = z.object({
   SUPABASE_JWKS_URL: z.string().url().optional(),
   // WhatsApp Cloud API credentials (media download + verification).
   WHATSAPP_VERIFY_TOKEN: z.string().min(1, 'WHATSAPP_VERIFY_TOKEN is required').optional(),
+  // App secret for X-Hub-Signature-256 webhook validation (Meta dashboard:
+  // App settings > Basic > App Secret). Required in production; the webhook
+  // fails closed (rejects every delivery) when it is missing there.
+  WHATSAPP_APP_SECRET: z.string().min(1).optional(),
   WHATSAPP_ACCESS_TOKEN: z.string().min(1).optional(),
   WHATSAPP_PHONE_NUMBER_ID: z.string().min(1).optional(),
   WHATSAPP_GRAPH_VERSION: z.string().min(1).default('v21.0'),
+  // Keyed HMAC for WhatsApp sender identities. Generate with:
+  // node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  // NEVER commit the real value; rotate by re-keying whatsapp_identities.
+  WHATSAPP_IDENTITY_HMAC_KEY: z.string().min(32, 'WHATSAPP_IDENTITY_HMAC_KEY must be at least 32 chars').optional(),
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
   GEMINI_API_KEY: z.string().min(1).optional(),
   GEMINI_MODEL: z.string().min(1).default('gemini-1.5-flash'),
@@ -49,6 +57,7 @@ export function getPublicEnvInfo() {
     hasPublishableKey: (process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? '').length > 0,
     hasSecret: (process.env.SUPABASE_SECRET_KEY ?? '').length > 0,
     hasWhatsappToken: (process.env.WHATSAPP_VERIFY_TOKEN ?? '').length > 0,
+    hasWhatsappAppSecret: (process.env.WHATSAPP_APP_SECRET ?? '').length > 0,
     hasWhatsappAccessToken: (process.env.WHATSAPP_ACCESS_TOKEN ?? '').length > 0,
     hasGeminiKey: (process.env.GEMINI_API_KEY ?? '').length > 0,
     urlHost: safeHost(url),

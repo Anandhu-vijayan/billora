@@ -36,10 +36,36 @@ scripts/secret-scan.mjs          # `npm run secret-scan` — blocks secret-looki
 supabase/migrations/             # workspace-scoped schema + RLS (source of truth)
 ```
 
+## WhatsApp onboarding V1 (Phase 1)
+
+Flow: `Hi` → Individual / Organization buttons → (org: name → client list / add client) → collecting.
+No document-type question in V1 — classification is automatic in a later phase.
+
+### Implemented commands
+- `Help` — state-aware help text, no state change.
+- `Cancel` — resets to `cancelled`; `Hi` restarts.
+
+### Deferred to next phase
+- `Done` — ends the current batch (needs batch lifecycle).
+- `Change client` / `Add client` as mid-collection commands — add-client only exists inside onboarding.
+- `Change type` — obsolete in V1 (no manual document types).
+- Media→batch linking (media still uploads via the existing pipeline; batch linkage is Phase 2).
+
+### Manual migration (do NOT auto-apply)
+1. Review `supabase/migrations/20261010120000_whatsapp_onboarding_v1.sql`.
+2. Apply to the dev project first: `supabase db push` (or run the SQL in the dashboard SQL editor).
+3. Set `WHATSAPP_IDENTITY_HMAC_KEY` (32+ chars, server only) and restart the server.
+
+### Security notes
+- Sender identity is HMAC-SHA256 with `WHATSAPP_IDENTITY_HMAC_KEY`; raw phone numbers are never stored or logged.
+- Bot workspaces use `created_via='whatsapp'` with NULL `owner_user_id`; existing web workspaces keep their owners. New tables have RLS with no browser policies (service-role only).
+- Client selections are re-verified against the sender's workspace; unknown reply IDs re-prompt safely.
+
 ## Quality checks
 
 - `npm run lint` runs ESLint.
 - `npm run typecheck` runs the TypeScript compiler without emitting files.
+- `npm test` runs the zero-dependency onboarding contract tests (`node --test`).
 - `npm run secret-scan` fails on secret-looking staged diffs.
 - `npm run check` runs secret-scan, lint, and typecheck.
 - `npm run build` creates an optimized production build.

@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "check": "npm run secret-scan && npm run lint && npm run typecheck",
     "secret-scan": "node scripts/secret-scan.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test tests/onboarding.test.mjs"
   },
   "engines": {
     "node": ">=20.9.0"

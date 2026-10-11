@@ -89,7 +89,6 @@ export async function downloadWhatsAppMedia(args: {
     size: bytes.byteLength,
   }
   logger.info('[WhatsApp] media downloaded', {
-    mediaId,
     mimeType: downloaded.mimeType,
     extension,
     size: downloaded.size,
