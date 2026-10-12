@@ -113,6 +113,8 @@ export async function recordMediaIntake(
     originalFileName: string | null
     contentType: string
     fileSha256Hex?: string | null
+    keyVersion?: string | null
+    sizeBytes?: number | null
   },
 ): Promise<{ invoiceId: string; jobId: string; invoicePreexisting: boolean; jobPreexisting: boolean }> {
   const invoicePayload = {
@@ -122,6 +124,8 @@ export async function recordMediaIntake(
     original_file_name: args.originalFileName,
     content_type: args.contentType,
     file_sha256: args.fileSha256Hex ? `\\x${args.fileSha256Hex}` : null,
+    file_encryption_key_version: args.keyVersion ?? null,
+    size_bytes: args.sizeBytes ?? null,
     status: 'received',
   }
   const invoice = (await db.from('invoices').insert(invoicePayload).select('id').single() as unknown as {
@@ -198,6 +202,7 @@ export async function recordPendingUpload(
     fileSha256Hex: string | null
     sizeBytes: number
     providerMediaId: string | null
+    keyVersion?: string | null
   },
 ): Promise<string> {
   const row = (await db.from('pending_uploads').upsert({
@@ -207,6 +212,7 @@ export async function recordPendingUpload(
     content_type: args.contentType,
     file_sha256: args.fileSha256Hex ? `\\x${args.fileSha256Hex}` : null,
     size_bytes: args.sizeBytes,
+    file_encryption_key_version: args.keyVersion ?? null,
     provider_media_id: args.providerMediaId,
   }, { onConflict: 'object_path' }).select('id').single() as unknown as { data: { id: string } | null; error: { message: string } | null })
   if (row.error || !row.data) throw new Error(`PENDING_UPLOAD_RECORD_ERROR: ${row.error?.message ?? 'missing id'}`)
@@ -236,7 +242,7 @@ export async function assignPendingUploads(
 ): Promise<number> {
   const { data: rows, error } = await db
     .from('pending_uploads')
-    .select('id,object_path,original_file_name,content_type,file_sha256')
+    .select('id,object_path,original_file_name,content_type,file_sha256,size_bytes,file_encryption_key_version')
     .eq('sender_hmac', senderHmac)
     .eq('status', 'waiting_assignment')
     .order('created_at')
@@ -244,7 +250,8 @@ export async function assignPendingUploads(
   let assigned = 0
   for (const row of (rows ?? []) as Array<{
     id: string; object_path: string; original_file_name: string | null;
-    content_type: string; file_sha256: string | null
+    content_type: string; file_sha256: string | null;
+    size_bytes: number | null; file_encryption_key_version: string | null
   }>) {
     const shaHex = typeof row.file_sha256 === 'string'
       ? row.file_sha256.replace(/^\\x/i, '')
@@ -256,6 +263,8 @@ export async function assignPendingUploads(
       originalFileName: row.original_file_name,
       contentType: row.content_type,
       fileSha256Hex: shaHex,
+      keyVersion: row.file_encryption_key_version,
+      sizeBytes: row.size_bytes,
     })
     const { error: updateError } = await db
       .from('pending_uploads')

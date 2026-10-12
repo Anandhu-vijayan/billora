@@ -10,6 +10,10 @@ import { getSupabaseAdmin } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { safeTokenEqual } from '@/lib/whatsapp/verify';
 import { runWorkerTick } from '@/lib/jobs/worker';
+// Importing the handlers module registers the Phase-4 job handlers as a side
+// effect, so this tick finally claims invoice_extraction / register_generation
+// work. Without this import the queue stays inert (worker claims nothing).
+import '@/lib/jobs/handlers';
 
 export const dynamic = 'force-dynamic';
 

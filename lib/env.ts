@@ -29,6 +29,23 @@ const serverSchema = z.object({
     .string()
     .regex(HEX_64, 'ENCRYPTION_MASTER_KEY must be a 32-byte hex string (64 hex chars)')
     .optional(),
+  // Dedicated 32-byte hex key for the HMAC that derives opaque object paths.
+  // Deliberately separate from WHATSAPP_IDENTITY_HMAC_KEY and the encryption
+  // master key, so path derivation and content encryption never share a secret.
+  STORAGE_PATH_KEY: z
+    .string()
+    .regex(HEX_64, 'STORAGE_PATH_KEY must be a 32-byte hex string (64 hex chars)')
+    .optional(),
+  // Supabase Storage bucket slugs (read from env; literals are the safe default
+  // matching the provisioned buckets).
+  SUPABASE_INVOICES_BUCKET: z.string().min(1).default('billora-invoices'),
+  SUPABASE_EXPORTS_BUCKET: z.string().min(1).default('billora-exports'),
+  // Extraction engine selection (Stage 3). gemini is the only implemented
+  // provider; tesseract is reserved and unimplemented.
+  EXTRACTION_PROVIDER: z.enum(['gemini', 'tesseract']).default('gemini'),
+  EXTRACTION_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.8),
+  // Vision model for invoice extraction; defaults to GEMINI_MODEL when unset.
+  EXTRACTION_VISION_MODEL: z.string().min(1).optional(),
   // Durable job queue. The queue lives in Postgres; WORKER_SECRET only guards
   // the external trigger endpoint. Unset = endpoint disabled (fail closed).
   WORKER_SECRET: z.string().min(16, 'WORKER_SECRET must be at least 16 chars').optional(),
@@ -70,6 +87,10 @@ export function getPublicEnvInfo() {
     hasWhatsappAccessToken: (process.env.WHATSAPP_ACCESS_TOKEN ?? '').length > 0,
     hasGeminiKey: (process.env.GEMINI_API_KEY ?? '').length > 0,
     hasWorkerSecret: (process.env.WORKER_SECRET ?? '').length > 0,
+    // Booleans/labels only — never key material.
+    hasEncryptionKey: HEX_64.test(process.env.ENCRYPTION_MASTER_KEY ?? ''),
+    hasPathKey: HEX_64.test(process.env.STORAGE_PATH_KEY ?? ''),
+    extractionProvider: process.env.EXTRACTION_PROVIDER ?? 'gemini',
     urlHost: safeHost(url),
   }
 }

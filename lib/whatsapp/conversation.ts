@@ -15,6 +15,16 @@ export const REPLY_IDS = {
   CLIENT_PREFIX: 'billora:client:',
   CONFIRM_YES: 'billora:confirm:yes',
   CONFIRM_NO: 'billora:confirm:no',
+  // Optional navigation menu (Stage 2). Namespaced so unknown/stale ids degrade
+  // to a safe re-prompt rather than an action. Labels are never authoritative.
+  MENU_PREFIX: 'billora:menu:',
+  MENU_STATUS: 'billora:menu:status',
+  MENU_CHANGE_CLIENT: 'billora:menu:change_client',
+  MENU_ADD_CLIENT: 'billora:menu:add_client',
+  MENU_REVIEW: 'billora:menu:review',
+  MENU_DONE: 'billora:menu:done',
+  MENU_HELP: 'billora:menu:help',
+  MENU_CANCEL: 'billora:menu:cancel',
 } as const
 
 export const COMMANDS = {
@@ -37,6 +47,7 @@ export type OutboundMessage =
   | { kind: 'text'; body: string }
   | { kind: 'account_type_buttons' }
   | { kind: 'client_list'; clients: Array<{ id: string; name: string }> }
+  | { kind: 'menu_list'; workspace: boolean }
   | { kind: 'none' }
 
 export interface TransitionInput {
@@ -74,10 +85,16 @@ export function transition(input: TransitionInput): TransitionResult {
         outbound: { kind: 'text', body: 'Cancelled. Send Hi anytime to start again.' }, note: 'cancel' }
     }
     if (norm === COMMANDS.HELP || norm === 'help me' || norm === '?') {
+      // Onboarded users get the actionable list; pre-onboarding gets guidance text.
+      if (session.workspaceId) {
+        return { nextState: session.state, outbound: { kind: 'menu_list', workspace: true }, note: 'help' }
+      }
       return { nextState: session.state, outbound: { kind: 'text', body: helpText(session.state) }, note: 'help' }
     }
     if (norm === COMMANDS.MENU) {
-      return { nextState: session.state, outbound: { kind: 'text', body: menuText(session) }, note: 'menu' }
+      // Interactive list is optional navigation; text is preserved as a fallback
+      // body so the send layer can degrade to plain text if the list is blocked.
+      return { nextState: session.state, outbound: { kind: 'menu_list', workspace: !!session.workspaceId }, note: 'menu' }
     }
     if (norm === COMMANDS.DONE) {
       if (session.workspaceId) {
@@ -97,6 +114,12 @@ export function transition(input: TransitionInput): TransitionResult {
       }
       return { nextState: session.state, outbound: { kind: 'text', body: 'Finish setup first — send Hi.' }, note: 'no-workspace' }
     }
+  }
+  // Interactive menu selections (Stage 2) are intercepted BEFORE the state
+  // switch and reuse the SAME notes the text commands emit — no parallel state
+  // machine. A display label never authorizes an action; only the id routes.
+  if (replyId && replyId.startsWith(REPLY_IDS.MENU_PREFIX)) {
+    return menuTransition(session, replyId)
   }
   switch (session.state) {
     case 'new':
@@ -206,7 +229,45 @@ function helpText(state: ConversationState): string {
   return 'Send Hi to begin. You will choose Individual or Organization / CA firm. Commands: Help, Cancel.'
 }
 
-function menuText(session: SessionSnapshot): string {
+/**
+ * Route an interactive `billora:menu:*` selection to the SAME note the matching
+ * text command emits, so the existing branches handle it (no parallel state
+ * machine). Unknown or stale menu ids degrade to a safe re-prompt (the list
+ * again) and never trigger an action; a display label is not authorization.
+ */
+function menuTransition(session: SessionSnapshot, replyId: string): TransitionResult {
+  const ws = !!session.workspaceId
+  switch (replyId) {
+    case REPLY_IDS.MENU_CANCEL:
+      return { nextState: 'cancelled',
+        outbound: { kind: 'text', body: 'Cancelled. Send Hi anytime to start again.' }, note: 'cancel' }
+    case REPLY_IDS.MENU_HELP:
+      return ws
+        ? { nextState: session.state, outbound: { kind: 'menu_list', workspace: true }, note: 'help' }
+        : { nextState: session.state, outbound: { kind: 'text', body: helpText(session.state) }, note: 'help' }
+    case REPLY_IDS.MENU_DONE:
+      return ws
+        ? { nextState: session.state, outbound: { kind: 'none' }, note: 'done' }
+        : { nextState: session.state, outbound: { kind: 'text', body: helpText(session.state) }, note: 'done-not-onboarded' }
+    case REPLY_IDS.MENU_CHANGE_CLIENT:
+      return ws
+        ? { nextState: 'awaiting_client_select', outbound: { kind: 'none' }, note: 'change-client-requested' }
+        : { nextState: session.state, outbound: { kind: 'text', body: 'Finish setup first — send Hi.' }, note: 'no-workspace' }
+    case REPLY_IDS.MENU_ADD_CLIENT:
+      return ws
+        ? { nextState: 'awaiting_client_name', outbound: { kind: 'text', body: 'Send the new client name.' }, note: 'client-add-requested' }
+        : { nextState: session.state, outbound: { kind: 'text', body: 'Finish setup first — send Hi.' }, note: 'no-workspace' }
+    case REPLY_IDS.MENU_STATUS:
+      return { nextState: session.state, outbound: { kind: 'none' }, note: 'status-requested' }
+    case REPLY_IDS.MENU_REVIEW:
+      return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-requested' }
+    default:
+      // Unknown/stale menu id: re-show the menu, state untouched, no action.
+      return { nextState: session.state, outbound: { kind: 'menu_list', workspace: ws }, note: 'menu' }
+  }
+}
+
+export function menuText(session: SessionSnapshot): string {
   if (!session.workspaceId) return 'Send Hi to begin setup. Commands: Help, Cancel.'
   return [
     'Billora menu:',

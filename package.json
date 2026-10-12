@@ -12,6 +12,7 @@
     "secret-scan": "node scripts/secret-scan.mjs",
     "smoke": "node scripts/smoke.mjs",
     "worker:poll": "node scripts/worker-poll.mjs",
+    "reencrypt:legacy": "node scripts/reencrypt-legacy.mjs",
     "test": "node --test tests/onboarding.test.mjs"
   },
   "engines": {

@@ -127,3 +127,42 @@ export function sendConfirmApply(to: string, count: number, clientName: string):
     },
   })
 }
+
+/**
+ * Optional navigation menu — an interactive Cloud API list (up to 10 rows).
+ * Never an upload gate: invoices are accepted regardless. With no workspace
+ * only Help/Cancel are offered (setup guidance is a reply, not an action).
+ * Row ids are the `billora:menu:*` namespace the conversation layer validates;
+ * display titles are never treated as authorization.
+ */
+export function sendMenu(to: string, opts: { workspace: boolean }): Promise<SendOutcome> {
+  const rows = opts.workspace
+    ? [
+        { id: 'billora:menu:status', title: 'Status & how to send' },
+        { id: 'billora:menu:change_client', title: 'Change client' },
+        { id: 'billora:menu:add_client', title: 'Add client' },
+        { id: 'billora:menu:review', title: 'Review held / flagged' },
+        { id: 'billora:menu:done', title: 'Done with this batch' },
+        { id: 'billora:menu:help', title: 'Help' },
+        { id: 'billora:menu:cancel', title: 'Cancel' },
+      ]
+    : [
+        { id: 'billora:menu:help', title: 'Help' },
+        { id: 'billora:menu:cancel', title: 'Cancel' },
+      ]
+  return postMessage({
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Billora menu' },
+      body: {
+        text: opts.workspace
+          ? 'Choose an option — or just send an invoice PDF/photo anytime; you never need the menu to upload.'
+          : 'Welcome to Billora. Choose an option to get started, or send Hi.',
+      },
+      action: { button: 'Options', sections: [{ title: 'Menu', rows }] },
+    },
+  })
+}

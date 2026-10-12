@@ -5,6 +5,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { importTs } from '../scripts/_ts-import.mjs'
 
 const REPLY = {
   IND: 'billora:account:individual',
@@ -39,6 +41,36 @@ const p3SqlSrc = () => readFileSync(
 const queueSrc = () => readFileSync(new URL('../lib/jobs/queue.ts', import.meta.url), 'utf8')
 const workerSrc = () => readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
 const workerRouteSrc = () => readFileSync(new URL('../app/api/jobs/worker/route.ts', import.meta.url), 'utf8')
+const filesSrc = () => readFileSync(new URL('../lib/encryption/files.ts', import.meta.url), 'utf8')
+const envSrc = () => readFileSync(new URL('../lib/env.ts', import.meta.url), 'utf8')
+const serverSrc = () => readFileSync(new URL('../lib/supabase/server.ts', import.meta.url), 'utf8')
+const encSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261012000000_invoice_storage_encryption.sql', import.meta.url), 'utf8')
+const encMenuSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261012120000_whatsapp_menu_outbound_decoupling.sql', import.meta.url), 'utf8')
+const visionSrc = () => readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
+const extractSrc = () => readFileSync(new URL('../lib/jobs/handlers/extract-invoice.ts', import.meta.url), 'utf8')
+const registerSrc = () => readFileSync(new URL('../lib/jobs/handlers/build-register.ts', import.meta.url), 'utf8')
+const handlersIndexSrc = () => readFileSync(new URL('../lib/jobs/handlers/index.ts', import.meta.url), 'utf8')
+const extractionSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261012190000_extraction_register.sql', import.meta.url), 'utf8')
+const qualitySrc = () => readFileSync(new URL('../lib/ocr/quality.ts', import.meta.url), 'utf8')
+
+// Stage-1 envelope crypto is exercised against the REAL module (transpiled),
+// not a copy, so a format drift cannot silently pass here and break Stage-3.
+const files = await importTs('lib/encryption/files.ts')
+// conversation.ts imports only erased types, so it transpiles to pure JS and
+// the menu routing is tested behaviorally against the REAL state machine.
+const conv = await importTs('lib/whatsapp/conversation.ts')
+// ledger.ts is dependency-free (no aliases/provider imports), so the REAL
+// extraction-review decision logic is exercised in-process, not reimplemented.
+const ledger = await importTs('lib/ocr/ledger.ts')
+const MASTER = randomBytes(32).toString('hex')
+const PATHK = randomBytes(32).toString('hex')
+function sess(state, workspaceId = null) {
+  return { senderHmac: 'h', state, workspaceId, clientId: null, batchId: null,
+    pendingClientId: null, lastProviderMessageId: null, expired: false }
+}
 
 test('A1 reply-id namespace is validated (prefix + uuid shape)', () => {
   const good = 'billora:client:123e4567-e89b-12d3-a456-426614174000'
@@ -260,7 +292,9 @@ test('E3 media holds, never orphans: receive-first-ask-later + never guess a cli
   assert.match(src, /recordPendingUpload/)
   assert.match(src, /holdMedia/)
   assert.match(src, /accountType === 'organization' && !clientId/)
-  assert.match(src, /whatsapp\/pending\/\$\{mediaId\}/) // deterministic redelivery-safe path
+  // Encrypted intake: opaque deterministic hold path + plaintext never stored.
+  assert.match(src, /deriveObjectKey\('pending', mediaId, pathKeyHex\)/)
+  assert.match(src, /encryptFile\(downloaded\.buffer, masterKeyHex/)
   // Unsupported media gets a reply, not a DB error or retry loop.
   assert.match(src, /isAcceptedMediaType\(downloaded\.contentType\)/)
   assert.match(src, /PDF, JPG, or PNG/)
@@ -314,8 +348,8 @@ test('E6 a freshly-filed invoice is acknowledged; redelivery stays silent', () =
   // Clean filing must confirm receipt (was previously silent, confusing users).
   assert.match(src, /Invoice received and queued for processing/)
   // Guarded so a Meta webhook redelivery of the same media never double-pings.
-  assert.match(src, /if \(!deduped\)/)
-  const dedupIdx = src.indexOf('if (!deduped)')
+  assert.match(src, /if \(!deduped && !alreadyAcked\)/)
+  const dedupIdx = src.indexOf('if (!deduped && !alreadyAcked)')
   const sendIdx = src.indexOf('Invoice received and queued', dedupIdx)
   const acceptIdx = src.indexOf('accepted for queue')
   assert.ok(dedupIdx > 0 && sendIdx > dedupIdx, 'acknowledgment must fire inside the !deduped guard')
@@ -405,8 +439,8 @@ test('F5 intake and queueing are strictly idempotent: redelivery cannot double-f
   assert.match(rec, /eq\('job_type', 'invoice_extraction'\)/)
   // Never upsert an invoice: that would rewind a processed row's status.
   assert.ok(!rec.includes("from('invoices').upsert"), 'invoice must be insert-then-read, never upsert')
-  // Stored path is deterministic per provider media id.
-  assert.match(routeSrc(), /whatsapp\/invoices\/\$\{mediaId\}/)
+  // Stored path is a deterministic opaque HMAC per provider media id (Stage 1).
+  assert.match(routeSrc(), /deriveObjectKey\('invoices', mediaId, pathKeyHex\)/)
 })
 
 test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes success', () => {
@@ -438,4 +472,334 @@ test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes suc
   assert.match(route, /safeTokenEqual\(req\.headers\.get\('x-worker-token'\)/)
   assert.ok(!route.includes('searchParams.get'), 'worker secret must never travel in a URL')
   assert.match(route, /Math\.min\(Math\.max\(body\.limit as number, 1\), 25\)/)
+})
+
+// ---- Stage 1: envelope file encryption + opaque paths ----------------------
+
+function tamper(buf) {
+  const b = Buffer.from(buf)
+  b[b.length - 1] ^= 0x01 // flip one bit of the ciphertext tail
+  return b
+}
+
+test('G1 envelope round-trip returns the exact plaintext bytes', () => {
+  const plain = randomBytes(4096)
+  const ctx = 'whatsapp/invoices/abc.bin'
+  const enc = files.encryptFile(plain, MASTER, { context: ctx })
+  assert.equal(enc.sizeBytes, plain.length)
+  assert.match(enc.keyVersion, /^[0-9a-f]{16}$/)
+  const back = files.decryptFile(enc.container, MASTER, { context: ctx, expectedKeyVersion: enc.keyVersion })
+  assert.ok(Buffer.compare(back, plain) === 0, 'decrypt must reproduce plaintext exactly')
+  assert.ok(Buffer.compare(enc.container, plain) !== 0, 'container must not equal plaintext (never stored raw)')
+})
+
+test('G1b a fresh DEK per file: identical plaintext yields distinct containers', () => {
+  const plain = Buffer.from('same invoice bytes every time')
+  const ctx = 'whatsapp/invoices/dup.bin'
+  const a = files.encryptFile(plain, MASTER, { context: ctx })
+  const b = files.encryptFile(plain, MASTER, { context: ctx })
+  assert.ok(Buffer.compare(a.container, b.container) !== 0, 'random DEK + IV must make containers unique')
+  // ...and both still decrypt to the same plaintext under the same context.
+  assert.ok(Buffer.compare(files.decryptFile(a.container, MASTER, { context: ctx }), plain) === 0)
+  assert.ok(Buffer.compare(files.decryptFile(b.container, MASTER, { context: ctx }), plain) === 0)
+})
+
+test('G1c tampering ciphertext, context (AAD), or key-version all fail closed', () => {
+  const plain = randomBytes(1200)
+  const ctx = 'whatsapp/invoices/t.bin'
+  const enc = files.encryptFile(plain, MASTER, { context: ctx })
+  assert.throws(() => files.decryptFile(tamper(enc.container), MASTER, { context: ctx }),
+    (e) => e.name === 'MediaDecryptFailed', 'ciphertext tamper must throw MediaDecryptFailed')
+  assert.throws(() => files.decryptFile(enc.container, MASTER, { context: 'whatsapp/invoices/other.bin' }),
+    (e) => e.name === 'MediaDecryptFailed', 'wrong context/AAD must fail authentication')
+  assert.throws(() => files.decryptFile(enc.container, MASTER, { context: ctx, expectedKeyVersion: 'deadbeefdeadbeef' }),
+    (e) => e.name === 'MediaDecryptFailed', 'key-version mismatch must fail before decrypt')
+})
+
+test('G1d malformed or missing keys fail closed; wrong master key cannot decrypt', () => {
+  assert.throws(() => files.encryptFile(Buffer.from('x'), 'tooshort', { context: 'c' }),
+    (e) => e.name === 'EncryptionConfigError', 'non-64-hex master key must be rejected')
+  const enc = files.encryptFile(Buffer.from('secret invoice'), MASTER, { context: 'whatsapp/invoices/k.bin' })
+  const otherKey = randomBytes(32).toString('hex')
+  assert.throws(() => files.decryptFile(enc.container, otherKey, { context: 'whatsapp/invoices/k.bin' }),
+    (e) => e.name === 'MediaDecryptFailed', 'a different master key must not unwrap the DEK')
+  // Structural invariants in the real module: key boundary is length/charset
+  // validated, a fresh DEK is drawn per file, and decrypt has no plaintext
+  // fallback (it only ever returns authenticated plaintext or throws).
+  const mod = filesSrc()
+  assert.match(mod, /\[0-9a-fA-F\]\{64\}/, 'keys validated to exactly 64 hex chars')
+  assert.match(mod, /randomBytes\(DEK_LEN\)/, 'a fresh DEK is generated per file')
+  assert.ok(!/return container\b/.test(mod), 'decryptFile must never fall back to returning the input container')
+})
+
+test('G2 object paths are deterministic per media id, opaque, and scope-separated', () => {
+  const mediaId = '1013854642324610'
+  const p1 = files.deriveObjectKey('invoices', mediaId, PATHK)
+  const p2 = files.deriveObjectKey('invoices', mediaId, PATHK)
+  assert.equal(p1, p2, 'same media id must always resolve the same path (idempotent upsert)')
+  assert.ok(p1.endsWith('.bin') && p1.startsWith('whatsapp/invoices/'))
+  assert.ok(!p1.includes(mediaId), 'the raw media id must never appear in the path')
+  const other = files.deriveObjectKey('invoices', '9999999999999998', PATHK)
+  assert.notEqual(p1, other, 'distinct media ids must not collide')
+  // Same media id in a different scope is a different object (no cross-overwrite).
+  assert.notEqual(files.deriveObjectKey('pending', mediaId, PATHK), p1)
+  // A different path key produces different names (path key is dedicated + secret).
+  assert.notEqual(files.deriveObjectKey('invoices', mediaId, randomBytes(32).toString('hex')), p1)
+})
+
+test('G3 encryption wiring: keys required fail-closed, container uploaded as octet-stream', () => {
+  const src = routeSrc()
+  // Encrypt BEFORE upload, and upload the container (not the plaintext buffer).
+  const encIdx = src.indexOf('encryptFile(downloaded.buffer')
+  const upIdx = src.indexOf('.upload(objectPath, enc.container')
+  assert.ok(encIdx > 0 && upIdx > encIdx, 'encryptFile must precede the storage upload')
+  assert.match(src, /contentType: 'application\/octet-stream'/)
+  // Fail closed on missing keys before any storage call.
+  assert.match(src, /resolveFileKeyConfig\(\)/)
+  // Bucket name comes from env, never hardcoded in intake.
+  assert.match(src, /bucketFor\('invoices'\)/)
+  assert.ok(!/storage\.from\('billora-invoices'\)/.test(src), 'intake must not hardcode the bucket slug')
+  assert.match(serverSrc(), /SUPABASE_INVOICES_BUCKET|bucketFor/)
+})
+
+test('G3b env + migration: path/bucket/extraction vars and octet-stream bucket compat', () => {
+  const env = envSrc()
+  assert.match(env, /STORAGE_PATH_KEY: z/)
+  assert.match(env, /SUPABASE_INVOICES_BUCKET: z\.string\(\)\.min\(1\)\.default\('billora-invoices'\)/)
+  assert.match(env, /SUPABASE_EXPORTS_BUCKET: z\.string\(\)\.min\(1\)\.default\('billora-exports'\)/)
+  assert.match(env, /EXTRACTION_PROVIDER: z\.enum\(\['gemini', 'tesseract'\]\)/)
+  assert.match(env, /hasPathKey/)
+  const sql = encSqlSrc()
+  assert.match(sql, /add column if not exists file_encryption_key_version text/)
+  assert.match(sql, /add column if not exists size_bytes bigint/)
+  assert.match(sql, /'application\/octet-stream'/)
+  assert.match(sql, /where id = 'billora-invoices'/)
+  // Logical media typing is unchanged: invoices.content_type still CHECKs pdf/jpeg/png.
+  assert.match(initialSqlSrc(), /content_type is null or content_type in \([\s\S]*'image\/png'/)
+})
+
+test('G3c legacy re-encrypt script is dry-run by default and delete-gated', () => {
+  const s = readFileSync(new URL('../scripts/reencrypt-legacy.mjs', import.meta.url), 'utf8')
+  assert.match(s, /const APPLY = process\.env\.APPLY === '1'/)
+  assert.match(s, /process\.env\.DELETE === '1' && APPLY/)
+  // Never writes unless APPLY; never deletes unless APPLY && DELETE; verifies
+  // the container round-trips before repointing any row.
+  assert.match(s, /round-trip mismatch/)
+  assert.match(s, /no remaining row still references the old path|[\s\S]*still referenced/)
+})
+
+// ---- Stage 2: interactive menu + upload-first + inbound/outbound decoupling --
+
+test('G4a menu selections reuse the text-command notes (no parallel state machine)', () => {
+  const s = sess('collecting', 'w1')
+  const t = (id) => conv.transition({ session: s, replyId: id, text: null, providerMessageId: 'wm.' + id })
+  assert.equal(t('billora:menu:change_client').note, 'change-client-requested')
+  assert.equal(t('billora:menu:change_client').nextState, 'awaiting_client_select')
+  assert.equal(t('billora:menu:add_client').note, 'client-add-requested')
+  assert.equal(t('billora:menu:done').note, 'done')
+  assert.equal(t('billora:menu:cancel').note, 'cancel')
+  assert.equal(t('billora:menu:cancel').nextState, 'cancelled')
+  assert.equal(t('billora:menu:status').note, 'status-requested')
+  assert.equal(t('billora:menu:review').note, 'review-requested')
+  // status/review request a send without transitioning away from collecting.
+  assert.equal(t('billora:menu:status').nextState, 'collecting')
+  assert.equal(t('billora:menu:review').nextState, 'collecting')
+})
+
+test('G4b menu/help render an interactive list once onboarded; text is the fallback', () => {
+  const s = sess('collecting', 'w1')
+  assert.equal(conv.transition({ session: s, replyId: null, text: 'menu', providerMessageId: 'a' }).outbound.kind, 'menu_list')
+  assert.equal(conv.transition({ session: s, replyId: null, text: 'help', providerMessageId: 'b' }).outbound.kind, 'menu_list')
+  // Pre-onboarding help stays plain guidance text (no useless empty menu).
+  const helpNoWs = conv.transition({ session: sess('new', null), replyId: null, text: 'help', providerMessageId: 'c' })
+  assert.equal(helpNoWs.outbound.kind, 'text')
+  // Text commands remain first-class: a plain "change client" still works.
+  assert.equal(conv.transition({ session: s, replyId: null, text: 'change client', providerMessageId: 'd' }).note, 'change-client-requested')
+})
+
+test('G4c unknown/stale menu ids degrade to a safe re-prompt, never an action', () => {
+  const s = sess('collecting', 'w1')
+  const stale = conv.transition({ session: s, replyId: 'billora:menu:delete_everything', text: null, providerMessageId: 'z' })
+  assert.equal(stale.nextState, 'collecting', 'state must be untouched by a stale id')
+  assert.equal(stale.note, 'menu')
+  assert.equal(stale.outbound.kind, 'menu_list')
+})
+
+test('G4d sendMenu is a Cloud API list with namespaced ids and a no-workspace subset', () => {
+  const m = sendSrc().slice(sendSrc().indexOf('export function sendMenu'))
+  assert.match(m, /type: 'list'/)
+  for (const id of ['billora:menu:status', 'billora:menu:change_client', 'billora:menu:add_client',
+    'billora:menu:review', 'billora:menu:done', 'billora:menu:help', 'billora:menu:cancel']) {
+    assert.ok(m.includes(id), `menu row ${id} missing`)
+  }
+  // A Cloud API list allows at most 10 rows; the no-workspace case is Help/Cancel only.
+  assert.ok((m.match(/id: 'billora:menu:/g) || []).length <= 10)
+  assert.match(m, /opts\.workspace\s*\?\s*\[[\s\S]*:\s*\[[\s\S]*billora:menu:help[\s\S]*billora:menu:cancel/)
+})
+
+test('G4e route renders menu/status/review and decouples resend (never re-runs intake)', () => {
+  const src = routeSrc()
+  assert.match(src, /result\.outbound\.kind === 'menu_list'/)
+  assert.match(src, /deliverMenu\(result\.outbound\.workspace\)/)
+  assert.match(src, /note === 'status-requested'/)
+  assert.match(src, /note === 'review-requested'/)
+  assert.match(src, /async function resendPendingReply/)
+  assert.match(src, /updateSessionDeliveryState/)
+  // The resend path only sends — it must not re-run business operations.
+  const rpr = src.slice(src.indexOf('async function resendPendingReply'), src.indexOf('Onboarding + upload decision engine'))
+  assert.ok(!/recordMediaIntake|assignPendingUploads|transition\(/.test(rpr), 'resend must not re-run business ops')
+  // Ack fires once per session; later clean uploads stay silent (no nag).
+  assert.match(src, /upload_ack_sent_at: new Date\(\)/)
+})
+
+test('G4f Stage-2 session columns are additive; inbound idempotency is untouched', () => {
+  const sql = encMenuSqlSrc()
+  assert.match(sql, /add column if not exists last_reply_error_code text/)
+  assert.match(sql, /add column if not exists pending_reply_body text/)
+  assert.match(sql, /add column if not exists upload_ack_sent_at timestamptz/)
+  assert.match(sql, /add column if not exists/)
+  // The inbound idempotency ledger must not be altered (a comment may name it).
+  assert.ok(!/alter table public\.webhook_events|drop table[\s\S]*webhook_events|delete from webhook_events/i.test(sql),
+    'Stage 2 must not modify the inbound idempotency ledger')
+})
+
+// ---- Stage 3: extraction -> review -> batch -> register -> delivery ---------
+
+const CLEAN_ROW = {
+  invoice_date: '2026-09-05', invoice_number: 'INV-1', vendor_name: 'Acme Traders',
+  supplier_gstin: '27ABCDE1234F1Z5', taxable_value: 1000, cgst_amount: 90,
+  sgst_amount: 90, igst_amount: 0, total_amount: 1180,
+  confidence: {
+    invoice_date: 0.95, invoice_number: 0.95, vendor_name: 0.9, supplier_gstin: 0.92,
+    taxable_value: 0.95, cgst_amount: 0.9, sgst_amount: 0.9, igst_amount: 0.95, total_amount: 0.95,
+  },
+}
+const hiConf = (over = {}) => ({ ...CLEAN_ROW, ...over })
+
+test('G5a ledger approves a clean, confident, date-resolved row (real module)', () => {
+  const ev = ledger.evaluateLedger(CLEAN_ROW, { minConfidence: 0.8 })
+  assert.equal(ev.review, 'approved')
+  assert.equal(ev.invoiceDateResolved, true)
+  assert.deepEqual(ev.reasons, [])
+  assert.equal(ev.row.invoice_date, '2026-09-05')
+  assert.equal(ev.row.total_amount, 1180)
+})
+
+test('G5b ledger NEVER fabricates an unclear date; it flags review and keeps the text', () => {
+  // A day that does not exist must not be coerced to anything.
+  const ev = ledger.evaluateLedger(hiConf({ invoice_date: '31/02/2026' }), { minConfidence: 0.8 })
+  assert.equal(ev.review, 'needs_review')
+  assert.equal(ev.invoiceDateResolved, false)
+  assert.ok(ev.reasons.includes('invoice-date-unresolved'))
+  assert.equal(ev.row.invoice_date, '31/02/2026', 'original text preserved, never invented')
+  // Missing entirely -> empty, not today's date.
+  const empty = ledger.evaluateLedger(hiConf({ invoice_date: null }), { minConfidence: 0.8 })
+  assert.equal(empty.row.invoice_date, '')
+  assert.equal(empty.review, 'needs_review')
+})
+
+test('G5c ledger parses Indian day-first dates and rejects anomalies / low confidence', () => {
+  assert.equal(ledger.evaluateLedger(hiConf({ invoice_date: '5/9/2026' }), { minConfidence: 0.8 }).row.invoice_date, '2026-09-05')
+  const mismatch = ledger.evaluateLedger(hiConf({ total_amount: 9999 }), { minConfidence: 0.8 })
+  assert.equal(mismatch.review, 'needs_review')
+  assert.ok(mismatch.reasons.some((r) => r.startsWith('total-mismatch')))
+  const badGstin = ledger.evaluateLedger(hiConf({ supplier_gstin: 'NOTAGSTIN' }), { minConfidence: 0.8 })
+  assert.ok(badGstin.reasons.includes('gstin-invalid'))
+  const lowConf = ledger.evaluateLedger(hiConf({ confidence: { ...CLEAN_ROW.confidence, total_amount: 0.4 } }), { minConfidence: 0.8 })
+  assert.equal(lowConf.review, 'needs_review')
+  assert.ok(lowConf.reasons.some((r) => r.startsWith('low-confidence')))
+})
+
+test('G5d ledger GSTIN rule matches lib/ocr/quality.ts exactly (no drift)', () => {
+  const grab = (s) => { const m = /const GSTIN_RE = (\/[^\n]+\/)/.exec(s); assert.ok(m, 'GSTIN_RE missing'); return m[1] }
+  const ledgerSrc = readFileSync(new URL('../lib/ocr/ledger.ts', import.meta.url), 'utf8')
+  assert.equal(grab(ledgerSrc), grab(qualitySrc()))
+})
+
+test('G5e both Phase-4 handlers register and the worker imports the seam (queue stops being inert)', () => {
+  const idx = handlersIndexSrc()
+  assert.match(idx, /registerJobHandler\('invoice_extraction', extractInvoice\)/)
+  assert.match(idx, /registerJobHandler\('register_generation', buildRegister\)/)
+  assert.match(workerRouteSrc(), /import '@\/lib\/jobs\/handlers'/)
+  // Contract: with no handler registered a tick claims nothing (never half-process).
+  assert.match(workerSrc(), /if \(jobTypes\.length === 0\)/)
+})
+
+test('G5f extraction decrypts in-memory, routes review, and only enqueues the register when the batch is ready', () => {
+  const s = extractSrc()
+  assert.ok(s.includes('context: invoice.file_object_path'), 'decrypt AAD context is the object path')
+  assert.ok(s.includes('expectedKeyVersion: invoice.file_encryption_key_version'), 'key version enforced')
+  assert.ok(s.includes('isMediaDecryptFailure'), 'tampered container -> permanent, never plaintext')
+  assert.ok(s.includes('if (env.EXTRACTION_PROVIDER !== \'gemini\')'), 'unimplemented provider fails closed')
+  assert.ok(s.includes('e instanceof VisionTransientError) throw e'), 'transient provider error requeues')
+  assert.ok(s.includes("onConflict: 'invoice_id'"), 'extracted_records upsert is idempotent')
+  assert.ok(s.includes('status: evaluation.review'), 'approved->completed / else needs_review')
+  // Scheduling is unconditional + deduped here; readiness is enforced in build_register
+  // (never gate the enqueue here or two workers finishing together can deadlock).
+  assert.ok(s.includes('await enqueueRegisterGeneration(db, args.workspaceId, batchId)'), 'register scheduled on approve')
+  assert.ok(!s.includes('outstanding === 0'), 'extract must NOT gate scheduling on batch quiescence')
+  assert.ok(s.includes('max_attempts: 12'), 'register gets a readiness-retry attempt budget')
+  // Every read/write is tenant-scoped.
+  assert.ok(s.includes(".eq('workspace_id', workspaceId).eq('id', invoiceId)"))
+})
+
+test('G6a workbook object key is deterministic per batch under the path key (real module)', () => {
+  const a = files.deriveWorkbookKey('batch-aaa', PATHK)
+  assert.equal(a, files.deriveWorkbookKey('batch-aaa', PATHK))
+  assert.ok(a.startsWith('whatsapp/exports/') && a.endsWith('.xlsx'))
+  assert.notEqual(a, files.deriveWorkbookKey('batch-bbb', PATHK))
+  assert.throws(() => files.deriveWorkbookKey('x', 'not-a-key'), /STORAGE_PATH_KEY/)
+})
+
+test('G6b register builds from approved rows, uploads deterministically, versions, and delivers best-effort', () => {
+  const s = registerSrc()
+  assert.ok(s.includes("throw new PermanentJobError('REGISTER_MISSING_BATCH')"))
+  assert.ok(s.includes(".eq('workspace_id', workspaceId).eq('id', batchId)"), 'batch verified to belong to workspace')
+  assert.ok(s.includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'deterministic export path')
+  assert.ok(s.includes("contentType: SPREADSHEET_MIME, upsert: true"))
+  assert.ok(s.includes("status: 'expired'"), 'prior workbook retired (freshness)')
+  assert.match(s, /version, generated_at: new Date\(\)/)
+  assert.ok(s.includes('createSignedUrl(exportPath, SIGNED_URL_TTL_SECONDS)'))
+  assert.ok(s.includes('updateSessionDeliveryState(db, senderHmac'), 'delivery via next inbound reply')
+  // Batch readiness gate lives HERE: never build a premature workbook.
+  assert.ok(s.includes("eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])"))
+  assert.ok(s.includes('REGISTER_NOT_READY'), 'requeues while siblings are in flight')
+  // Delivery is orthogonal to generation: it is caught and NEVER fails the job.
+  const sched = s.slice(s.indexOf('async function scheduleDelivery'))
+  assert.match(sched, /catch \(e\)/)
+  assert.ok(s.includes('SEND_DEFERRED'))
+  // A batch with nothing approved is a no-op completion, not a failure.
+  assert.match(s, /rows\.length === 0[\s\S]*return/)
+})
+
+test('G6c Stage-3 migration wires batch linkage, register dedup, and the batch RPC (service-role only)', () => {
+  const sql = extractionSqlSrc()
+  assert.ok(sql.includes('add column if not exists batch_id uuid references public.invoice_batches(id)'))
+  assert.ok(sql.includes('processing_jobs_batch_uniq'))
+  assert.match(sql, /where batch_id is not null and invoice_id is null/)
+  assert.ok(sql.includes('create or replace function public.ensure_invoice_batch'))
+  assert.match(sql, /nulls not distinct/)
+  assert.ok(sql.includes('security definer'), 'batch RPC is definer-scoped')
+  // Service-role only: no browser/anon access to the batch resolver.
+  assert.match(sql, /revoke all on function public\.ensure_invoice_batch\(uuid, uuid, date, date\)\s*\n\s*from public, anon, authenticated/)
+  assert.match(sql, /grant execute on function public\.ensure_invoice_batch\(uuid, uuid, date, date\)\s*\n\s*to service_role/)
+  assert.ok(sql.includes('add column if not exists version integer'))
+  assert.ok(sql.includes('add column if not exists generated_at timestamptz'))
+})
+
+test('G6d vision is provider-gated with a strict schema and transient/permanent taxonomy', () => {
+  const s = visionSrc()
+  assert.ok(s.includes('class VisionTransientError') && s.includes('class VisionPermanentError'))
+  assert.ok(s.includes("responseMimeType: 'application/json'"))
+  assert.ok(s.includes('responseSchema: LEDGER_SCHEMA'))
+  assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
+  assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
+})
+
+test('G6e JOB_TYPES alignment: both Phase-4 job kinds stay in the TS enum and phase3 CHECK', () => {
+  for (const jt of ['invoice_extraction', 'register_generation']) {
+    assert.ok(statusesSrc().includes(`'${jt}'`), `${jt} missing from statuses.ts`)
+    assert.ok(p3SqlSrc().includes(`'${jt}'`), `${jt} missing from phase3 job_type CHECK`)
+    assert.ok(handlersIndexSrc().includes(`registerJobHandler('${jt}'`), `${jt} not registered`)
+  }
 })

@@ -2,15 +2,16 @@
 import { createHash } from 'crypto';
 import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { getSupabaseAdmin } from '@/lib/supabase/server';
+import { getSupabaseAdmin, bucketFor } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { isAcceptedMediaType } from '@/lib/statuses';
+import { encryptFile, deriveObjectKey, resolveFileKeyConfig } from '@/lib/encryption/files';
 import { downloadWhatsAppMedia, isPermanentMediaFailure } from '@/lib/whatsapp/media';
 import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
-import { transition, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
-import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot } from '@/lib/whatsapp/sessions';
-import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, type SendOutcome } from '@/lib/whatsapp/send';
+import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
+import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState } from '@/lib/whatsapp/sessions';
+import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, type SendOutcome } from '@/lib/whatsapp/send';
 import {
   ensureIndividualWorkspace, ensureOrganizationWorkspace,
   listClients, createClient, verifyClientInWorkspace,
@@ -134,46 +135,82 @@ async function handleOnboardingSideEffects(
 
   // Outbound sends happen only after durable persistence. Failures never throw:
   // the intake stays accepted and delivery is tracked separately (rule 5).
+  // A failed (transient/blocked) TEXT reply is remembered and best-effort
+  // resent on the sender's NEXT inbound message — never re-running a completed
+  // business operation. Inbound idempotency (webhook_events) is untouched.
   let sendOutcome: SendOutcome = 'ok';
   const track = (outcome: SendOutcome): void => {
     if (outcome === 'blocked') sendOutcome = 'blocked';
     else if (outcome === 'transient' && sendOutcome !== 'blocked') sendOutcome = 'transient';
   };
+  const deliverText = async (body: string): Promise<void> => {
+    const o = await sendText(to, body);
+    if (o === 'ok') await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
+    else await updateSessionDeliveryState(db, hmac, { pending_reply_body: body, last_reply_error_code: o });
+    track(o);
+  };
+  // Menu/list/button sends are re-derivable, so a failed one records only the
+  // error code (no body resend); a failed interactive list degrades to text.
+  const deliverMenu = async (workspace: boolean): Promise<void> => {
+    const o = await sendMenu(to, { workspace });
+    if (o === 'ok') { await updateSessionDeliveryState(db, hmac, { last_reply_error_code: null }); track(o); return }
+    await updateSessionDeliveryState(db, hmac, { last_reply_error_code: o });
+    await deliverText(menuText({ ...snapshot, workspaceId: workspace ? (workspaceId ?? snapshot.workspaceId) : null }));
+  };
+  const countNeedsReview = async (): Promise<number> => {
+    if (!workspaceId) return 0;
+    const { count } = await db.from('invoices').select('id', { count: 'exact', head: true })
+      .eq('workspace_id', workspaceId).eq('status', 'needs_review');
+    return count ?? 0;
+  };
   const sendStateMessage = async (): Promise<void> => {
     if (result.note === 'individual-selected') {
       const held = assignedNow > 0 ? ` I also filed the ${assignedNow} invoice file(s) you sent earlier.` : '';
-      track(await sendText(to, `Your workspace is ready. Send invoice PDFs or photos here.${held}`));
+      await deliverText(`Your workspace is ready. Send invoice PDFs or photos here.${held}`);
     } else if (result.note.startsWith('org-name:')) {
       const clients = await listClients(db, workspaceId as string);
       if (clients.length > 0) { track(await sendClientList(to, clients)); }
       else {
-        track(await sendText(to, 'Organization workspace created. No clients yet — send the first client name.'));
+        await deliverText('Organization workspace created. No clients yet — send the first client name.');
       }
     } else if (result.note === 'reprompt-client-list' || result.note === 're-list-clients'
       || result.note === 'change-client-requested') {
       if (workspaceId) track(await sendClientList(to, await listClients(db, workspaceId)));
     } else if (result.note.startsWith('client-name:')) {
-      track(await sendText(to, 'Client saved. Send invoice PDFs or photos here.'));
+      await deliverText('Client saved. Send invoice PDFs or photos here.');
     } else if (result.note === 'client-selected') {
-      track(await sendText(to, 'Client selected. Send invoice PDFs or photos here.'));
+      await deliverText('Client selected. Send invoice PDFs or photos here.');
     } else if (result.note === 'client-selection-rejected') {
-      track(await sendText(to, 'That client is not available. Choose from the list below.'));
+      await deliverText('That client is not available. Choose from the list below.');
       if (workspaceId) track(await sendClientList(to, await listClients(db, workspaceId)));
     } else if (result.note === 'awaiting-pending-confirm' || result.note === 'pending-confirm-stale') {
       // noop: handled by the confirm branch below / generic text.
     } else if (result.note === 'pending-confirm-yes') {
-      track(await sendText(to, assignedNow > 0
+      await deliverText(assignedNow > 0
         ? `Applied to ${assignedNow} file(s) — they're queued for processing. Send more invoices anytime.`
-        : 'Applied. Nothing was held for you. Send invoice PDFs or photos here.'));
+        : 'Applied. Nothing was held for you. Send invoice PDFs or photos here.');
     } else if (result.note === 'welcome-back') {
       const waiting = await countWaitingUploads(db, hmac);
-      track(await sendText(to, waiting > 0
+      await deliverText(waiting > 0
         ? `Welcome back to Billora. Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them, or just send more invoices.`
-        : 'Welcome back to Billora — send invoice PDFs or photos here. Send Menu for options.'));
+        : 'Welcome back to Billora — send invoice PDFs or photos here. Send Menu for options.');
     } else if (result.note === 'done') {
-      track(await sendText(to, 'Done — your uploads are queued for processing. Send more invoices anytime, or type Menu.'));
+      await deliverText('Done — your uploads are queued for processing. Send more invoices anytime, or type Menu.');
+    } else if (result.note === 'status-requested') {
+      const waiting = await countWaitingUploads(db, hmac).catch(() => 0);
+      await deliverText(!workspaceId
+        ? "You're not set up yet — send Hi to begin, or just send an invoice and I'll hold it safely."
+        : `You're ready. Send invoice PDFs or photos anytime.${waiting > 0 ? ` ${waiting} file(s) are held for a client — send Change client to assign them.` : ''} Send Done when this batch is finished, or Menu for options.`);
+    } else if (result.note === 'review-requested') {
+      const waiting = await countWaitingUploads(db, hmac).catch(() => 0);
+      const flagged = await countNeedsReview().catch(() => 0);
+      await deliverText(waiting === 0 && flagged === 0
+        ? 'Nothing needs your attention right now — keep sending invoices.'
+        : `Needs attention: ${waiting} file(s) held for a client${flagged > 0 ? `, ${flagged} invoice(s) flagged for review` : ''}. Send Change client to assign held files.`);
+    } else if (result.outbound.kind === 'menu_list') {
+      await deliverMenu(result.outbound.workspace);
     } else if (result.outbound.kind === 'text') {
-      track(await sendText(to, result.outbound.body));
+      await deliverText(result.outbound.body);
     } else if (result.outbound.kind === 'account_type_buttons') {
       track(await sendAccountTypeButtons(to));
     }
@@ -312,6 +349,27 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
 }
 
 /**
+ * Best-effort resend of a reply that failed delivery earlier (rule 5 decouples
+ * outbound from inbound). Fires at the top of a NEW inbound message and only
+ * sends — it never re-runs intake or onboarding side effects, so a completed
+ * business operation cannot be duplicated. Cleared on success; left stored on
+ * any non-ok so the next message retries. Never throws.
+ */
+async function resendPendingReply(db: Db, hmac: string, to: string): Promise<void> {
+  try {
+    const { data } = await db.from('whatsapp_sessions').select('pending_reply_body')
+      .eq('sender_hmac', hmac).maybeSingle();
+    const body = (data?.pending_reply_body as string | null) ?? null;
+    if (!body) return;
+    const o = await sendText(to, body);
+    if (o === 'ok') {
+      await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
+      logger.info('[WhatsApp] deferred reply resent');
+    }
+  } catch { /* delivery is best-effort; ignore and try again next message */ }
+}
+
+/**
  * Onboarding + upload decision engine for one message. Throws only when the
  * work is NOT durably recorded (caller marks intake failed -> Meta retries).
  * Media lifecycle: validate type -> store privately + SHA-256 -> invoice
@@ -324,6 +382,11 @@ async function processMessage(
 ): Promise<void> {
   const replyId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || null;
   const textBody = message.text?.body ?? null;
+  // Decoupled outbound retry: if a previous reply failed delivery, resend it
+  // now (send only — no business operation re-runs), before normal processing.
+  if (message.from) {
+    try { await resendPendingReply(db, senderHmac(message.from), message.from); } catch { /* best effort */ }
+  }
   let onboardingWorkspaceId: string | null = null;
   let onboardingClientId: string | null = null;
   if ((message.type === 'text' || message.type === 'interactive') && message.from) {
@@ -381,17 +444,26 @@ async function processMessage(
   const workspaceId = onboardingWorkspaceId ?? mSession.workspace_id;
   const clientId = onboardingClientId ?? mSession.client_id;
 
+  // Envelope-encrypt the ORIGINAL bytes before they ever touch storage. A
+  // missing/misconfigured key throws here (fail closed) so plaintext is never
+  // stored; Meta retries the delivery. The SHA-256 above stays over plaintext
+  // for dedup + integrity; the stored blob is the self-describing container.
+  const { masterKeyHex, pathKeyHex } = resolveFileKeyConfig();
+  const invoiceBucket = bucketFor('invoices');
+
   // Deterministic private hold path: redelivery of the same provider media id
-  // overwrites the same object + upserts the same row — never a duplicate hold.
+  // resolves to the same opaque object + upserts the same row — never a
+  // duplicate hold, and never collides with an unrelated file.
   const holdMedia = async (): Promise<string> => {
-    const pendingPath = `whatsapp/pending/${mediaId}.${downloaded.extension}`;
-    const { error: pendingUploadError } = await db.storage.from('billora-invoices')
-      .upload(pendingPath, downloaded.buffer, { contentType: downloaded.contentType, upsert: true });
+    const pendingPath = deriveObjectKey('pending', mediaId, pathKeyHex);
+    const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: pendingPath });
+    const { error: pendingUploadError } = await db.storage.from(invoiceBucket)
+      .upload(pendingPath, enc.container, { contentType: 'application/octet-stream', upsert: true });
     if (pendingUploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${pendingUploadError.message}`);
     await recordPendingUpload(db, {
       senderHmac: mHmac, objectPath: pendingPath, originalFileName: media?.filename ?? null,
       contentType: downloaded.contentType, fileSha256Hex: sha256Hex,
-      sizeBytes: downloaded.size, providerMediaId: mediaId,
+      sizeBytes: enc.sizeBytes, providerMediaId: mediaId, keyVersion: enc.keyVersion,
     });
     return pendingPath;
   };
@@ -426,31 +498,35 @@ async function processMessage(
   // Assigned path is deterministic too (per provider media id): combined with
   // the invoices.file_object_path unique constraint, a redelivery can never
   // store or queue the same file twice, whatever the retry timing.
-  const objectPath = `whatsapp/invoices/${mediaId}.${downloaded.extension}`;
-  const { error: uploadError } = await db.storage.from('billora-invoices')
-    .upload(objectPath, downloaded.buffer, { contentType: downloaded.contentType, upsert: true });
+  const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
+  const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath });
+  const { error: uploadError } = await db.storage.from(invoiceBucket)
+    .upload(objectPath, enc.container, { contentType: 'application/octet-stream', upsert: true });
   if (uploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${uploadError.message}`);
   const recorded = await recordMediaIntake(db, {
     workspaceId, clientId, objectPath,
     originalFileName: media?.filename ?? null, contentType: downloaded.contentType,
-    fileSha256Hex: sha256Hex,
+    fileSha256Hex: sha256Hex, keyVersion: enc.keyVersion, sizeBytes: enc.sizeBytes,
   });
   const waiting = await countWaitingUploads(db, mHmac).catch(() => 0);
   const deduped = recorded.invoicePreexisting || recorded.jobPreexisting;
   logger.info('[WhatsApp] media intake recorded', {
-    shortId, size: downloaded.size,
+    shortId, size: enc.sizeBytes,
     invoice: recorded.invoiceId.slice(0, 8), job: recorded.jobId.slice(0, 8),
     deduped,
   });
   // Acknowledge a freshly-filed invoice so a clean upload is never silent
   // (rule 5: send is best-effort — a delivery failure never rewinds the
   // accepted intake). A webhook redelivery dedups to the same invoice/job and
-  // stays quiet, so Meta retries never double-ping the sender.
-  if (!deduped) {
+  // stays quiet, so Meta retries never double-ping the sender. After the FIRST
+  // ack in a session, subsequent clean uploads are silent (no repetitive nag).
+  const alreadyAcked = !!mSession.upload_ack_sent_at;
+  if (!deduped && !alreadyAcked) {
     const held = waiting > 0 && clientId
       ? ` Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them.`
       : '';
-    await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
+    const o = await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
+    if (o === 'ok') await updateSessionDeliveryState(db, mHmac, { upload_ack_sent_at: new Date().toISOString() });
   }
 }
 

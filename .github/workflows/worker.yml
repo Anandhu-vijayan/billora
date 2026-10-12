@@ -1,0 +1,47 @@
+name: Worker Tick
+
+# Phase 4 extraction/register run from the durable Postgres queue. On a
+# serverless host nothing wakes the worker on its own, so this schedule drives
+# one tick of POST /api/jobs/worker per interval. On a persistent host use
+# `npm run worker:poll` instead — both call the same endpoint.
+#
+# The endpoint is fail-closed: without WORKER_SECRET (repo secret) and a
+# deployed APP_URL (repo variable) it returns 503/401 and this workflow is a
+# harmless no-op. Real work also needs ENCRYPTION_MASTER_KEY, STORAGE_PATH_KEY
+# and GEMINI_API_KEY configured on the deployed app.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    # Only run when the deployment URL is configured (avoids noisy failures on
+    # forks / before the app is deployed). WORKER_SECRET is read at step level.
+    if: ${{ vars.APP_URL != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drive one worker tick
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          set -euo pipefail
+          url="${APP_URL%/}/api/jobs/worker"
+          echo "POST ${url}"
+          # Non-fatal: a disabled worker (no secret / not yet deployed) returns
+          # 503; we surface the body but do not fail the schedule.
+          code=$(curl -sS -o /tmp/worker.out -w '%{http_code}' \
+            -X POST "$url" \
+            -H "x-worker-token: ${WORKER_SECRET}" \
+            -H 'content-type: application/json' \
+            --data '{"limit": 5}' || echo '000')
+          echo "http ${code}"
+          cat /tmp/worker.out || true

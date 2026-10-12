@@ -52,6 +52,14 @@ export interface DbSession {
   batch_id: string | null
   pending_client_id: string | null
   last_provider_message_id: string | null
+  // Stage 2 — outbound delivery decoupled from inbound idempotency. A failed
+  // (transient) reply is remembered here and best-effort resent on the sender's
+  // NEXT inbound message, WITHOUT re-running any completed business operation.
+  last_reply_error_code: string | null
+  pending_reply_body: string | null
+  // Suppress repetitive "Invoice received…" acks: set once per session after the
+  // first successful filing acknowledgment.
+  upload_ack_sent_at: string | null
   updated_at: string
 }
 
@@ -141,6 +149,28 @@ export async function saveSession(
 
 export function isExpired(updatedAt: string): boolean {
   return Date.now() - new Date(updatedAt).getTime() > SESSION_TTL_MS
+}
+
+/**
+ * Unconditional field update (not the guarded onboarding advance). Used for
+ * delivery bookkeeping only: a lost race here never rewinds conversation state
+ * or re-triggers intake (rule 5), so we don't gate it on last_provider_message_id.
+ */
+export async function updateSessionDeliveryState(
+  db: SupabaseClient,
+  senderHmac: string,
+  patch: {
+    last_reply_error_code?: string | null
+    pending_reply_body?: string | null
+    upload_ack_sent_at?: string | null
+  },
+): Promise<void> {
+  const { error } = await db.from('whatsapp_sessions').update(patch).eq('sender_hmac', senderHmac)
+  if (error) {
+    logger.error('[WhatsApp] delivery-state update failed', {
+      kind: classifyDbError(error.code, error.message), ...safeDbFields(error),
+    })
+  }
 }
 
 /**

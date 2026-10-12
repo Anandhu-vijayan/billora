@@ -15,6 +15,7 @@ export interface ClaimedJob {
   id: string
   workspace_id: string
   invoice_id: string | null
+  batch_id: string | null
   job_type: JobType
   status: JobStatus
   attempts: number

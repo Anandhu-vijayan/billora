@@ -17,6 +17,16 @@ export function getSupabaseAdmin() {
   return cached
 }
 
+/**
+ * Resolve a logical bucket to its configured slug. Intake/exports code must
+ * never hardcode a bucket name — this reads SUPABASE_INVOICES_BUCKET /
+ * SUPABASE_EXPORTS_BUCKET (defaults match the provisioned private buckets).
+ */
+export function bucketFor(kind: 'invoices' | 'exports'): string {
+  const env = getEnv()
+  return kind === 'invoices' ? env.SUPABASE_INVOICES_BUCKET : env.SUPABASE_EXPORTS_BUCKET
+}
+
 // Back-compat: lazy Proxy so importing this module never throws
 // ("supabaseUrl is required"). New server code should call getSupabaseAdmin().
 type Admin = ReturnType<typeof createClient>
