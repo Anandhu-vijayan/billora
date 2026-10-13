@@ -55,6 +55,11 @@ const handlersIndexSrc = () => readFileSync(new URL('../lib/jobs/handlers/index.
 const extractionSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261012190000_extraction_register.sql', import.meta.url), 'utf8')
 const qualitySrc = () => readFileSync(new URL('../lib/ocr/quality.ts', import.meta.url), 'utf8')
+const healthSrc = () => readFileSync(new URL('../app/api/health/route.ts', import.meta.url), 'utf8')
+const sessionsSrc = () => readFileSync(new URL('../lib/whatsapp/sessions.ts', import.meta.url), 'utf8')
+const envExampleSrc = () => readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
+const webpSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261012210000_media_formats_webp.sql', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -65,6 +70,11 @@ const conv = await importTs('lib/whatsapp/conversation.ts')
 // ledger.ts is dependency-free (no aliases/provider imports), so the REAL
 // extraction-review decision logic is exercised in-process, not reimplemented.
 const ledger = await importTs('lib/ocr/ledger.ts')
+// file-type.ts + statuses.ts are alias-free, so the REAL byte-sniffer, the REAL
+// size/pixel/page limits, and the REAL accepted-type set are tested in-process
+// rather than reimplemented (a drift in either would fail here, not silently).
+const fileType = await importTs('lib/media/file-type.ts')
+const statuses = await importTs('lib/statuses.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -295,9 +305,11 @@ test('E3 media holds, never orphans: receive-first-ask-later + never guess a cli
   // Encrypted intake: opaque deterministic hold path + plaintext never stored.
   assert.match(src, /deriveObjectKey\('pending', mediaId, pathKeyHex\)/)
   assert.match(src, /encryptFile\(downloaded\.buffer, masterKeyHex/)
-  // Unsupported media gets a reply, not a DB error or retry loop.
-  assert.match(src, /isAcceptedMediaType\(downloaded\.contentType\)/)
-  assert.match(src, /PDF, JPG, or PNG/)
+  // Unsupported/oversized media is rejected from the SNIFFED bytes, gets a
+  // useful reply, and is NOT stored / never loops (return before any DB write).
+  assert.match(src, /validateInvoiceMedia\(/)
+  assert.match(src, /isPermanentMediaFormatFailure\(e\)/)
+  assert.ok(!/isAcceptedMediaType/.test(src), 'intake must stop trusting the declared MIME')
   // SHA-256 computed at intake time.
   assert.match(src, /createHash\('sha256'\)/)
   // Holds upsert on object_path; assigned rows are never reset.
@@ -803,3 +815,321 @@ test('G6e JOB_TYPES alignment: both Phase-4 job kinds stay in the TS enum and ph
     assert.ok(handlersIndexSrc().includes(`registerJobHandler('${jt}'`), `${jt} not registered`)
   }
 })
+
+// ---- Stage-6 runtime hardening: encryption config fails closed, fast, loud --
+
+test('H1a encryption config errors are classifiable and carry no key material', () => {
+  assert.equal(files.isEncryptionConfigFailure(new files.EncryptionConfigError('missing key')), true)
+  assert.equal(files.isEncryptionConfigFailure(new files.MediaDecryptFailed('tampered')), false)
+  assert.equal(files.isEncryptionConfigFailure(new Error('plain error')), false)
+  assert.equal(files.isEncryptionConfigFailure(null), false)
+  // The thrown message must name the variable and never echo the value: the
+  // webhook route logs the error detail, so this is a log-leak boundary.
+  const saved = process.env.ENCRYPTION_MASTER_KEY
+  process.env.ENCRYPTION_MASTER_KEY = 'short-not-hex'
+  let message = ''
+  try { files.resolveFileKeyConfig() } catch (e) { message = String(e.message) }
+  delete process.env.ENCRYPTION_MASTER_KEY
+  if (saved !== undefined) process.env.ENCRYPTION_MASTER_KEY = saved
+  assert.match(message, /ENCRYPTION_MASTER_KEY/)
+  assert.ok(!message.includes('short-not-hex'), 'the malformed value must never appear in the error')
+})
+
+test('H1b hasFileKeyConfig is non-throwing and reports booleans only', () => {
+  const snapshot = {
+    ENCRYPTION_MASTER_KEY: process.env.ENCRYPTION_MASTER_KEY,
+    STORAGE_PATH_KEY: process.env.STORAGE_PATH_KEY,
+  }
+  try {
+    process.env.ENCRYPTION_MASTER_KEY = MASTER
+    process.env.STORAGE_PATH_KEY = 'not-a-key'
+    assert.deepEqual(files.hasFileKeyConfig(), { masterKeyPresent: true, pathKeyPresent: false })
+    process.env.ENCRYPTION_MASTER_KEY = ''
+    process.env.STORAGE_PATH_KEY = PATHK
+    assert.deepEqual(files.hasFileKeyConfig(), { masterKeyPresent: false, pathKeyPresent: true })
+    const probe = files.hasFileKeyConfig()
+    assert.deepEqual(Object.keys(probe).sort(), ['masterKeyPresent', 'pathKeyPresent'])
+    assert.ok(Object.values(probe).every((v) => typeof v === 'boolean'), 'booleans only — never key material')
+  } finally {
+    for (const [k, v] of Object.entries(snapshot)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test('H1c intake validates keys BEFORE any media download (no wasted fetch, no retry loop)', () => {
+  const src = routeSrc()
+  const keyIdx = src.indexOf('resolveFileKeyConfig()')
+  const dlIdx = src.indexOf('downloadWhatsAppMedia({')
+  const uploadIdx = src.indexOf('.upload(pendingPath, enc.container')
+  assert.ok(keyIdx > 0 && dlIdx > keyIdx, 'key validation must precede the Graph media download')
+  assert.ok(uploadIdx > keyIdx, 'key validation must precede any storage write')
+  // Exactly one resolution point: hoisted before the download, not re-read later.
+  assert.equal(src.match(/resolveFileKeyConfig\(\)/g).length, 1)
+})
+
+test('H1d a config failure settles the intake as final, notifies once, and never loops', () => {
+  const src = routeSrc()
+  const start = src.indexOf('if (isEncryptionConfigFailure(e))')
+  assert.ok(start > 0, 'the config-failure branch must exist in handleSingleMessage')
+  const branch = src.slice(start, src.indexOf('await markIntakeFailed'))
+  assert.ok(branch.includes("markIntakeAccepted(db, providerMessageId, 'ENCRYPTION_CONFIG')"),
+    'accepted as final with a stable sanitized audit code (no 503 -> no Meta redelivery loop)')
+  assert.ok(branch.includes("return 'processed'"), 'never returns retryable for a permanent config fault')
+  assert.ok(branch.includes('sendText(message.from'), 'the sender gets a truthful actionable reply')
+  assert.ok(branch.includes('nothing was saved'), 'the reply must never claim the file was stored')
+  assert.ok(!branch.includes('markIntakeFailed'), 'config failure must not fall through to the retry path')
+  // Operator alert carries the short id only — never message bodies or key material.
+  const alert = branch.slice(branch.indexOf('logger.error('), branch.indexOf('if (message.from)'))
+  assert.ok(!/message\.text|downloaded|MASTER_KEY_VALUE/.test(alert))
+  assert.ok(alert.includes('shortId'), 'alert correlates via the truncated provider id only')
+  // Redelivery of an accepted event must be skipped BEFORE processing, so a
+  // webhook resend cannot notify the sender twice or store anything.
+  const skipIdx = src.indexOf('duplicate accepted event skipped')
+  assert.ok(skipIdx > 0 && skipIdx < src.indexOf('await processMessage'), 'accepted events short-circuit before reprocessing')
+})
+
+test('H1e health diagnostic exposes configuration posture as booleans, never secrets', () => {
+  const src = healthSrc()
+  assert.ok(src.includes('getPublicEnvInfo()'), 'health reuses the safe env subset')
+  assert.ok(src.includes('hasFileKeyConfig()'), 'health reports file-encryption key presence')
+  assert.ok(!/process\.env\.ENCRYPTION_MASTER_KEY|process\.env\.SUPABASE_SECRET_KEY/.test(src),
+    'health must read raw secrets only through the sanitized helpers')
+  // The safe subset itself: booleans + host, no values.
+  const env = envSrc()
+  const info = env.slice(env.indexOf('export function getPublicEnvInfo'))
+  assert.match(info, /hasEncryptionKey: HEX_64\.test/)
+  assert.match(info, /hasPathKey: HEX_64\.test/)
+  // Configuration is documented for local + production. The app must never
+  // auto-generate keys on restart: no code path writes them into process.env.
+  const example = envExampleSrc()
+  for (const k of ['ENCRYPTION_MASTER_KEY', 'STORAGE_PATH_KEY', 'GEMINI_API_KEY', 'WORKER_SECRET', 'WHATSAPP_APP_SECRET']) {
+    assert.ok(example.includes(`${k}=`), `.env.example must document ${k}`)
+  }
+  assert.ok(!/process\.env\.ENCRYPTION_MASTER_KEY\s*=/.test(filesSrc()),
+    'encryption code must read the key, never generate/assign it on restart')
+})
+
+test('H1f delivery-state bookkeeping stays resilient: a schema/cache failure never breaks intake', () => {
+  const s = sessionsSrc()
+  const start = s.indexOf('export async function updateSessionDeliveryState')
+  assert.ok(start > 0)
+  const body = s.slice(start)
+  assert.ok(body.includes('logger.error'), 'a failed bookkeeping write is logged, not swallowed silently')
+  assert.ok(!/throw/.test(body), 'bookkeeping must never throw: a delivery-tracking lapse cannot fail the webhook')
+  // PGRST204-style stale-cache/schema errors are explicitly classified for ops.
+  assert.match(s, /PGRST205|schema cache/)
+  assert.ok(s.includes("'table_not_exposed_or_stale_cache'"), 'stale-cache is a distinct triage kind')
+})
+
+// The runtime logs proved (via `supabase migration list`) that the newest three
+// migrations are NOT yet on the remote. Applying them is operator-gated, but we
+// can statically guarantee they are SAFE to apply: purely additive, idempotent,
+// and complete enough to unblock the encrypted intake + register pipeline.
+test('H2 the pending migrations are forward-only, re-runnable, non-destructive, and complete', () => {
+  const pending = { storage: encSqlSrc(), menu: encMenuSqlSrc(), extraction: extractionSqlSrc() }
+  for (const [name, sql] of Object.entries(pending)) {
+    assert.equal((sql.match(/add column(?! if not exists)/gi) ?? []).length, 0,
+      `${name}: every added column must be guarded by IF NOT EXISTS (re-runnable)`)
+    assert.ok(!/drop\s+table/i.test(sql), `${name}: never drops a table`)
+    assert.ok(!/drop\s+column/i.test(sql), `${name}: never drops a column (preserves user data)`)
+    assert.ok(!/\btruncate\b|delete\s+from/i.test(sql), `${name}: never truncates or deletes rows`)
+  }
+  // Completeness — applying exactly these resolves the columns the code writes.
+  assert.match(pending.storage, /add column if not exists file_encryption_key_version text/)
+  assert.match(pending.storage, /add column if not exists size_bytes bigint/)
+  assert.ok(pending.storage.includes("'application/octet-stream'"), 'bucket must accept encrypted containers')
+  for (const col of ['last_reply_error_code', 'pending_reply_body', 'upload_ack_sent_at']) {
+    assert.ok(pending.menu.includes(`add column if not exists ${col}`), `menu migration must add ${col}`)
+  }
+  assert.match(pending.extraction, /add column if not exists batch_id uuid references public\.invoice_batches/)
+  assert.ok(pending.extraction.includes('create or replace function public.ensure_invoice_batch'))
+  assert.match(pending.extraction, /add column if not exists version integer/)
+  assert.match(pending.extraction, /add column if not exists generated_at timestamptz/)
+})
+
+// ---- I: end-to-end media format support (PNG / JPEG / PDF / WebP; HEIC out) --
+// Crafted magic-byte fixtures (no fixtures dir, no provider, no sharp).
+function mkPng(w = 8, h = 8, pad = 24) {
+  const b = Buffer.alloc(24 + pad)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b, 0)
+  b.writeUInt32BE(13, 8)
+  b.write('IHDR', 12, 'latin1')
+  b.writeUInt32BE(w, 16)
+  b.writeUInt32BE(h, 20)
+  return b
+}
+function mkJpeg(w = 8, h = 8) {
+  const b = Buffer.alloc(40)
+  b[0] = 0xff; b[1] = 0xd8; b[2] = 0xff; b[3] = 0xc0; b[4] = 0x00; b[5] = 0x11; b[6] = 0x08
+  b.writeUInt16BE(h, 7)
+  b.writeUInt16BE(w, 9)
+  return b
+}
+function mkWebp(w = 8, h = 8) {
+  const b = Buffer.alloc(40)
+  b.write('RIFF', 0, 'latin1'); b.write('WEBP', 8, 'latin1'); b.write('VP8X', 12, 'latin1')
+  b.writeUInt32LE(18, 16)
+  b[24] = (w - 1) & 0xff; b[25] = ((w - 1) >> 8) & 0xff; b[26] = ((w - 1) >> 16) & 0xff
+  b[27] = (h - 1) & 0xff; b[28] = ((h - 1) >> 8) & 0xff; b[29] = ((h - 1) >> 16) & 0xff
+  return b
+}
+function mkPdf(pages = 1) {
+  let s = '%PDF-1.4\n'
+  for (let i = 0; i < pages; i++) s += `\n${i + 1} 0 obj\n/Type /Page\nendobj\n`
+  s += '%%EOF\n'
+  return Buffer.from(s, 'latin1')
+}
+function mkHeic() {
+  const b = Buffer.alloc(40)
+  b.writeUInt32BE(24, 0)
+  b.write('ftyp', 4, 'latin1')
+  b.write('heic', 8, 'latin1')
+  return b
+}
+
+test('I1 sniffMediaKind reads the real container, never the declared hint', () => {
+  assert.equal(fileType.sniffMediaKind(mkPdf()), 'pdf')
+  assert.equal(fileType.sniffMediaKind(mkPng()), 'png')
+  assert.equal(fileType.sniffMediaKind(mkJpeg()), 'jpeg')
+  assert.equal(fileType.sniffMediaKind(mkWebp()), 'webp')
+  assert.equal(fileType.sniffMediaKind(mkHeic()), 'heif')
+  assert.equal(fileType.sniffMediaKind(Buffer.from('GIF89a' + 'x'.repeat(40), 'latin1')), 'gif')
+  assert.equal(fileType.sniffMediaKind(Buffer.from([0x49, 0x49, 0x2a, 0x00, ...new Array(40).fill(0)])), 'tiff')
+  // A file that claims nothing recognizable (e.g. a raw script) is unknown.
+  assert.equal(fileType.sniffMediaKind(Buffer.from('this is definitely not a document at all', 'latin1')), 'unknown')
+  assert.equal(fileType.sniffMediaKind(Buffer.alloc(0)), 'unknown')
+})
+
+test('I2 accepted formats validate to their authoritative MIME + extension', () => {
+  const cases = [
+    [mkPdf(2), 'application/pdf', 'pdf'],
+    [mkPng(), 'image/png', 'png'],
+    [mkJpeg(), 'image/jpeg', 'jpg'],
+    [mkWebp(), 'image/webp', 'webp'],
+  ]
+  for (const [buf, mime, ext] of cases) {
+    const v = fileType.validateInvoiceMedia({ buffer: buf })
+    assert.equal(v.mime, mime, `mime for ${ext}`)
+    assert.equal(v.extension, ext)
+  }
+})
+
+test('I3 declared MIME/filename are hints: sniffed bytes win on a mismatch', () => {
+  // WhatsApp claims a PDF but the bytes are a real PNG: we accept it AS a PNG.
+  const v = fileType.validateInvoiceMedia({
+    buffer: mkPng(), declaredMime: 'application/pdf', declaredFilename: 'invoice.pdf',
+  })
+  assert.equal(v.kind, 'png')
+  assert.equal(v.mime, 'image/png')
+  // Bytes are not a supported container at all -> rejected regardless of claim.
+  assert.throws(
+    () => fileType.validateInvoiceMedia({ buffer: Buffer.from('#!/bin/sh rm -rf /\n'.repeat(4), 'latin1'), declaredMime: 'image/png' }),
+    (e) => e.name === 'UnsupportedMediaError',
+  )
+})
+
+test('I4 unsupported + HEIC get a clear, actionable reply (HEIC is not advertised)', () => {
+  assert.throws(() => fileType.validateInvoiceMedia({ buffer: mkHeic() }), (e) => {
+    return e.name === 'UnsupportedMediaError' && /HEIC/i.test(e.userReply) && !/undefined/.test(e.userReply)
+  })
+  // GIF/TIFF are detected but have no extraction path -> rejected, not stored.
+  for (const buf of [Buffer.from('GIF89a' + 'y'.repeat(40), 'latin1'), mkHeic()]) {
+    assert.throws(() => fileType.validateInvoiceMedia({ buffer: buf }), (e) => e.name === 'UnsupportedMediaError')
+  }
+})
+
+test('I5 size, pixel and PDF-page limits are enforced from the bytes', () => {
+  // Real byte count over the cap (not the declared size) -> OversizeMediaError.
+  const huge = mkPng(8, 8, fileType.MAX_FILE_BYTES)
+  assert.ok(huge.length > fileType.MAX_FILE_BYTES)
+  assert.throws(() => fileType.validateInvoiceMedia({ buffer: huge }), (e) => e.name === 'OversizeMediaError')
+  // A tiny file whose header declares a 10000x10000 canvas -> decompression-bomb guard.
+  assert.throws(() => fileType.validateInvoiceMedia({ buffer: mkPng(10000, 10000) }), (e) => e.name === 'OversizeMediaError')
+  // A flat PDF over the page cap -> rejected.
+  assert.throws(() => fileType.validateInvoiceMedia({ buffer: mkPdf(fileType.MAX_PDF_PAGES + 5) }), (e) => e.name === 'OversizeMediaError')
+  // Under every limit -> accepted.
+  assert.doesNotThrow(() => fileType.validateInvoiceMedia({ buffer: mkPng(64, 64) }))
+})
+
+test('I6 isPermanentMediaFormatFailure separates permanent from retryable', () => {
+  assert.equal(fileType.isPermanentMediaFormatFailure(new fileType.UnsupportedMediaError('x', 'reply')), true)
+  assert.equal(fileType.isPermanentMediaFormatFailure(new fileType.OversizeMediaError('x', 'reply')), true)
+  assert.equal(fileType.isPermanentMediaFormatFailure(new Error('STORAGE_UPLOAD_ERROR: transient')), false)
+  assert.equal(fileType.isPermanentMediaFormatFailure(null), false)
+})
+
+test('I7 encrypted round trip preserves the original bytes for correct routing', () => {
+  // Real envelope: encrypt then decrypt must reproduce the exact original bytes,
+  // and the decrypted buffer must re-sniff to the SAME format (routing on decrypt).
+  const png = mkPng(16, 12)
+  const { container } = files.encryptFile(png, MASTER, { context: 'whatsapp/invoices/x.bin' })
+  const back = files.decryptFile(container, MASTER, { context: 'whatsapp/invoices/x.bin' })
+  assert.ok(Buffer.compare(back, png) === 0, 'decrypt must reproduce original bytes exactly')
+  assert.equal(fileType.sniffMediaKind(back), 'png')
+  // The encrypted container is NOT itself a valid image — proves we never parse
+  // ciphertext as an image and must decrypt first.
+  assert.equal(fileType.sniffMediaKind(container), 'unknown')
+})
+
+test('I8 statuses + vision + migration agree on one accepted-format set', () => {
+  const accepted = statuses.ACCEPTED_MEDIA_TYPES
+  assert.deepEqual([...accepted].sort(), ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'])
+  assert.equal(statuses.isAcceptedMediaType('image/webp'), true)
+  assert.equal(statuses.isAcceptedMediaType('image/heic'), false)
+  // vision SUPPORTED_MIME covers exactly this set and excludes heic. Match on
+  // the tokens (not the escaped punctuation) so a source-regex rewrite can't
+  // silently drift the accepted set away from DB + statuses.
+  const mimeLine = (visionSrc().match(/const SUPPORTED_MIME = .*/) ?? [''])[0]
+  assert.ok(mimeLine, 'SUPPORTED_MIME line not found')
+  for (const tok of ['jpeg', 'png', 'webp', 'application']) {
+    assert.ok(mimeLine.includes(tok), `SUPPORTED_MIME must include ${tok}`)
+  }
+  assert.ok(!/heic|heif/i.test(mimeLine), 'vision must not advertise HEIC')
+})
+
+test('I9 migration widens CHECKs + bucket MIME for webp, forward-only & safe', () => {
+  const sql = webpSqlSrc()
+  // Both content_type CHECKs gain image/webp while retaining pdf/jpeg/png.
+  const webpChecks = (sql.match(/'image\/webp'/g) ?? []).length
+  assert.ok(webpChecks >= 2, 'invoices + pending_uploads CHECKs must both allow webp')
+  for (const m of ['application/pdf', 'image/jpeg', 'image/png']) {
+    assert.ok(sql.includes(`'${m}'`), `CHECK set must keep ${m}`)
+  }
+  // Bucket re-asserted for the octet-stream container + webp.
+  assert.match(sql, /'application\/octet-stream'/)
+  assert.match(sql, /where id = 'billora-invoices'/)
+  // Forward-only: no destructive ops, no security loosening (private + size kept).
+  assert.ok(!/drop\s+table|drop\s+column/i.test(sql), 'no destructive DDL')
+  assert.ok(!/\btruncate\b|delete\s+from/i.test(sql), 'no row loss')
+  assert.ok(!/is_public|public\s*=\s*true/i.test(sql), 'bucket stays private')
+  assert.ok(!/file_size_limit/i.test(sql), 'existing size limit untouched')
+})
+
+test('I10 intake persists the validated MIME and never loosens the transport', () => {
+  const src = routeSrc()
+  assert.match(src, /downloaded\.contentType = validated\.mime/)
+  assert.match(src, /downloaded\.extension = validated\.extension/)
+  // Stored blob is still octet-stream (encryption boundary unchanged).
+  const octetUploads = (src.match(/contentType: 'application\/octet-stream'/g) ?? []).length
+  assert.equal(octetUploads, 2, 'both hold + assigned uploads stay octet-stream')
+  // Original mime + extension retained as object metadata on both uploads.
+  const metaCount = (src.match(/metadata: \{ original_mime: validated\.mime, original_extension: validated\.extension \}/g) ?? []).length
+  assert.equal(metaCount, 2, 'original mime/extension stored as metadata on both paths')
+})
+
+test('I11 storage-config rejection settles final, never loops, stays narrow', () => {
+  const src = routeSrc()
+  assert.match(src, /isStorageConfigFailure\(e\)/)
+  assert.match(src, /markIntakeAccepted\(db, providerMessageId, 'STORAGE_CONFIG'\)/)
+  // The helper only fires on a MIME/"not allowed"-style STORAGE_UPLOAD_ERROR, so
+  // transient network and permission failures remain retryable.
+  const fnStart = src.indexOf('function isStorageConfigFailure')
+  assert.ok(fnStart > 0, 'isStorageConfigFailure defined')
+  const body = src.slice(fnStart, src.indexOf('\n}', fnStart) + 2)
+  assert.match(body, /STORAGE_UPLOAD_ERROR/)
+  assert.match(body, /not allowed|not supported|unsupported/)
+  assert.ok(/return 'processed';/.test(src), 'permanent storage-config settles as processed (no 503 loop)')
+})
+

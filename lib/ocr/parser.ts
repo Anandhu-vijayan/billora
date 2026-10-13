@@ -106,10 +106,10 @@ export class SecureComplianceParser {
           mappedHeader: { type: Type.STRING }, confidence: { type: Type.NUMBER } },
         required: ["canonicalField", "mappedHeader", "confidence"] } } },
       required: ["corrections"] };
-    const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+    const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
     const res = await client.models.generateContent({ model,
       contents: `Map targets ${JSON.stringify(missingTargets)} from headers ${JSON.stringify(cleanHeaders)}.`,
-      config: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.0 } });
+      config: { responseMimeType: 'application/json', responseSchema: schema } });
     const parsed = JSON.parse(res.text || '{"corrections":[]}') as
       { corrections?: Array<{ canonicalField: string; mappedHeader: string; confidence: number }> };
     return parsed.corrections || [];

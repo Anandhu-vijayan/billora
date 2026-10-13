@@ -81,7 +81,7 @@ begin
   -- Create, or (on a concurrent winner) do nothing and fall through to re-read.
   insert into public.invoice_batches (workspace_id, client_id, period_start, period_end, status)
   values (p_workspace, p_client, p_start, p_end, 'open')
-  on conflict (workspace_id, client_id, period_start, period_end) nulls not distinct
+  on conflict (workspace_id, client_id, period_start, period_end)
   do nothing
   returning id into v_id;
   if v_id is not null then

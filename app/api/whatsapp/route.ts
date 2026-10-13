@@ -4,9 +4,9 @@ import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getSupabaseAdmin, bucketFor } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
-import { isAcceptedMediaType } from '@/lib/statuses';
-import { encryptFile, deriveObjectKey, resolveFileKeyConfig } from '@/lib/encryption/files';
-import { downloadWhatsAppMedia, isPermanentMediaFailure } from '@/lib/whatsapp/media';
+import { encryptFile, deriveObjectKey, resolveFileKeyConfig, isEncryptionConfigFailure } from '@/lib/encryption/files';
+import { validateInvoiceMedia, isPermanentMediaFormatFailure, type ValidatedMedia } from '@/lib/media/file-type';
+import { downloadWhatsAppMedia, isPermanentMediaFailure, type DownloadedMedia } from '@/lib/whatsapp/media';
 import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
@@ -340,6 +340,39 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       await markIntakeAccepted(db, providerMessageId, detail.slice(0, 120)).catch(() => undefined);
       return 'processed';
     }
+    if (isEncryptionConfigFailure(e)) {
+      // Encryption keys are a deploy-time contract: a missing/malformed key is
+      // an operator-configuration error that NO retry can fix. Returning 503
+      // would make Meta redeliver the message in a loop, so accept this
+      // delivery as final with a stable audit code (webhook_events stays the
+      // idempotency ledger: a genuine later redelivery of an ACCEPTED event is
+      // skipped, so the sender below is notified at most once per message),
+      // alert the operator, and tell the sender the truth: nothing was saved.
+      logger.error('[WhatsApp] ENCRYPTION_CONFIG: file encryption is not configured; nothing was stored — operator must set ENCRYPTION_MASTER_KEY + STORAGE_PATH_KEY and restart', {
+        shortId, code: 'ENCRYPTION_CONFIG',
+      });
+      if (message.from) {
+        await sendText(message.from, 'I could not file that invoice — a required system setting is missing on our side, so nothing was saved. The account owner needs to finish setup; please resend afterwards.').catch(() => undefined);
+      }
+      await markIntakeAccepted(db, providerMessageId, 'ENCRYPTION_CONFIG').catch(() => undefined);
+      return 'processed';
+    }
+    if (isStorageConfigFailure(e)) {
+      // The private bucket is not yet configured to accept the encrypted
+      // container's transport type (application/octet-stream). This is an
+      // operator/schema-delivery gap that no retry can fix: returning 503 would
+      // loop Meta redeliveries and re-download the same media forever. Accept as
+      // final with a stable audit code, alert the operator, and tell the sender
+      // the truth — nothing was saved.
+      logger.error('[WhatsApp] STORAGE_CONFIG: private storage rejected the encrypted upload; operator must apply the invoices bucket migration', {
+        shortId, code: 'STORAGE_CONFIG',
+      });
+      if (message.from) {
+        await sendText(message.from, 'I could not file that invoice — our private storage is mid-setup, so nothing was saved. The account owner needs to finish a configuration step; please resend afterwards.').catch(() => undefined);
+      }
+      await markIntakeAccepted(db, providerMessageId, 'STORAGE_CONFIG').catch(() => undefined);
+      return 'processed';
+    }
     await markIntakeFailed(db, providerMessageId, code).catch(() => undefined);
     logger.error('[WhatsApp] processing failed, retryable', { shortId, error: code, detail: detail.slice(0, 200) });
     return 'retryable';
@@ -425,30 +458,58 @@ async function processMessage(
     return;
   }
   if (!message.from) throw new Error('MEDIA_MISSING_SENDER: media without from address');
+  // Encryption keys are required before ANY file handling, so validate them
+  // FIRST: a misconfigured deploy must not pay for a media download it can
+  // never store (fail-closed: plaintext is never written, retries never help).
+  const { masterKeyHex, pathKeyHex } = resolveFileKeyConfig();
   logger.info('[WhatsApp] media intake start', { shortId });
   const mHmac = senderHmac(message.from);
   const mSession = await loadSession(db, mHmac);
-  const downloaded = await downloadWhatsAppMedia({
-    mediaId, accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '', declaredMime: media?.mime_type,
-  });
 
-  // Unsupported or corrupt-by-type media gets a useful reply, never a DB error
-  // or a retry loop (acceptance: "unsupported file gets a useful response").
-  if (!isAcceptedMediaType(downloaded.contentType)) {
-    logger.info('[WhatsApp] unsupported media type rejected', { shortId, contentType: downloaded.contentType });
-    await sendText(message.from,
-      'Sorry, I can only process invoice PDF, JPG, or PNG files. Please resend as one of those — or type Help.');
-    return;
+  // Download, then validate the ACTUAL bytes. WhatsApp's declared mime /
+  // filename / extension are hints only — the magic-byte sniff is authoritative,
+  // so a mislabeled, unsupported or oversized file is rejected here: nothing is
+  // stored, no DB error is raised, and the intake settles accepted (a permanent
+  // format/size failure must NEVER trigger a Meta retry / re-download loop).
+  let downloaded: DownloadedMedia;
+  try {
+    downloaded = await downloadWhatsAppMedia({
+      mediaId, accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '', declaredMime: media?.mime_type,
+    });
+  } catch (e) {
+    if (isPermanentMediaFormatFailure(e)) {
+      logger.info('[WhatsApp] media rejected by declared size', { shortId, reason: (e as Error).message });
+      await sendText(message.from, (e as { userReply: string }).userReply);
+      return;
+    }
+    throw e;
   }
+  let validated: ValidatedMedia;
+  try {
+    validated = validateInvoiceMedia({
+      buffer: downloaded.buffer, declaredMime: downloaded.contentType, declaredFilename: media?.filename ?? null,
+    });
+  } catch (e) {
+    if (isPermanentMediaFormatFailure(e)) {
+      logger.info('[WhatsApp] unsupported or oversized media rejected', { shortId, reason: (e as Error).message });
+      await sendText(message.from, (e as { userReply: string }).userReply);
+      return;
+    }
+    throw e;
+  }
+  // Persist the VALIDATED original MIME + extension (never the provider hint) so
+  // extraction routes on the true format. The stored blob is always the opaque
+  // octet-stream container; the original bytes stay intact inside it.
+  downloaded.contentType = validated.mime;
+  downloaded.extension = validated.extension;
   const sha256Hex = createHash('sha256').update(downloaded.buffer).digest('hex');
   const workspaceId = onboardingWorkspaceId ?? mSession.workspace_id;
   const clientId = onboardingClientId ?? mSession.client_id;
 
-  // Envelope-encrypt the ORIGINAL bytes before they ever touch storage. A
-  // missing/misconfigured key throws here (fail closed) so plaintext is never
-  // stored; Meta retries the delivery. The SHA-256 above stays over plaintext
-  // for dedup + integrity; the stored blob is the self-describing container.
-  const { masterKeyHex, pathKeyHex } = resolveFileKeyConfig();
+  // Envelope-encrypt the ORIGINAL bytes before they ever touch storage (keys
+  // were validated above, before the download). The SHA-256 above stays over
+  // plaintext for dedup + integrity; the stored blob is the self-describing
+  // container.
   const invoiceBucket = bucketFor('invoices');
 
   // Deterministic private hold path: redelivery of the same provider media id
@@ -458,7 +519,10 @@ async function processMessage(
     const pendingPath = deriveObjectKey('pending', mediaId, pathKeyHex);
     const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: pendingPath });
     const { error: pendingUploadError } = await db.storage.from(invoiceBucket)
-      .upload(pendingPath, enc.container, { contentType: 'application/octet-stream', upsert: true });
+      .upload(pendingPath, enc.container, {
+        contentType: 'application/octet-stream', upsert: true,
+        metadata: { original_mime: validated.mime, original_extension: validated.extension },
+      });
     if (pendingUploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${pendingUploadError.message}`);
     await recordPendingUpload(db, {
       senderHmac: mHmac, objectPath: pendingPath, originalFileName: media?.filename ?? null,
@@ -501,7 +565,10 @@ async function processMessage(
   const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
   const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath });
   const { error: uploadError } = await db.storage.from(invoiceBucket)
-    .upload(objectPath, enc.container, { contentType: 'application/octet-stream', upsert: true });
+    .upload(objectPath, enc.container, {
+      contentType: 'application/octet-stream', upsert: true,
+      metadata: { original_mime: validated.mime, original_extension: validated.extension },
+    });
   if (uploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${uploadError.message}`);
   const recorded = await recordMediaIntake(db, {
     workspaceId, clientId, objectPath,
@@ -528,5 +595,21 @@ async function processMessage(
     const o = await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
     if (o === 'ok') await updateSessionDeliveryState(db, mHmac, { upload_ack_sent_at: new Date().toISOString() });
   }
+}
+
+/**
+ * A storage upload rejected specifically because the object's transport MIME is
+ * not permitted on the bucket (the encrypted container is uploaded as
+ * application/octet-stream). That is a bucket-configuration gap the operator
+ * fixes by applying the invoices bucket migration — retrying the same upload
+ * can never succeed, so it must NOT loop Meta redeliveries. Deliberately narrow:
+ * only a MIME/"not allowed"-style rejection matches, so transient network and
+ * permission errors stay retryable.
+ */
+function isStorageConfigFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/STORAGE_UPLOAD_ERROR/.test(message)) return false;
+  return /(mime|content[ -]?type|file type)/i.test(message)
+    && /(not allowed|not supported|unsupported)/i.test(message);
 }
 

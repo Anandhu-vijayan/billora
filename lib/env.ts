@@ -23,7 +23,7 @@ const serverSchema = z.object({
   WHATSAPP_IDENTITY_HMAC_KEY: z.string().min(32, 'WHATSAPP_IDENTITY_HMAC_KEY must be at least 32 chars').optional(),
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
   GEMINI_API_KEY: z.string().min(1).optional(),
-  GEMINI_MODEL: z.string().min(1).default('gemini-1.5-flash'),
+  GEMINI_MODEL: z.string().min(1).default('gemini-3.8-flash'),
   // 32-byte hex master key for local AES-256-GCM payload encryption.
   ENCRYPTION_MASTER_KEY: z
     .string()

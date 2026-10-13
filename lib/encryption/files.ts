@@ -62,6 +62,28 @@ export function isMediaDecryptFailure(error: unknown): boolean {
   return error instanceof Error && error.name === 'MediaDecryptFailed'
 }
 
+/**
+ * A missing/malformed key is an operator-configuration error, not a transient
+ * fault: no retry can succeed until the environment is fixed and the server
+ * restarts. Callers use this to keep such a failure OUT of a webhook retry loop
+ * (which would also re-download the same media for nothing).
+ */
+export function isEncryptionConfigFailure(error: unknown): boolean {
+  return error instanceof Error && error.name === 'EncryptionConfigError'
+}
+
+/**
+ * Non-throwing readiness probe for the file-encryption keys, for health /
+ * startup diagnostics. Reports presence + well-formedness only; it never
+ * returns or logs key material.
+ */
+export function hasFileKeyConfig(): { masterKeyPresent: boolean; pathKeyPresent: boolean } {
+  return {
+    masterKeyPresent: HEX_64.test(process.env.ENCRYPTION_MASTER_KEY ?? ''),
+    pathKeyPresent: HEX_64.test(process.env.STORAGE_PATH_KEY ?? ''),
+  }
+}
+
 function requireKey(hex: string | undefined, label: string): Buffer {
   if (!hex || !HEX_64.test(hex)) {
     throw new EncryptionConfigError(

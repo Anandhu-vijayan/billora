@@ -1,5 +1,6 @@
 // lib/whatsapp/media.ts — WhatsApp media download pipeline (image/document/pdf).
 import { logger } from '@/lib/logger'
+import { MAX_FILE_BYTES, OversizeMediaError } from '@/lib/media/file-type'
 
 const GRAPH_VERSION = process.env.WHATSAPP_GRAPH_VERSION || 'v21.0'
 const FETCH_TIMEOUT_MS = 15_000
@@ -95,6 +96,15 @@ export async function downloadWhatsAppMedia(args: {
   }
 
   // Step 2 — download raw bytes (verification: non-empty buffer).
+  // Declared size is a hint, but a body already reported far over our cap is
+  // rejected before we spend bandwidth fetching it. Real byte length is capped
+  // authoritatively by validateInvoiceMedia after download.
+  if (typeof meta.file_size === 'number' && meta.file_size > MAX_FILE_BYTES) {
+    throw new OversizeMediaError(
+      'MEDIA_DECLARED_TOO_LARGE',
+      `That file is too large for me to process (over ${Math.floor(MAX_FILE_BYTES / (1024 * 1024))} MB). Please resend a smaller PDF, JPG or PNG.`,
+    )
+  }
   const fileRes = await fetchWithTimeout(meta.url, accessToken)
   if (!fileRes.ok) {
     if (fileRes.status === 401 || fileRes.status === 403) {

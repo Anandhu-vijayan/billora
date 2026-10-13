@@ -53,7 +53,10 @@ export type BatchMode = (typeof BATCH_MODES)[number]
 
 // Only these media types may become invoices (matches invoices + pending_uploads
 // CHECK constraints). Anything else gets a useful reply, never a DB error.
-export const ACCEPTED_MEDIA_TYPES = ['application/pdf', 'image/jpeg', 'image/png'] as const
+// WebP is the vision pipeline's fourth accepted transport (see vision.ts
+// SUPPORTED_MIME); HEIC/HEIF are intentionally absent — they need a converter
+// we do not ship, so intake rejects them with a clear reply instead.
+export const ACCEPTED_MEDIA_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'] as const
 export function isAcceptedMediaType(mime: string | null | undefined): boolean {
   return !!mime && (ACCEPTED_MEDIA_TYPES as readonly string[]).includes(mime)
 }
