@@ -25,7 +25,9 @@ import {
 } from '@/lib/encryption/files'
 import { encryptExtractedPayload } from '@/lib/encryption'
 import { extractInvoiceFields, VisionTransientError } from '@/lib/ocr/vision'
-import { evaluateLedger, type LedgerCandidate, type LedgerRow } from '@/lib/ocr/ledger'
+import { tryLocalExtract } from '@/lib/ocr/local'
+import { renderFirstPageToPng } from '@/lib/ocr/pdf'
+import { evaluateLedger, mergeCandidates, type LedgerCandidate, type LedgerRow } from '@/lib/ocr/ledger'
 
 type Db = SupabaseClient
 
@@ -139,52 +141,105 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     throw e
   }
 
-  // Vision call. Transient provider errors rethrow (backoff requeue); anything
-  // the classifier marks permanent becomes a PermanentJobError via the throw.
+  // Extraction is LOCAL-FIRST with a privacy-GATED AI fallback. The decrypted
+  // bytes live in memory only and are wiped in `finally`; plaintext is never
+  // persisted and nothing is ever fabricated.
   const env = getEnv()
-  if (env.EXTRACTION_PROVIDER !== 'gemini') {
-    throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
-  }
-  const model = env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL
-  let candidate: LedgerCandidate
   try {
-    candidate = await extractInvoiceFields({
-      buffer: plain, mimeType: invoice.content_type, apiKey: env.GEMINI_API_KEY || '', model,
+    // 1) Try a configured/registered LOCAL engine (PDF text / OCR). When there
+    //    is no local engine — or the input is an image/scan it cannot process —
+    //    tryLocalExtract returns a miss (never a made-up candidate).
+    const local = await tryLocalExtract({ buffer: plain, mimeType: invoice.content_type })
+    let candidate: LedgerCandidate | null = local.ok ? local.candidate : null
+    let confidenceSource: 'local' | 'ai' | 'human' = local.ok ? 'local' : 'human'
+
+    // 2) Independently evaluate whatever local produced. evaluateLedger measures
+    //    confidence from objective checks — it never trusts a source's own number.
+    let evaluation = candidate
+      ? evaluateLedger(candidate, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
+      : null
+
+    // 3) AI fallback ONLY when the operator explicitly enabled it AND confirmed
+    //    a paid tier. When AI is disabled we NEVER silently send decrypted
+    //    invoice content to a provider; unresolved input stays for human review.
+    const aiEnabled = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
+    const needsFallback = evaluation === null || evaluation.review === 'needs_review'
+    if (aiEnabled && needsFallback) {
+      if (env.EXTRACTION_PROVIDER !== 'gemini') {
+        throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
+      }
+      const model = env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL
+      // HYBRID media selection: a PDF reaches Gemini as a REAL rendered FIRST
+      // PAGE (never every page), so a scanned/ambiguous document is seen as a
+      // genuine rasterized image. Bare images go as-is. If no canvas is
+      // available we fall back to the original PDF bytes (Gemini accepts PDFs)
+      // rather than silently skipping — but we never fabricate a result.
+      const isPdf = /^application\/pdf$/i.test(invoice.content_type ?? '')
+      let aiBuffer: Buffer = plain
+      let aiMime = invoice.content_type ?? 'application/pdf'
+      if (isPdf) {
+        const png = await renderFirstPageToPng(plain)
+        if (png) { aiBuffer = png; aiMime = 'image/png' }
+      }
+      let aiCandidate: LedgerCandidate
+      try {
+        aiCandidate = await extractInvoiceFields({
+          buffer: aiBuffer, mimeType: aiMime, apiKey: env.GEMINI_API_KEY || '', model,
+        })
+      } catch (e) {
+        if (e instanceof VisionTransientError) throw e // -> retryable backoff
+        throw new PermanentJobError(`VISION_FAILED: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      // AI only ASSISTS the local parser: every locally-valid field is kept and
+      // AI merely fills what local missed. The merged row is then re-evaluated
+      // independently, so no source is ever blindly trusted.
+      const assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate
+      const aiEval = evaluateLedger(assisted, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
+      // Adopt only when the merge strictly improves the outcome; a valid local
+      // approval is never downgraded or overruled by the AI result.
+      if (!evaluation || aiEval.review === 'approved' || aiEval.confidence > evaluation.confidence) {
+        candidate = assisted
+        evaluation = aiEval
+        confidenceSource = 'ai'
+      }
+    }
+
+    // 4) No engine and AI disabled -> a review-only placeholder (empty values,
+    //    never invented) so the invoice deterministically lands in needs_review.
+    if (!evaluation) {
+      evaluation = evaluateLedger({}, { minConfidence: Number.NEGATIVE_INFINITY })
+      confidenceSource = 'human'
+    }
+
+    const keyVersion = deriveKeyVersion(masterKeyHex)
+    const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
+
+    const { error: recErr } = await db.from('extracted_records').upsert({
+      workspace_id: workspaceId,
+      invoice_id: invoiceId,
+      encrypted_payload: `\\x${payload.toString('hex')}`,
+      encryption_key_version: keyVersion,
+      review_status: evaluation.review,
+      confidence_source: confidenceSource,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'invoice_id' })
+    if (recErr) throw new Error(`RECORD_WRITE_ERROR: ${recErr.message}`)
+
+    // Route the invoice status: approved -> completed, else needs_review.
+    const { error: stErr } = await db.from('invoices').update({ status: evaluation.review })
+      .eq('workspace_id', workspaceId).eq('id', invoiceId)
+    if (stErr) throw new Error(`INVOICE_STATUS_ERROR: ${stErr.message}`)
+
+    if (evaluation.review === 'approved') {
+      await finalizeApproved(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)
+    }
+    logger.info('[Extract] done', {
+      invoice: invoiceId.slice(0, 8), review: evaluation.review,
+      source: confidenceSource, reasons: evaluation.reasons.slice(0, 4),
     })
-  } catch (e) {
-    if (e instanceof VisionTransientError) throw e // -> retryable backoff
-    throw new PermanentJobError(`VISION_FAILED: ${e instanceof Error ? e.message : String(e)}`)
   } finally {
-    plain.fill(0) // wipe plaintext bytes when we are done with them
+    plain.fill(0) // wipe plaintext bytes on every exit path (approve, review, throw)
   }
-
-  // Validate + route to review. This never fabricates a value; a missing/low
-  // confidence or anomaly flags needs_review while we still persist the row.
-  const evaluation = evaluateLedger(candidate, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
-  const keyVersion = deriveKeyVersion(masterKeyHex)
-  const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
-
-  const { error: recErr } = await db.from('extracted_records').upsert({
-    workspace_id: workspaceId,
-    invoice_id: invoiceId,
-    encrypted_payload: `\\x${payload.toString('hex')}`,
-    encryption_key_version: keyVersion,
-    review_status: evaluation.review,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'invoice_id' })
-  if (recErr) throw new Error(`RECORD_WRITE_ERROR: ${recErr.message}`)
-
-  // Route the invoice status: approved -> completed, else needs_review.
-  const { error: stErr } = await db.from('invoices').update({ status: evaluation.review })
-    .eq('workspace_id', workspaceId).eq('id', invoiceId)
-  if (stErr) throw new Error(`INVOICE_STATUS_ERROR: ${stErr.message}`)
-
-  if (evaluation.review === 'approved') {
-    await finalizeApproved(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)
-  }
-  logger.info('[Extract] done', {
-    invoice: invoiceId.slice(0, 8), review: evaluation.review, reasons: evaluation.reasons.slice(0, 4),
-  })
 }
 
 /**

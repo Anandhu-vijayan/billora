@@ -28,6 +28,12 @@ export type JobFailureInvoiceStatus = (typeof JOB_FAILURE_INVOICE_STATUSES)[numb
 export const WORKBOOK_STATUSES = ['ready', 'sent', 'expired', 'deleted'] as const
 export type WorkbookStatus = (typeof WORKBOOK_STATUSES)[number]
 
+// Where an extracted record's confidence came from (matches extracted_records
+// .confidence_source CHECK). 'human' is the review-only placeholder written
+// when no local engine ran and AI is disabled — never a fabricated value.
+export const CONFIDENCE_SOURCES = ['local', 'ai', 'human'] as const
+export type ConfidenceSource = (typeof CONFIDENCE_SOURCES)[number]
+
 // webhook_events intake ledger (durable idempotency).
 export const INTAKE_STATUSES = ['received', 'accepted', 'failed'] as const
 export type IntakeStatus = (typeof INTAKE_STATUSES)[number]

@@ -9,6 +9,17 @@
 import { registerJobHandler } from '@/lib/jobs/worker'
 import { extractInvoice } from '@/lib/jobs/handlers/extract-invoice'
 import { buildRegister } from '@/lib/jobs/handlers/build-register'
+import { getEnv } from '@/lib/env'
+import { registerLocalEngine } from '@/lib/ocr/local'
+import { createPdfTextEngine } from '@/lib/ocr/engines/pdf-text-engine'
+
+// Install the wired LOCAL engine before any extraction runs. Only 'pdfjs-text'
+// has a real implementation here; 'none' runs local-free (honest needs_review),
+// and the reserved ids are left unregistered so the seam reports them as an
+// unavailable engine rather than pretending to extract.
+if (getEnv().LOCAL_OCR_ENGINE === 'pdfjs-text') {
+  registerLocalEngine(createPdfTextEngine())
+}
 
 registerJobHandler('invoice_extraction', extractInvoice)
 registerJobHandler('register_generation', buildRegister)

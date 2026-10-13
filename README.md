@@ -61,6 +61,44 @@ No document-type question in V1 — classification is automatic in a later phase
 - Bot workspaces use `created_via='whatsapp'` with NULL `owner_user_id`; existing web workspaces keep their owners. New tables have RLS with no browser policies (service-role only).
 - Client selections are re-verified against the sender's workspace; unknown reply IDs re-prompt safely.
 
+## Invoice extraction architecture (hybrid — not fully offline)
+
+Billora extracts invoice fields using a **hybrid local-first pipeline**. It is
+explicitly **not** an offline product: an optional cloud assistant exists behind
+an operator-controlled privacy gate.
+
+1. **Local PDF text layer (private, default).** `pdf.js` (`pdfjs-dist`) reads a
+   digital PDF's embedded text layer entirely on the server — no network, no
+   model. A deterministic parser (`lib/ocr/text-parser.ts`) maps that text to
+   invoice fields and `lib/ocr/ledger.ts` scores each field from *objective*
+   checks (GSTIN shape, a resolvable day-first date, finite/non-negative amounts
+   that add up). A complete, consistent result may be auto-approved.
+2. **Scanned / image input.** These have no text layer, so the local engine
+   honestly produces no candidate. For a PDF we rasterize **only the first page**
+   (a real render via `@napi-rs/canvas`) rather than pretending it parsed.
+3. **Optional AI assistant (gated).** Only when an operator sets
+   `EXTRACTION_ALLOW_AI=true` **and** confirms a paid tier (`EXTRACTION_AI_TIER=paid`
+   after completing paid API activation) is Google Gemini consulted — for the
+   fields the local parser could not resolve. AI **assists**: valid local values
+   are kept and AI only fills gaps (`mergeCandidates`); its output is
+   independently re-validated and can never silently overrule good local data or
+   bypass the deterministic checks. Transient provider errors requeue; malformed
+   or refused responses are handled as permanent failures.
+4. **Human review.** Anything still incomplete, inconsistent or low-confidence is
+   stored with `review_status='needs_review'` and a clear reason. Nothing is ever
+   fabricated to force an approval.
+
+> **Data-exposure note:** enabling AI sends a rendered image (or the document
+> bytes) of a real customer invoice to Google. Keep `EXTRACTION_ALLOW_AI=false`
+> until paid activation is actually complete and the provider's data-processing
+> terms are acceptable. The original files and generated workbooks are encrypted
+> at rest; workbooks are served only through the authenticated
+> `/api/exports/[id]/download` route after a workspace-membership re-check.
+
+Extraction accuracy against real Indian invoices is **not yet certified**; the
+deterministic parsing and review logic are unit-tested, but OCR/render quality
+must still be validated on representative documents before production use.
+
 ## Quality checks
 
 - `npm run lint` runs ESLint.

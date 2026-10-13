@@ -45,8 +45,14 @@ export interface LedgerEvaluation {
   row: LedgerRow;
   review: LedgerReview;
   reasons: string[];
-  /** Lowest per-field confidence across the required fields (0 when unknown). */
+  /**
+   * The gate value: our OWN measured confidence from the deterministic checks,
+   * downgraded (never raised) by the model's self-reported per-field confidence
+   * when it supplied any. This is deliberately NOT the model's number alone.
+   */
   confidence: number;
+  /** Confidence computed purely from objective validity of the row (0..1). */
+  measuredConfidence: number;
   /** True only when a real invoice date was parsed (never fabricated). */
   invoiceDateResolved: boolean;
 }
@@ -101,10 +107,14 @@ function toNumber(v: number | string | null | undefined): number {
   return Number.NaN;
 }
 
-/** Lowest confidence across the required fields; 0 when the model gave none. */
-function overallConfidence(candidate: LedgerCandidate): number {
+/**
+ * The model's own lowest required-field confidence, or null when it gave none.
+ * This is only ever a conservative DOWNGRADE signal — it can lower trust, and
+ * the auto-approve gate never rests on it alone (see measuredConfidence below).
+ */
+function selfConfidence(candidate: LedgerCandidate): number | null {
   const c = candidate.confidence;
-  if (!c || typeof c !== 'object') return 0;
+  if (!c || typeof c !== 'object') return null;
   let min = 1;
   let seen = false;
   for (const field of REQUIRED_FIELDS) {
@@ -114,7 +124,86 @@ function overallConfidence(candidate: LedgerCandidate): number {
       if (value < min) min = value;
     }
   }
-  return seen ? min : 0;
+  return seen ? min : null;
+}
+
+/**
+ * Independently measured confidence from objective quality of the parsed row:
+ * completeness, GSTIN validity, a resolvable date, finite/non-negative amounts
+ * and tax-arithmetic consistency. We do NOT trust the model's self-report as
+ * the gate. Each unmet signal subtracts; a fully clean row scores 1.0. This is
+ * calibration-free and deterministic, so the same input always scores the same.
+ */
+function computeMeasured(parts: {
+  dateResolved: boolean;
+  gstinValid: boolean;
+  invoiceNumberPresent: boolean;
+  vendorNamePresent: boolean;
+  amountsFinite: boolean;
+  amountsNonNegative: boolean;
+  arithmeticConsistent: boolean;
+}): number {
+  let m = 1;
+  if (!parts.dateResolved) m -= 0.5;
+  if (!parts.gstinValid) m -= 0.35;
+  if (!parts.invoiceNumberPresent) m -= 0.3;
+  if (!parts.vendorNamePresent) m -= 0.3;
+  if (!parts.amountsFinite) m -= 0.5;
+  if (!parts.amountsNonNegative) m -= 0.4;
+  if (!parts.arithmeticConsistent) m -= 0.4;
+  return Math.max(0, Math.min(1, m));
+}
+
+/**
+ * Merge two candidates field-by-field, preferring `primary` (the LOCAL result)
+ * for every field it produced that is INDEPENDENTLY VALID, and taking
+ * `fallback` (the AI result) only to fill a field local left missing or invalid.
+ * This is what lets AI *assist* the local parser without ever *overruling* a
+ * valid local value: a good local GSTIN/date/amount is kept, a gap is filled.
+ * The merged candidate is still handed to `evaluateLedger`, so the combination
+ * is validated independently afterwards (no blind trust in either source).
+ */
+export function mergeCandidates(
+  primary: LedgerCandidate,
+  fallback: LedgerCandidate,
+): LedgerCandidate {
+  const merged: LedgerCandidate = { ...(fallback ?? {}) }
+  const confidence: Record<string, number> = { ...(fallback?.confidence ?? {}) }
+  const isTextValid = (raw: string | null | undefined): boolean => (raw ?? '').trim() !== ''
+  const isGstinValid = (raw: string | null | undefined): boolean =>
+    GSTIN_RE.test((raw ?? '').trim().toUpperCase())
+  const isDateValid = (raw: string | null | undefined): boolean => parseInvoiceDate(raw) !== null
+  const isAmountValid = (raw: number | string | null | undefined): boolean => {
+    const n = toNumber(raw)
+    return Number.isFinite(n) && n >= 0
+  }
+
+  const copyText = (field: 'invoice_number' | 'vendor_name', valid: (v: string | null | undefined) => boolean) => {
+    const pv = primary[field]
+    if (typeof pv === 'string' && valid(pv)) {
+      ;(merged as Record<string, unknown>)[field] = pv.trim()
+      if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
+    }
+  }
+  copyText('invoice_number', isTextValid)
+  copyText('vendor_name', isTextValid)
+
+  if (isDateValid(primary.invoice_date)) {
+    merged.invoice_date = (primary.invoice_date ?? '').trim()
+    if (primary.confidence?.invoice_date !== undefined) confidence.invoice_date = primary.confidence.invoice_date
+  }
+  if (isGstinValid(primary.supplier_gstin)) {
+    merged.supplier_gstin = (primary.supplier_gstin ?? '').trim().toUpperCase()
+    if (primary.confidence?.supplier_gstin !== undefined) confidence.supplier_gstin = primary.confidence.supplier_gstin
+  }
+  for (const field of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) {
+    if (isAmountValid(primary[field])) {
+      ;(merged as Record<string, unknown>)[field] = primary[field]
+      if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
+    }
+  }
+  merged.confidence = confidence
+  return merged
 }
 
 /**
@@ -147,16 +236,33 @@ export function evaluateLedger(
   const igst = toNumber(candidate.igst_amount);
   const total = toNumber(candidate.total_amount);
   const amounts = [taxable, cgst, sgst, igst, total];
-  if (amounts.some((n) => !Number.isFinite(n))) reasons.push('non-finite-amount');
+  const amountsFinite = amounts.every((n) => Number.isFinite(n));
+  const amountsNonNegative = amounts.every((n) => Number.isFinite(n) && n >= 0);
+  let arithmeticConsistent = true;
+  if (!amountsFinite) reasons.push('non-finite-amount');
   if (amounts.some((n) => Number.isFinite(n) && n < 0)) reasons.push('negative-amount');
-  if (amounts.every((n) => Number.isFinite(n))) {
+  if (amountsFinite) {
     const taxSum = taxable + cgst + sgst + igst;
     if (Math.abs(taxSum - total) > 1.01) {
+      arithmeticConsistent = false;
       reasons.push(`total-mismatch:${taxSum.toFixed(2)}!=${total.toFixed(2)}`);
     }
   }
 
-  const confidence = overallConfidence(candidate);
+  // Measured confidence is our OWN signal; the model's self-report can only
+  // lower it (a source that is unsure of a field must not be auto-approved just
+  // because the deterministic shape looked clean).
+  const measuredConfidence = computeMeasured({
+    dateResolved: iso !== null,
+    gstinValid: gstin !== '' && GSTIN_RE.test(gstin),
+    invoiceNumberPresent: invoiceNumber !== '',
+    vendorNamePresent: vendorName !== '',
+    amountsFinite,
+    amountsNonNegative,
+    arithmeticConsistent,
+  });
+  const self = selfConfidence(candidate);
+  const confidence = self === null ? measuredConfidence : Math.min(measuredConfidence, self);
   if (confidence < opts.minConfidence) reasons.push(`low-confidence:${confidence.toFixed(2)}`);
 
   const row: LedgerRow = {
@@ -176,6 +282,7 @@ export function evaluateLedger(
     review: reasons.length === 0 ? 'approved' : 'needs_review',
     reasons,
     confidence,
+    measuredConfidence,
     invoiceDateResolved: iso !== null,
   };
 }

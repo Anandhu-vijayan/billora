@@ -4,6 +4,11 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
   typedRoutes: true,
+  // The local PDF engine loads pdf.js (large, dynamic worker/font assets) and a
+  // native canvas binding. Keep both out of the server bundle graph and require
+  // them at runtime instead, so a deploy without them fails closed rather than
+  // breaking the build.
+  serverExternalPackages: ["pdfjs-dist", "@napi-rs/canvas"],
   async headers() {
     const supabaseHost = process.env.NEXT_PUBLIC_SUPABASE_URL
       ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).host

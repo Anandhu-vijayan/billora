@@ -60,6 +60,16 @@ const sessionsSrc = () => readFileSync(new URL('../lib/whatsapp/sessions.ts', im
 const envExampleSrc = () => readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
 const webpSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261012210000_media_formats_webp.sql', import.meta.url), 'utf8')
+const privacySqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261013120000_privacy_extraction_exports.sql', import.meta.url), 'utf8')
+const localSrc = () => readFileSync(new URL('../lib/ocr/local.ts', import.meta.url), 'utf8')
+const accessSrc = () => readFileSync(new URL('../lib/exports/access.ts', import.meta.url), 'utf8')
+const downloadRouteSrc = () => readFileSync(
+  new URL('../app/api/exports/[id]/download/route.ts', import.meta.url), 'utf8')
+const pdfSrc = () => readFileSync(new URL('../lib/ocr/pdf.ts', import.meta.url), 'utf8')
+const pdfEngineSrc = () => readFileSync(new URL('../lib/ocr/engines/pdf-text-engine.ts', import.meta.url), 'utf8')
+const nextConfigSrc = () => readFileSync(new URL('../next.config.ts', import.meta.url), 'utf8')
+const readmeSrc = () => readFileSync(new URL('../README.md', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -75,6 +85,15 @@ const ledger = await importTs('lib/ocr/ledger.ts')
 // rather than reimplemented (a drift in either would fail here, not silently).
 const fileType = await importTs('lib/media/file-type.ts')
 const statuses = await importTs('lib/statuses.ts')
+// local.ts (seam) + access.ts (download authz) are alias-free, so the REAL
+// no-fabrication behavior and the REAL cross-workspace denial decision are
+// exercised in-process rather than reimplemented in the test.
+const local = await importTs('lib/ocr/local.ts')
+const access = await importTs('lib/exports/access.ts')
+// text-parser.ts is alias-free + dependency-free, so the REAL deterministic
+// text->field extraction is exercised in-process (a regex drift fails here,
+// not silently in production).
+const textParser = await importTs('lib/ocr/text-parser.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -763,15 +782,24 @@ test('G6a workbook object key is deterministic per batch under the path key (rea
   assert.throws(() => files.deriveWorkbookKey('x', 'not-a-key'), /STORAGE_PATH_KEY/)
 })
 
-test('G6b register builds from approved rows, uploads deterministically, versions, and delivers best-effort', () => {
+test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, versions, and delivers best-effort', () => {
   const s = registerSrc()
   assert.ok(s.includes("throw new PermanentJobError('REGISTER_MISSING_BATCH')"))
   assert.ok(s.includes(".eq('workspace_id', workspaceId).eq('id', batchId)"), 'batch verified to belong to workspace')
   assert.ok(s.includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'deterministic export path')
-  assert.ok(s.includes("contentType: SPREADSHEET_MIME, upsert: true"))
-  assert.ok(s.includes("status: 'expired'"), 'prior workbook retired (freshness)')
+  // Workbook is encrypted with the same envelope scheme as originals, then the
+  // container uploads as octet-stream (never a plaintext spreadsheet at rest).
+  assert.ok(s.includes('encryptFile(workbook, masterKeyHex'), 'register encrypted at rest')
+  assert.ok(s.includes("contentType: 'application/octet-stream', upsert: true"), 'encrypted container transport')
+  assert.ok(s.includes('original_mime: SPREADSHEET_MIME'), 'logical type retained as metadata')
+  assert.ok(s.includes('file_encryption_key_version: enc.keyVersion'), 'key version tracked for decrypt + rotation')
+  // No raw bucket/signed URL is ever handed out for an encrypted object.
+  assert.ok(!s.includes('createSignedUrl'), 'encrypted workbook must not be served via a raw signed URL')
+  assert.ok(s.includes('status: \'expired\''), 'prior workbook retired (freshness)')
   assert.match(s, /version, generated_at: new Date\(\)/)
-  assert.ok(s.includes('createSignedUrl(exportPath, SIGNED_URL_TTL_SECONDS)'))
+  // Delivery links to OUR authenticated route, gated on PUBLIC_APP_URL.
+  assert.ok(s.includes('/api/exports/${workbookId}/download'), 'delivery via authenticated route')
+  assert.ok(s.includes('PUBLIC_APP_URL'), 'link only built when a public origin is configured')
   assert.ok(s.includes('updateSessionDeliveryState(db, senderHmac'), 'delivery via next inbound reply')
   // Batch readiness gate lives HERE: never build a premature workbook.
   assert.ok(s.includes("eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])"))
@@ -1131,5 +1159,315 @@ test('I11 storage-config rejection settles final, never loops, stays narrow', ()
   assert.match(body, /STORAGE_UPLOAD_ERROR/)
   assert.match(body, /not allowed|not supported|unsupported/)
   assert.ok(/return 'processed';/.test(src), 'permanent storage-config settles as processed (no 503 loop)')
+})
+
+// ---- J: privacy-first extraction, AI gate, workbook-at-rest + download ----- 
+
+test('J1 env: AI is OFF by default and the safe posture reveals no secrets', () => {
+  const e = envSrc()
+  assert.match(e, /EXTRACTION_ALLOW_AI: boolFromEnv\(false\)/, 'privacy gate defaults to false')
+  assert.match(e, /EXTRACTION_AI_TIER: z\.enum\(\['free', 'paid'\]\)\.default\('paid'\)/)
+  assert.match(e, /LOCAL_OCR_ENGINE: z\.enum\(\['none', 'pdfjs-text', 'pdftotext', 'tesseract'\]\)\.default\('pdfjs-text'\)/)
+  assert.match(e, /PUBLIC_APP_URL: z\.string\(\)\.url\(\)\.optional\(\)/)
+  // boolFromEnv must reject the zod-coerce trap (only true/1 are truthy).
+  assert.match(e, /s === '1' \|\| s === 'true' \? 'true' : 'false'/)
+  // Public health subset stays boolean/label only — no key/value material.
+  const info = e.slice(e.indexOf('export function getPublicEnvInfo'))
+  assert.ok(info.includes("aiAllowed: (process.env.EXTRACTION_ALLOW_AI ?? '')"))
+  assert.ok(!/\.\.\.|MASTER_KEY|API_KEY_VALUE/.test(info.match(/aiAllowed[^\n]*/)?.[0] ?? ''), 'aiAllowed is a boolean expression')
+  assert.ok(!/process\.env\.ENCRYPTION_MASTER_KEY\b(?!\.)/.test(info.replace(/HEX_64\.test\(process\.env\.ENCRYPTION_MASTER_KEY[^)]*\)/g, '')),
+    'health never echoes raw key material')
+  // Documented in .env.example for operators.
+  const ex = envExampleSrc()
+  for (const k of ['EXTRACTION_ALLOW_AI=false', 'EXTRACTION_AI_TIER=', 'LOCAL_OCR_ENGINE=none', 'PUBLIC_APP_URL=']) {
+    assert.ok(ex.includes(k.split('=')[0]) || ex.includes(k), `.env.example documents ${k}`)
+  }
+})
+
+test('J2 measured confidence is independent: the model self-report cannot approve alone', () => {
+  // (a) A fully valid row with NO self-reported confidence is auto-accepted on
+  //     our own measurement (score 1.0), proving we do not require the model's
+  //     number to approve.
+  const noSelf = { ...CLEAN_ROW }
+  delete noSelf.confidence
+  const a = ledger.evaluateLedger(noSelf, { minConfidence: 0.8 })
+  assert.equal(a.measuredConfidence, 1)
+  assert.equal(a.confidence, 1)
+  assert.equal(a.review, 'approved')
+  // (b) An invalid GSTIN with a maximal self-report (0.99) must still be held:
+  //     our measured score drops and the row is flagged, never auto-approved
+  //     because the model "said" it was confident.
+  const lying = {
+    ...CLEAN_ROW, supplier_gstin: 'NOTAGSTIN',
+    confidence: {
+      invoice_date: 0.99, invoice_number: 0.99, vendor_name: 0.99, supplier_gstin: 0.99,
+      taxable_value: 0.99, cgst_amount: 0.99, sgst_amount: 0.99, igst_amount: 0.99, total_amount: 0.99,
+    },
+  }
+  const b = ledger.evaluateLedger(lying, { minConfidence: 0.8 })
+  assert.ok(b.measuredConfidence < 1, 'objective invalidity lowers OUR confidence')
+  assert.ok(b.reasons.includes('gstin-invalid'))
+  assert.equal(b.review, 'needs_review', 'a confident-but-invalid row is never auto-approved')
+  // (c) Self-report can only DOWNGRADE, never raise: a clean row whose model
+  //     confidence is low is held even though measured is 1.0.
+  const low = ledger.evaluateLedger(hiConf({ confidence: { ...CLEAN_ROW.confidence, total_amount: 0.5 } }), { minConfidence: 0.8 })
+  assert.equal(low.measuredConfidence, 1)
+  assert.equal(low.confidence, 0.5)
+  assert.equal(low.review, 'needs_review')
+})
+
+test('J3 local seam NEVER fabricates: no engine is an honest miss, not a guess', async () => {
+  const savedEngine = process.env.LOCAL_OCR_ENGINE
+  local.registerLocalEngine(null)
+  delete process.env.LOCAL_OCR_ENGINE
+  try {
+    assert.equal(local.configuredEngineId(), 'none')
+    assert.equal(local.localEngineAvailable(), false)
+    const miss = await local.tryLocalExtract({ buffer: Buffer.from('bytes'), mimeType: 'image/png' })
+    assert.equal(miss.ok, false)
+    assert.equal(miss.reason, 'no-engine')
+    // A configured-but-unwired engine is still a miss, never a candidate.
+    process.env.LOCAL_OCR_ENGINE = 'tesseract'
+    const tesseractMiss = await local.tryLocalExtract({ buffer: Buffer.from('bytes'), mimeType: 'image/png' })
+    assert.equal(tesseractMiss.ok, false)
+    assert.notEqual(tesseractMiss.reason, undefined)
+  } finally {
+    local.registerLocalEngine(null)
+    if (savedEngine === undefined) delete process.env.LOCAL_OCR_ENGINE
+    else process.env.LOCAL_OCR_ENGINE = savedEngine
+  }
+})
+
+test('J3b a registered local adapter drives hit / no-candidate / error outcomes', async () => {
+  const savedEngine = process.env.LOCAL_OCR_ENGINE
+  delete process.env.LOCAL_OCR_ENGINE
+  try {
+    local.registerLocalEngine({ id: 'test-pdf', extract: async () => ({ ...CLEAN_ROW }) })
+    const hit = await local.tryLocalExtract({ buffer: Buffer.from('x'), mimeType: 'application/pdf' })
+    assert.equal(hit.ok, true)
+    assert.equal(hit.engine, 'test-pdf')
+
+    local.registerLocalEngine({ id: 'blank', extract: async () => null })
+    const empty = await local.tryLocalExtract({ buffer: Buffer.from('x'), mimeType: 'application/pdf' })
+    assert.equal(empty.ok, false)
+    assert.equal(empty.reason, 'no-candidate')
+
+    local.registerLocalEngine({ id: 'boom', extract: async () => { throw new Error('engine crashed') } })
+    const err = await local.tryLocalExtract({ buffer: Buffer.from('x'), mimeType: 'application/pdf' })
+    assert.equal(err.ok, false)
+    assert.equal(err.reason, 'engine-error')
+  } finally {
+    local.registerLocalEngine(null)
+    if (savedEngine === undefined) delete process.env.LOCAL_OCR_ENGINE
+    else process.env.LOCAL_OCR_ENGINE = savedEngine
+  }
+})
+
+test('J4 extract handler: local-first, AI behind an explicit paid gate, review when neither applies', () => {
+  const s = extractSrc()
+  assert.ok(s.includes('tryLocalExtract'), 'attempts a local engine first')
+  assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"),
+    'AI runs only when explicitly enabled AND on a paid tier')
+  // The vision call must live INSIDE the gate (never unconditional).
+  const gateIdx = s.indexOf('const aiEnabled =')
+  const providerIdx = s.indexOf("env.EXTRACTION_PROVIDER !== 'gemini'")
+  const visionIdx = s.indexOf('extractInvoiceFields(')
+  assert.ok(gateIdx > 0 && providerIdx > gateIdx && visionIdx > gateIdx,
+    'provider selection + vision call are gated behind aiEnabled (no silent Gemini)')
+  // AI disabled + no engine -> a review-only placeholder, never invented values.
+  assert.ok(s.includes('evaluateLedger({}, '), 'falls back to an empty review placeholder')
+  assert.ok(s.includes('confidence_source: confidenceSource'), 'provenance persisted')
+  assert.ok(s.includes('plain.fill(0)'), 'plaintext wiped on every path')
+})
+
+test('J5 download authz decision is total and denies cross-workspace access', () => {
+  const now = Date.UTC(2026, 0, 1)
+  const base = {
+    authenticated: true, workbookExists: true, memberOfWorkspace: true,
+    status: 'ready', expiresAt: new Date(now + 1000).toISOString(), nowMs: now,
+  }
+  assert.equal(access.decideDownloadAccess(base).ok, true)
+  assert.equal(access.decideDownloadAccess({ ...base, authenticated: false }).status, 401)
+  assert.equal(access.decideDownloadAccess({ ...base, workbookExists: false }).status, 404)
+  // The core isolation rule: a valid user who is NOT a member is denied.
+  const cross = access.decideDownloadAccess({ ...base, memberOfWorkspace: false })
+  assert.equal(cross.ok, false)
+  assert.equal(cross.status, 403)
+  assert.equal(cross.code, 'NOT_MEMBER')
+  // Precedence: anonymous beats everything; expired lapses at/after expiry.
+  assert.equal(access.decideDownloadAccess({ ...base, authenticated: false, memberOfWorkspace: false }).status, 401)
+  assert.equal(access.decideDownloadAccess({ ...base, expiresAt: new Date(now - 1).toISOString() }).status, 410)
+  assert.equal(access.decideDownloadAccess({ ...base, status: 'deleted' }).status, 404)
+  assert.equal(access.decideDownloadAccess({ ...base, status: 'expired' }).status, 410)
+})
+
+test('J6 download route authorizes BEFORE decrypt and never leaks the object', () => {
+  const r = downloadRouteSrc()
+  assert.ok(r.includes('getAuthenticatedUserId()'), 'requires a signed-in user')
+  assert.ok(r.includes("from('workspace_members')"), 're-checks workspace membership')
+  assert.ok(r.includes('decideDownloadAccess'), 'delegates to the pure decision fn')
+  // The access decision must short-circuit before any storage read/decrypt.
+  const denyIdx = r.indexOf('if (!decision.ok) return deny')
+  const dlIdx = r.indexOf('.download(')
+  assert.ok(denyIdx > 0 && dlIdx > denyIdx, 'never downloads/decrypts before the decision passes')
+  assert.ok(r.includes('decryptFile(container, masterKeyHex'), 'decrypts the container in memory')
+  assert.ok(r.includes("context: workbook.file_object_path"), 'decrypt AAD context is the object path')
+  assert.ok(r.includes("'Cache-Control': 'no-store'"), 'served with no-store')
+  // No raw signed URL is minted; nothing sensitive is logged.
+  assert.ok(!/createSignedUrl/.test(r), 'encrypted object is never exposed via a signed URL')
+  assert.ok(!/logger\.[a-z]+\([^)]*(masterKey|signedUrl|file_object_path|container)/.test(r),
+    'route must not log keys, URLs, object paths or ciphertext')
+})
+
+test('J7 privacy migration: confidence provenance, exports at-rest, retention sweeps (service-role only)', () => {
+  const sql = privacySqlSrc()
+  assert.ok(sql.includes("add column if not exists confidence_source text not null default 'human'"))
+  assert.ok(sql.includes("check (confidence_source in ('local', 'ai', 'human'))"))
+  assert.ok(sql.includes('add column if not exists file_encryption_key_version text'))
+  assert.ok(sql.includes('add column if not exists size_bytes bigint'))
+  // Exports bucket accepts the encrypted container transport, private flag kept.
+  assert.ok(sql.includes("'application/octet-stream'"))
+  assert.ok(sql.includes("where id = 'billora-exports'"))
+  assert.ok(!/is_public|public\s*=\s*true/i.test(sql), 'bucket stays private')
+  // Retention sweeps exist and are definer-scoped + service-role only.
+  assert.ok(sql.includes('create or replace function public.purge_expired_workbooks'))
+  assert.ok(sql.includes('create or replace function public.purge_expired_invoices'))
+  assert.match(sql, /security definer/)
+  assert.match(sql, /revoke all on function public\.purge_expired_workbooks\(timestamptz\) from public, anon, authenticated/)
+  assert.match(sql, /grant execute on function public\.purge_expired_workbooks\(timestamptz\)\s+to service_role/)
+  assert.match(sql, /grant execute on function public\.purge_expired_invoices\(timestamptz\)\s+to service_role/)
+  assert.ok(!/^[ \t]*grant[^\n]*\bto\s+(anon|authenticated)\b/im.test(sql), 'no browser access to retention sweeps')
+  assert.ok(!/drop column|drop table/i.test(sql), 'forward-only, never destroys existing schema')
+})
+
+test('J8 confidence_source stays aligned across statuses + migration + handler', () => {
+  assert.deepEqual([...statuses.CONFIDENCE_SOURCES].sort(), ['ai', 'human', 'local'])
+  assert.ok(privacySqlSrc().includes("'local', 'ai', 'human'"), 'DB CHECK matches the TS set')
+  for (const src of [extractSrc(), localSrc(), accessSrc()]) {
+    assert.ok(typeof src === 'string' && src.length > 0, 'source loaders resolve')
+  }
+  // The handler only ever writes one of the three provenance values.
+  const s = extractSrc()
+  assert.ok(s.includes("'local' : 'human'"), 'local-or-review provenance assigned at intake of the result')
+  assert.ok(s.includes("confidenceSource = 'ai'"), 'AI fallback recorded as ai provenance')
+})
+
+// ---- K: hybrid local-first extraction (real PDF text engine + gated AI) ---- 
+
+const INVOICE_TEXT = [
+  'TAX INVOICE',
+  'ACME TRADERS PVT LTD',
+  'GSTIN: 27ABCDE1234F1Z5',
+  'Invoice No: INV-2026-0042',
+  'Invoice Date: 05/09/2026',
+  'Taxable Value: 1,000.00',
+  'CGST: 90.00',
+  'SGST: 90.00',
+  'IGST: 0.00',
+  'Grand Total: 1,180.00',
+].join('\n')
+
+test('K1 text-parser: deterministic parse of a real PDF text layer (real module, never fabricates)', () => {
+  const cand = textParser.parseInvoiceText(INVOICE_TEXT)
+  assert.equal(cand.invoice_number, 'INV-2026-0042')
+  assert.equal(cand.invoice_date, '05/09/2026')
+  assert.equal(cand.supplier_gstin, '27ABCDE1234F1Z5')
+  assert.match(cand.vendor_name, /ACME TRADERS/)
+  assert.equal(cand.taxable_value, 1000)
+  assert.equal(cand.cgst_amount, 90)
+  assert.equal(cand.sgst_amount, 90)
+  assert.equal(cand.igst_amount, 0)
+  assert.equal(cand.total_amount, 1180)
+  // A complete, consistent local parse may be auto-approved on our OWN scoring.
+  const ev = ledger.evaluateLedger(cand, { minConfidence: 0.8 })
+  assert.equal(ev.review, 'approved')
+  assert.ok(ev.confidence <= 0.9, 'local self-confidence caps the score')
+  // NEVER fabricate: fields absent from the text are omitted, not invented.
+  const none = textParser.parseInvoiceText('a scanned page with no legible fields at all')
+  assert.ok(!none.supplier_gstin, 'no GSTIN invented')
+  assert.ok(!none.invoice_date, 'no date invented')
+  assert.ok(!none.total_amount, 'no total invented')
+  assert.equal(ledger.evaluateLedger(none, { minConfidence: 0.8 }).review, 'needs_review')
+  // A partial read (no total) can NEVER auto-approve.
+  const partial = textParser.parseInvoiceText(
+    'Invoice No: X-1\nDate: 05/09/2026\nGSTIN: 27ABCDE1234F1Z5\nAcme Traders Pvt Ltd\nTaxable Value: 1000')
+  assert.equal(ledger.evaluateLedger(partial, { minConfidence: 0.8 }).review, 'needs_review')
+  assert.equal(textParser.hasMeaningfulText(INVOICE_TEXT), true)
+  assert.equal(textParser.hasMeaningfulText('   '), false)
+})
+
+test('K2 mergeCandidates: AI assists the local parse but never overrules valid local data', () => {
+  const localRow = { invoice_number: 'INV-1', supplier_gstin: 'NOTAGSTIN', total_amount: 1000 }
+  const aiRow = {
+    invoice_number: 'WRONG', supplier_gstin: '27ABCDE1234F1Z5', total_amount: 999,
+    vendor_name: 'Acme Traders Pvt Ltd', invoice_date: '05/09/2026',
+  }
+  const merged = ledger.mergeCandidates(localRow, aiRow)
+  assert.equal(merged.invoice_number, 'INV-1', 'valid local text field kept over the AI value')
+  assert.equal(merged.supplier_gstin, '27ABCDE1234F1Z5', 'an INVALID local GSTIN is filled from AI')
+  assert.equal(merged.total_amount, 1000, 'valid local amount kept over AI')
+  assert.equal(merged.vendor_name, 'Acme Traders Pvt Ltd', 'AI fills a field local missed')
+  assert.equal(merged.invoice_date, '05/09/2026', 'AI fills the missing date')
+})
+
+test('K3 pdf.ts: a REAL pdf.js text layer + first-page-only rasterization, honest nulls', () => {
+  const p = pdfSrc()
+  assert.ok(p.includes('pdfjs-dist/legacy/build/pdf.mjs'), 'loads the real pdf.js engine')
+  assert.ok(p.includes('@napi-rs/canvas'), 'renders through a real canvas')
+  assert.ok(p.includes('getTextContent'), 'extracts the embedded text layer')
+  assert.ok(p.includes('standardFontDataUrl'), 'supplies standard-font data for rendering')
+  // Rasterization must render ONLY the first page (never iterate all pages).
+  const render = p.slice(p.indexOf('export async function renderFirstPageToPng'), p.indexOf('export async function pdfEngineAvailable'))
+  assert.ok(render.includes('getPage(1)'), 'renders page 1 only')
+  assert.ok(!/for \(let n = 1; n <= doc\.numPages/.test(render), 'never renders every page')
+  assert.ok(render.includes("toBuffer('image/png')"), 'emits a real PNG')
+  // Unavailable engine -> honest null, never a fabricated image.
+  assert.ok(p.includes('if (!pdfjs) return null'), 'missing engine resolves to null')
+})
+
+test('K4 pdf-text-engine + worker wiring: registered as the local engine; images/scans are honest nulls', () => {
+  const e = pdfEngineSrc()
+  assert.ok(e.includes("id: 'pdfjs-text'"), 'the wired adapter id')
+  assert.ok(e.includes('extractPdfTextLayer'), 'uses the real PDF text layer')
+  assert.ok(e.includes('parseInvoiceText'), 'parses deterministically')
+  assert.ok(e.includes("if (!PDF_MIME.test(mimeType ?? '')) return null"), 'bare images are NOT locally processed')
+  assert.ok(e.includes('if (!hasMeaningfulText(text)) return null'), 'scanned/blank layers yield no candidate')
+  const idx = handlersIndexSrc()
+  assert.ok(idx.includes("getEnv().LOCAL_OCR_ENGINE === 'pdfjs-text'"), 'registered only when the local engine is selected')
+  assert.ok(idx.includes('registerLocalEngine(createPdfTextEngine())'), 'worker boot installs the engine')
+})
+
+test('K5 extract handler: PDF reaches the gated AI as a rendered first page; AI only merges in', () => {
+  const s = extractSrc()
+  const gateIdx = s.indexOf('const aiEnabled =')
+  const renderIdx = s.indexOf('renderFirstPageToPng(plain)')
+  const mergeIdx = s.indexOf('mergeCandidates(candidate, aiCandidate)')
+  assert.ok(gateIdx > 0 && renderIdx > gateIdx, 'first-page rendering happens only inside the AI gate')
+  assert.ok(mergeIdx > gateIdx, 'AI merge happens only inside the AI gate')
+  assert.ok(s.includes("aiMime = 'image/png'"), 'a rendered PDF is sent as an image')
+  assert.ok(s.includes('const assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate'),
+    'AI fills gaps but valid local fields are preserved')
+  assert.ok(s.includes('const isPdf ='), 'PDF vs image media selection is explicit')
+})
+
+test('K6 hybrid config + docs: real deps externalized, exposure documented, no offline claim', () => {
+  // Heavy/native server modules must stay out of the bundle graph.
+  const cfg = nextConfigSrc()
+  assert.match(cfg, /serverExternalPackages/)
+  assert.ok(cfg.includes('pdfjs-dist') && cfg.includes('@napi-rs/canvas'), 'both engines externalized')
+  // package.json actually declares them (not phantom transitives).
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.ok(pkg.dependencies['pdfjs-dist'], 'pdfjs-dist is a direct dependency')
+  assert.ok(pkg.dependencies['@napi-rs/canvas'], '@napi-rs/canvas is a direct dependency')
+  // .env.example documents the hybrid engine + the exposure warning.
+  const ex = envExampleSrc()
+  assert.ok(ex.includes('LOCAL_OCR_ENGINE=pdfjs-text'), 'hybrid local default documented')
+  assert.ok(/EXTRACTION_ALLOW_AI=false/.test(ex), 'AI still off by default')
+  assert.match(ex, /data-exposure|DATA EXPOSURE|rendered image/i)
+  // README describes hybrid + cloud fallback and is NOT claiming "fully offline".
+  const rm = readmeSrc()
+  assert.match(rm, /hybrid/i)
+  assert.match(rm, /not fully offline|not\*\*\s*an offline/i)
+  assert.match(rm, /Data-exposure note|Gemini/)
 })
 

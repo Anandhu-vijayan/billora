@@ -19,7 +19,7 @@ import { bucketFor } from '@/lib/supabase/server'
 import { logger } from '@/lib/logger'
 import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
-import { resolveFileKeyConfig, deriveWorkbookKey } from '@/lib/encryption/files'
+import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
 import { buildComplianceExcelWorkbook } from '@/lib/excel/generator'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
@@ -28,7 +28,11 @@ import type { LedgerRow } from '@/lib/ocr/ledger'
 type Db = SupabaseClient
 
 const SPREADSHEET_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-const SIGNED_URL_TTL_SECONDS = 7 * 24 * 3600 // links live a week, then re-generate
+// A generated workbook is protected AT REST and served only through the
+// authenticated /api/exports/[id]/download route (workspace membership is
+// re-checked there). This window is when a ready register stays downloadable
+// before it is treated as lapsed; the object itself is never handed out raw.
+const WORKBOOK_LINK_TTL_SECONDS = 7 * 24 * 3600
 
 /** PostgREST renders bytea as a `\x`-prefixed hex string (same as intake). */
 function byteaToBuffer(value: unknown): Buffer {
@@ -116,8 +120,16 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   const workbook = await buildComplianceExcelWorkbook(rows)
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')
+  // Encrypt the register AT REST: vendor names, GSTINs and amounts are customer
+  // data. The envelope container uploads as application/octet-stream; the
+  // logical spreadsheetml type + extension are retained as object metadata so
+  // the download route can name the file it streams after decrypting in memory.
+  const enc = encryptFile(workbook, masterKeyHex, { context: exportPath })
   const { error: upErr } = await db.storage.from(exportsBucket)
-    .upload(exportPath, workbook, { contentType: SPREADSHEET_MIME, upsert: true })
+    .upload(exportPath, enc.container, {
+      contentType: 'application/octet-stream', upsert: true,
+      metadata: { original_mime: SPREADSHEET_MIME, original_extension: 'xlsx' },
+    })
   if (upErr) throw new Error(`WORKBOOK_UPLOAD_ERROR: ${upErr.message}`)
 
   // Freshness: retire prior workbooks for this batch, then insert the new one
@@ -129,48 +141,43 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).order('version', { ascending: false }).limit(1)
   const version = ((prior ?? [])[0]?.version as number | undefined ?? 0) + 1
 
+  const expiresAt = new Date(Date.now() + WORKBOOK_LINK_TTL_SECONDS * 1000).toISOString()
   const { data: inserted, error: gwErr } = await db.from('generated_workbooks').insert({
     workspace_id: workspaceId, batch_id: batchId, file_object_path: exportPath,
-    status: 'ready', version, generated_at: new Date().toISOString(),
+    file_encryption_key_version: enc.keyVersion, size_bytes: enc.sizeBytes,
+    status: 'ready', version, generated_at: new Date().toISOString(), expires_at: expiresAt,
   }).select('id').single()
   if (gwErr || !inserted) throw new Error(`WORKBOOK_ROW_ERROR: ${gwErr?.message ?? 'no id'}`)
   const workbookId = (inserted as { id: string }).id
 
-  // Short-lived signed download link + its expiry (tracked independently of
-  // generation: a link can lapse while the workbook row itself stays valid).
-  const { data: signed, error: signErr } = await db.storage.from(exportsBucket)
-    .createSignedUrl(exportPath, SIGNED_URL_TTL_SECONDS)
-  if (signErr || !signed?.signedUrl) {
-    logger.warn('[Register] signed URL creation failed; workbook still stored', {
-      batch: batchId.slice(0, 8), error: signErr?.message ?? 'none',
-    })
-    return // generation succeeded; delivery is deferred, never fail the job
-  }
-  const expiresAt = new Date(Date.now() + SIGNED_URL_TTL_SECONDS * 1000).toISOString()
-  await db.from('generated_workbooks').update({ expires_at: expiresAt })
-    .eq('workspace_id', workspaceId).eq('id', workbookId)
-
-  await scheduleDelivery(db, workspaceId, rows.length, String(signed.signedUrl), expiresAt)
+  // Delivery is best-effort and NEVER fails the generation job (rule 5).
+  await scheduleDelivery(db, workspaceId, workbookId, rows.length, expiresAt)
 }
 
 /**
- * Best-effort delivery: hand the workbook link to the sender's NEXT inbound
- * reply (the phone number is only known at webhook time, so we never claim a
- * spontaneous push). Storing the pending reply is send-only bookkeeping — a
- * failure here cannot fail the generation job (rule 5) and the workbook row +
- * signed URL persist for a later retry regardless.
+ * Best-effort delivery: hand the AUTHENTICATED download link to the sender's
+ * NEXT inbound reply (the phone number is only known at webhook time, so we
+ * never claim a spontaneous push). The workbook is encrypted at rest, so we
+ * link our own login-required route rather than a raw bucket URL. Storing the
+ * pending reply is send-only bookkeeping — a failure here cannot fail the
+ * generation job (rule 5), and the workbook row persists for a later retry.
  */
-async function scheduleDelivery(db: Db, workspaceId: string, rowCount: number, signedUrl: string, expiresAt: string): Promise<void> {
+async function scheduleDelivery(db: Db, workspaceId: string, workbookId: string, rowCount: number, expiresAt: string): Promise<void> {
   try {
+    const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
+    if (!base) {
+      // No public origin configured: the register is stored + ready, but we have
+      // no safe way to hand out a link, so delivery is honestly deferred.
+      logger.info('[Register] PUBLIC_APP_URL unset; workbook ready, delivery deferred', { workspace: workspaceId.slice(0, 8) })
+      return
+    }
     const senderHmac = await findOwnerSenderHmac(db, workspaceId)
     if (!senderHmac) {
       logger.info('[Register] no linked WhatsApp sender; workbook ready for later delivery', { workspace: workspaceId.slice(0, 8) })
       return
     }
-    const body = `Your invoice register is ready — ${rowCount} invoice(s). Download: ${signedUrl} (link expires ${expiresAt}).`
-    // If the sender is online right now a direct send may already succeed; if
-    // not (no active window), fall back to the deferred-reply path. Delivery
-    // status is never asserted as 'sent' from here — that stays honest.
+    const link = `${base}/api/exports/${workbookId}/download`
+    const body = `Your invoice register is ready — ${rowCount} invoice(s). Secure download (sign in required): ${link} (valid until ${expiresAt}).`
     await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
     logger.info('[Register] delivery queued on next inbound reply', { workspace: workspaceId.slice(0, 8) })
   } catch (e) {
