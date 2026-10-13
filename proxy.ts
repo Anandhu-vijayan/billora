@@ -29,10 +29,10 @@ function isRateLimited(key: string): { limited: boolean; resetAfterMs: number } 
 
 /**
  * Attaches a request id, enforces a basic in-memory rate limit on /api/*,
- * and keeps the middleware free of secrets. For multi-instance production,
+ * and keeps the proxy free of secrets. For multi-instance production,
  * replace the Map with Redis/Upstash.
  */
-export function middleware(req: NextRequest) {
+export function proxy(req: NextRequest) {
   const requestId =
     req.headers.get('x-request-id') ?? crypto.randomUUID().slice(0, 8)
 

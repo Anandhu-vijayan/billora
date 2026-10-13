@@ -4,7 +4,7 @@ Billora is an invoice operations application built with Next.js and Supabase. Th
 
 ## Requirements
 
-- Node.js 20.9 or newer
+- Node.js 22 or newer (supabase-js no longer supports Node 20 and below)
 - npm
 - A Supabase project for database-backed development
 
@@ -30,7 +30,7 @@ app/
   lib/supabase/admin.ts          # lazy service_role client (server only)
   lib/supabase/server.ts         # back-compat re-export (lazy Proxy)
   lib/supabase/client.ts         # browser client (publishable key only)
-middleware.ts                    # request id + basic in-memory /api rate limiting
+proxy.ts                       # request id + basic in-memory /api rate limiting
 scripts/smoke.mjs                # `npm run smoke` — hits both health endpoints
 scripts/secret-scan.mjs          # `npm run secret-scan` — blocks secret-looking staged diffs
 supabase/migrations/             # workspace-scoped schema + RLS (source of truth)
@@ -117,7 +117,7 @@ must still be validated on representative documents before production use.
 - Zod-validated env at request time (`lib/env.ts`); one clear error instead of `supabaseUrl is required` crashes.
 - Lazy Supabase admin client; no secrets in browser bundles, no `NEXT_PUBLIC_` secrets.
 - Generic API error envelope; logs carry `x-request-id`, secrets auto-redacted by `lib/logger.ts`.
-- Security headers in `next.config.ts` (+ CSP and HSTS in production), `middleware.ts` rate-limits `/api/*` (60 req/min/IP, in-memory — use Redis/Upstash for multi-instance prod).
+- Security headers in `next.config.ts` (+ CSP and HSTS in production), `proxy.ts` rate-limits `/api/*` (60 req/min/IP, in-memory — use Redis/Upstash for multi-instance prod).
 - `robots.ts` disallows indexing; error boundaries never render internals.
 - CI runs secret-scan + lint + typecheck + build; build uses placeholder public env only.
 

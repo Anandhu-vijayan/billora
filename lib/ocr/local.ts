@@ -16,7 +16,14 @@
 //
 // Alias-free + import-only-types so it is unit-testable in-process (the test
 // harness transpiles a single file and cannot resolve `@/` runtime imports).
-import { createRequire } from 'node:module'
+// The presence probe uses node:fs only: createRequire().resolve() with a
+// computed specifier trips Turbopack's static analysis ("Can't resolve
+// <dynamic>") on every worker tick, so we walk node_modules for package.json
+// instead. Resolution semantics are identical (we only claim "installed" when
+// the package dir + manifest exist on disk), and engines are still never
+// loaded here.
+import { existsSync } from 'node:fs'
+import { dirname, join, resolve as resolvePath } from 'node:path'
 import type { LedgerCandidate } from './ledger'
 
 export interface LocalExtractArgs {
@@ -79,29 +86,40 @@ export function localEngineAvailable(): boolean {
   return probeEngineModule(id) !== null
 }
 
-// Best-effort PRESENCE check only — resolves (never executes) the module so we
-// do not claim a package is usable when it is not installed. Any throw resolves
-// to "unavailable". This is consulted only when NO adapter is registered; the
-// hybrid worker registers the real pdfjs-text adapter (see engines/).
+// Best-effort PRESENCE check only — confirms the package directory exists in
+// node_modules (never loads or executes it) so we do not claim an engine is
+// usable when it is not installed. Any failure resolves to "unavailable".
+// This is consulted only when NO adapter is registered; the hybrid worker
+// registers the real pdfjs-text adapter (see engines/).
 //
-// The names are assembled at runtime (never a string literal) on purpose: a
-// bundler must NOT statically resolve these optional, unbundled engines into the
-// build graph (that fails when they are absent, which is the honest default).
-// Reaching them through a computed key keeps the probe purely dynamic.
-const ENGINE_PACKAGE_PARTS: Record<string, string[]> = {
-  'pdfjs-text': ['pdfjs-dist', '/', 'legacy', '/', 'build', '/', 'pdf', '.mjs'],
-  tesseract: ['tesseract', '.', 'js'],
-  pdftotext: ['pdftotext', '-', 'npm', '-', 'wrapper'],
+// Only the top-level package slug is resolved (never the deep entry file) on
+// purpose: a bundler must NOT statically trace these optional, unbundled
+// engines into the build graph (that fails when they are absent, which is the
+// honest default). Walking node_modules with node:fs keeps the probe purely
+// dynamic and Turbopack-clean.
+const ENGINE_PACKAGES: Record<string, string> = {
+  'pdfjs-text': 'pdfjs-dist',
+  tesseract: 'tesseract.js',
+  pdftotext: 'pdftotext-npm-wrapper',
 }
 
 function probeEngineModule(id: string): unknown | null {
-  const parts = ENGINE_PACKAGE_PARTS[id]
-  if (!parts) return null
-  const moduleName = parts.join('')
+  const slug = ENGINE_PACKAGES[id]
+  if (!slug) return null
+  // Pure node:fs walk upward from the process working directory: no
+  // require/import call at all, so the bundler has nothing dynamic to trace.
+  // Returns the manifest path on a hit (truthy), null on a miss — same
+  // contract as before.
   try {
-    const req = createRequire(import.meta.url)
-    // resolve() proves presence without loading/executing an ESM module.
-    return req.resolve(moduleName)
+    let dir = resolvePath(process.cwd())
+    for (let depth = 0; depth < 12; depth += 1) {
+      const manifest = join(dir, 'node_modules', slug, 'package.json')
+      if (existsSync(manifest)) return manifest
+      const parent = dirname(dir)
+      if (parent === dir) return null
+      dir = parent
+    }
+    return null
   } catch {
     return null
   }

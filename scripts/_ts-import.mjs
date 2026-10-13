@@ -1,5 +1,6 @@
 // scripts/_ts-import.mjs — load a dependency-light TypeScript module from a
-// plain .mjs runner (Node 20 has no native type-stripping). Transpiles the
+// plain .mjs runner (kept explicit so the suite also runs on Node 20, which
+// has no native type-stripping). Transpiles the
 // source with the installed `typescript` package and dynamic-imports it.
 //
 // Only for modules whose imports are Node builtins or relative paths WITHOUT the

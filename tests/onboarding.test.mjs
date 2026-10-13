@@ -1,6 +1,6 @@
 // Zero-dependency onboarding + intake tests: npm test (node --test).
-// Mirrors contracts in lib/whatsapp/*.ts without importing TS (Node 20 has
-// no type-stripping). A = conversation contract; B = intake/concurrency;
+// Mirrors contracts in lib/whatsapp/*.ts without importing TS (the harness
+// transpiles instead, so it also runs on older Node without type-stripping).
 // C = migration + logging expectations. Contract changes fail loudly.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
