@@ -50,6 +50,7 @@ const encMenuSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261012120000_whatsapp_menu_outbound_decoupling.sql', import.meta.url), 'utf8')
 const visionSrc = () => readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
 const extractSrc = () => readFileSync(new URL('../lib/jobs/handlers/extract-invoice.ts', import.meta.url), 'utf8')
+const extractorSrc = () => readFileSync(new URL('../lib/ocr/invoice-extractor.ts', import.meta.url), 'utf8')
 const registerSrc = () => readFileSync(new URL('../lib/jobs/handlers/build-register.ts', import.meta.url), 'utf8')
 const handlersIndexSrc = () => readFileSync(new URL('../lib/jobs/handlers/index.ts', import.meta.url), 'utf8')
 const extractionSqlSrc = () => readFileSync(
@@ -776,8 +777,9 @@ test('G5f extraction decrypts in-memory, routes review, and only enqueues the re
   assert.ok(s.includes('context: invoice.file_object_path'), 'decrypt AAD context is the object path')
   assert.ok(s.includes('expectedKeyVersion: invoice.file_encryption_key_version'), 'key version enforced')
   assert.ok(s.includes('isMediaDecryptFailure'), 'tampered container -> permanent, never plaintext')
-  assert.ok(s.includes('if (env.EXTRACTION_PROVIDER !== \'gemini\')'), 'unimplemented provider fails closed')
-  assert.ok(s.includes('e instanceof VisionTransientError) throw e'), 'transient provider error requeues')
+  assert.ok(s.includes("if (allowAI && env.EXTRACTION_PROVIDER !== 'gemini')"), 'unimplemented provider fails closed (only when AI is on)')
+  assert.ok(s.includes('if (!e.retryable) throw new PermanentJobError'), 'permanent extraction failure never spins retries')
+  assert.ok(s.includes('throw e // transient'), 'transient OCR/vision fault requeues')
   assert.ok(s.includes("onConflict: 'invoice_id'"), 'extracted_records upsert is idempotent')
   // The invoices.status CHECK allows 'completed' but NOT 'approved' — a clean
   // extraction must route to 'completed' (extracted_records keeps review_status).
@@ -1284,19 +1286,18 @@ test('J3b a registered local adapter drives hit / no-candidate / error outcomes'
   }
 })
 
-test('J4 extract handler: local-first, AI behind an explicit paid gate, review when neither applies', () => {
+test('J4 extract handler: delegates to the OCR engine, AI behind an explicit paid gate, plaintext wiped', () => {
   const s = extractSrc()
-  assert.ok(s.includes('tryLocalExtract'), 'attempts a local engine first')
+  assert.ok(s.includes("from '@/lib/ocr/invoice-extractor'"), 'delegates extraction to the OCR engine module')
+  assert.ok(s.includes('await runExtraction({'), 'calls the engine to obtain a candidate')
+  // AI runs ONLY when explicitly enabled AND on a paid tier; never hard-coded true.
   assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"),
     'AI runs only when explicitly enabled AND on a paid tier')
-  // The vision call must live INSIDE the gate (never unconditional).
-  const gateIdx = s.indexOf('const aiEnabled =')
-  const providerIdx = s.indexOf("env.EXTRACTION_PROVIDER !== 'gemini'")
-  const visionIdx = s.indexOf('extractInvoiceFields(')
-  assert.ok(gateIdx > 0 && providerIdx > gateIdx && visionIdx > gateIdx,
-    'provider selection + vision call are gated behind aiEnabled (no silent Gemini)')
-  // AI disabled + no engine -> a review-only placeholder, never invented values.
-  assert.ok(s.includes('evaluateLedger({}, '), 'falls back to an empty review placeholder')
+  assert.ok(s.includes('allowAI,'), 'the gate result (not a literal) is what enables AI')
+  assert.ok(!/allowAI:\s*true/.test(s), 'AI is never forced on for customer invoices')
+  assert.ok(s.includes("env.EXTRACTION_PROVIDER !== 'gemini'"), 'an unimplemented provider fails closed before any AI call')
+  // The handler still owns the canonical row, provenance and the plaintext wipe.
+  assert.ok(s.includes('evaluateLedger(result.candidate'), 'handler re-evaluates the returned candidate independently')
   assert.ok(s.includes('confidence_source: confidenceSource'), 'provenance persisted')
   assert.ok(s.includes('plain.fill(0)'), 'plaintext wiped on every path')
 })
@@ -1367,10 +1368,12 @@ test('J8 confidence_source stays aligned across statuses + migration + handler',
   for (const src of [extractSrc(), localSrc(), accessSrc()]) {
     assert.ok(typeof src === 'string' && src.length > 0, 'source loaders resolve')
   }
-  // The handler only ever writes one of the three provenance values.
+  // Provenance now comes from the engine result; the engine assigns local/ai/human.
   const s = extractSrc()
-  assert.ok(s.includes("'local' : 'human'"), 'local-or-review provenance assigned at intake of the result')
-  assert.ok(s.includes("confidenceSource = 'ai'"), 'AI fallback recorded as ai provenance')
+  assert.ok(s.includes('const confidenceSource: ExtractionSource = result.source'), 'handler persists the engine-provided provenance')
+  const e = extractorSrc()
+  assert.ok(e.includes("source = 'local'") && e.includes("source = 'ai'") && e.includes("ExtractionSource = 'human'"),
+    'engine assigns local / ai / human provenance')
 })
 
 // ---- K: hybrid local-first extraction (real PDF text engine + gated AI) ---- 
@@ -1458,28 +1461,30 @@ test('K4 pdf-text-engine + worker wiring: registered as the local engine; images
   assert.ok(idx.includes('registerLocalEngine(createPdfTextEngine())'), 'worker boot installs the engine')
 })
 
-test('K5 extract handler: PDF reaches the gated AI as a rendered first page; AI only merges in', () => {
-  const s = extractSrc()
-  const gateIdx = s.indexOf('const aiEnabled =')
-  const renderIdx = s.indexOf('renderFirstPageToPng(plain)')
-  const mergeIdx = s.indexOf('mergeCandidates(candidate, aiCandidate)')
-  assert.ok(gateIdx > 0 && renderIdx > gateIdx, 'first-page rendering happens only inside the AI gate')
-  assert.ok(mergeIdx > gateIdx, 'AI merge happens only inside the AI gate')
-  assert.ok(s.includes("aiMime = 'image/png'"), 'a rendered PDF is sent as an image')
-  assert.ok(s.includes('let assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate'),
-    'AI fills gaps but valid local fields are preserved')
-  assert.ok(s.includes('const isPdf ='), 'PDF vs image media selection is explicit')
+test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, gated AI that only merges in', () => {
+  const e = extractorSrc()
+  assert.ok(e.includes("import sharp from 'sharp'"), 'image decode/normalize runs through sharp')
+  assert.ok(e.includes("from 'tesseract.js'"), 'local OCR runs through tesseract.js')
+  assert.ok(e.includes('const MAX_PDF_PAGES = 10'), 'scanned PDF page count is bounded')
+  assert.ok(e.includes('extractPdfTextLayer(buffer)'), 'a digital PDF text layer is preferred before OCR')
+  assert.ok(e.includes('extractScannedPdf(') && e.includes('recognizeText(png)'), 'scanned PDFs are rasterized then OCR-read')
+  // The gated AI merge lives in the engine; non-Gemini image formats are normalized.
+  assert.ok(/allowAI = false/.test(e), 'AI is opt-in at the engine boundary (defaults false)')
+  assert.ok(e.includes('mergeCandidates(candidate, aiCandidate)'), 'AI fills gaps but valid local fields are preserved')
+  assert.ok(e.includes("mimeType: 'image/png'"), 'un-supported image formats normalize to PNG for the provider')
 })
 
 test('K6 hybrid config + docs: real deps externalized, exposure documented, no offline claim', () => {
   // Heavy/native server modules must stay out of the bundle graph.
   const cfg = nextConfigSrc()
   assert.match(cfg, /serverExternalPackages/)
-  assert.ok(cfg.includes('pdfjs-dist') && cfg.includes('@napi-rs/canvas'), 'both engines externalized')
+  assert.ok(cfg.includes('pdfjs-dist') && cfg.includes('@napi-rs/canvas'), 'the PDF engines are externalized')
+  assert.ok(cfg.includes('sharp') && cfg.includes('tesseract.js'), 'the image OCR engines are externalized too')
   // package.json actually declares them (not phantom transitives).
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.ok(pkg.dependencies['pdfjs-dist'], 'pdfjs-dist is a direct dependency')
   assert.ok(pkg.dependencies['@napi-rs/canvas'], '@napi-rs/canvas is a direct dependency')
+  assert.ok(pkg.dependencies['sharp'] && pkg.dependencies['tesseract.js'], 'sharp + tesseract.js are direct dependencies')
   // .env.example documents the hybrid engine + the exposure warning.
   const ex = envExampleSrc()
   assert.ok(ex.includes('LOCAL_OCR_ENGINE=pdfjs-text'), 'hybrid local default documented')
@@ -1579,9 +1584,11 @@ test('M4 image uses the vision path only when the operator enabled AI; disabled 
   }
   assert.match(visionSrc(), /image\\?\/\(jpeg\|png\|webp\)/, 'JPEG/PNG/WebP are valid vision transports')
   const s = extractSrc()
-  const gate = s.indexOf('if (aiEnabled && needsFallback)')
-  const provider = s.indexOf('extractInvoiceFields({')
-  assert.ok(gate > 0 && provider > gate, 'provider call lives ONLY inside the aiEnabled gate')
+  assert.ok(s.includes('allowAI,'), 'handler passes the gate result to the engine (never literal true)')
+  const e = extractorSrc()
+  const aiGate = e.indexOf('if (allowAI && needsAI)')
+  const provider = e.indexOf('extractInvoiceFields(')
+  assert.ok(aiGate > 0 && provider > aiGate, 'provider call lives ONLY inside the engine AI gate')
   assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"), 'AI off by default')
   assert.ok(pdfEngineSrc().includes("if (!PDF_MIME.test(mimeType ?? '')) return null"), 'pdfjs-text is not claimed to OCR images')
 })
@@ -1940,11 +1947,12 @@ test('P7 retryHintFor: only re-readable failures produce a re-ask, and it forbid
   assert.match(hint, /only if the printed document supports it/)
 })
 
-test('P8 extract handler wiring: second AI pass is bounded and adopts only a strictly better read', () => {
+test('P8 extract handler wiring: engine drives review/status and failures are classified for retry', () => {
   const s = extractSrc()
-  assert.ok(s.includes('retryHintFor(aiEval.reasons)'))
-  assert.ok(s.includes('AI_RETRY_MAX_FIRST_PASS_MS'), 'a slow first pass skips the re-read')
-  assert.ok(s.includes('eval2.review === \'approved\' || eval2.confidence > aiEval.confidence'), 'adopt only if better')
+  assert.ok(s.includes('evaluateLedger(result.candidate'), 'canonical row re-evaluated from the engine candidate')
+  assert.ok(s.includes("review === 'approved' ? 'completed' : 'needs_review'"), 'approved -> completed, else needs_review')
+  assert.ok(s.includes('e instanceof InvoiceExtractionError'), 'engine failures are translated')
+  assert.ok(s.includes('if (!e.retryable) throw new PermanentJobError'), 'a permanent fault never spins retries')
   assert.ok(s.includes('[Extract] no extractor available'), 'a silent empty review row now explains itself in the logs')
   const w = readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
   assert.ok(w.includes('minJobWindowMs()'), 'a job cannot start too close to the tick deadline')

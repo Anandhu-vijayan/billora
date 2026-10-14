@@ -24,16 +24,14 @@ import {
   decryptFile, deriveKeyVersion, isMediaDecryptFailure, resolveFileKeyConfig,
 } from '@/lib/encryption/files'
 import { encryptExtractedPayload } from '@/lib/encryption'
-import { extractInvoiceFields, VisionTransientError } from '@/lib/ocr/vision'
-import { tryLocalExtract } from '@/lib/ocr/local'
-import { renderFirstPageToPng } from '@/lib/ocr/pdf'
-import { evaluateLedger, mergeCandidates, retryHintFor, type LedgerCandidate } from '@/lib/ocr/ledger'
+import { evaluateLedger } from '@/lib/ocr/ledger'
 import { resolveInvoiceBatch } from '@/lib/invoices/batch'
-
-// A targeted AI re-read is only worth its latency when the first read was quick:
-// the worker tick is capped (route maxDuration) and a slow provider must never
-// push a job past its lease. Past this, keep the first read and route to review.
-const AI_RETRY_MAX_FIRST_PASS_MS = 15_000
+import {
+  extractInvoice as runExtraction,
+  InvoiceExtractionError,
+  type ExtractionSource,
+  type InvoiceExtractionResult,
+} from '@/lib/ocr/invoice-extractor'
 
 interface InvoiceRow {
   id: string
@@ -98,112 +96,52 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     throw e
   }
 
-  // Extraction is LOCAL-FIRST with a privacy-GATED AI fallback. The decrypted
-  // bytes live in memory only and are wiped in `finally`; plaintext is never
-  // persisted and nothing is ever fabricated.
+  // Extraction now runs through the dedicated OCR engine (lib/ocr/invoice-extractor):
+  // sharp + tesseract.js for images, a PDF text layer / bounded rendered-page OCR
+  // for PDFs, and an optional privacy-GATED Gemini vision fallback. The handler
+  // keeps ownership of decryption, encryption-at-rest, tenant-scoped writes,
+  // review routing, batch scheduling and the in-memory wipe. Nothing is fabricated.
   const env = getEnv()
   try {
-    // 1) Try a configured/registered LOCAL engine (PDF text / OCR). When there
-    //    is no local engine — or the input is an image/scan it cannot process —
-    //    tryLocalExtract returns a miss (never a made-up candidate).
-    const local = await tryLocalExtract({ buffer: plain, mimeType: invoice.content_type })
-    let candidate: LedgerCandidate | null = local.ok ? local.candidate : null
-    let confidenceSource: 'local' | 'ai' | 'human' = local.ok ? 'local' : 'human'
+    // AI stays strictly behind the operator gate and is NEVER default-on: the
+    // engine only reaches Gemini when allowAI is true AND a paid tier is set.
+    const allowAI = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
+    if (allowAI && env.EXTRACTION_PROVIDER !== 'gemini') {
+      throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
+    }
 
-    // 2) Independently evaluate whatever local produced. evaluateLedger measures
-    //    confidence from objective checks — it never trusts a source's own number.
-    let evaluation = candidate
-      ? evaluateLedger(candidate, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
-      : null
+    // The engine returns a raw candidate + provenance. A permanent failure (bad
+    // media, unsupported type) never spins retries; a transient OCR/vision fault does.
+    const result: InvoiceExtractionResult = await runExtraction({
+      buffer: plain,
+      mimeType: invoice.content_type,
+      minConfidence: env.EXTRACTION_MIN_CONFIDENCE,
+      allowAI,
+      apiKey: allowAI ? (env.GEMINI_API_KEY || '') : undefined,
+      model: env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL,
+    }).catch((e: unknown): never => {
+      if (e instanceof InvoiceExtractionError) {
+        if (!e.retryable) throw new PermanentJobError(`EXTRACTION_FAILED: ${e.message}`)
+        throw e // transient OCR / vision fault -> the worker requeues
+      }
+      throw e
+    })
 
-    // 3) AI fallback ONLY when the operator explicitly enabled it AND confirmed
-    //    a paid tier. When AI is disabled we NEVER silently send decrypted
-    //    invoice content to a provider; unresolved input stays for human review.
-    const aiEnabled = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
-    const needsFallback = evaluation === null || evaluation.review === 'needs_review'
-    let aiPasses = 0
-    // Say WHY nothing could read the file. A silent empty needs_review row was
-    // previously indistinguishable from a model failure in the logs.
-    if (needsFallback && !aiEnabled) {
-      logger.warn('[Extract] no extractor available: local engine missed and AI fallback is off', {
+    // Re-evaluate the returned candidate independently so the handler owns the
+    // canonical row and the date-resolved batching gate (the engine never returns
+    // a canonicalised ledger row, only the fields it located).
+    const evaluation = evaluateLedger(result.candidate, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
+    const confidenceSource: ExtractionSource = result.source
+
+    // Say WHY nothing could read the file: a silent empty review row was previously
+    // indistinguishable from a model failure in the logs.
+    if (confidenceSource === 'human' && evaluation.review === 'needs_review') {
+      logger.warn('[Extract] no extractor available: local OCR missed and AI is gated off', {
         invoice: invoiceId.slice(0, 8),
         mime: invoice.content_type,
-        localMiss: local.ok ? null : local.reason,
         aiGate: env.EXTRACTION_ALLOW_AI !== true ? 'EXTRACTION_ALLOW_AI is not true' : 'EXTRACTION_AI_TIER is not paid',
+        reasons: evaluation.reasons.slice(0, 4),
       })
-    }
-    if (aiEnabled && needsFallback) {
-      if (env.EXTRACTION_PROVIDER !== 'gemini') {
-        throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
-      }
-      const model = env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL
-      // HYBRID media selection: a PDF reaches Gemini as a REAL rendered FIRST
-      // PAGE (never every page), so a scanned/ambiguous document is seen as a
-      // genuine rasterized image. Bare images go as-is. If no canvas is
-      // available we fall back to the original PDF bytes (Gemini accepts PDFs)
-      // rather than silently skipping — but we never fabricate a result.
-      const isPdf = /^application\/pdf$/i.test(invoice.content_type ?? '')
-      let aiBuffer: Buffer = plain
-      let aiMime = invoice.content_type ?? 'application/pdf'
-      if (isPdf) {
-        const png = await renderFirstPageToPng(plain)
-        if (png) { aiBuffer = png; aiMime = 'image/png' }
-      }
-      const callVision = async (hint: string | null): Promise<LedgerCandidate> => {
-        try {
-          return await extractInvoiceFields({
-            buffer: aiBuffer, mimeType: aiMime, apiKey: env.GEMINI_API_KEY || '', model, hint,
-          })
-        } catch (e) {
-          if (e instanceof VisionTransientError) throw e // -> retryable backoff
-          throw new PermanentJobError(`VISION_FAILED: ${e instanceof Error ? e.message : String(e)}`)
-        }
-      }
-      const aiStartedAt = Date.now()
-      const aiCandidate = await callVision(null)
-      aiPasses = 1
-      // AI only ASSISTS the local parser: every locally-valid field is kept and
-      // AI merely fills what local missed. The merged row is then re-evaluated
-      // independently, so no source is ever blindly trusted.
-      let assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate
-      let aiEval = evaluateLedger(assisted, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
-
-      // Targeted second read: when validation failed for a reason a re-read can
-      // fix (checksum, arithmetic, swapped parties, implausible date), ask once
-      // more with the exact failed checks. Best-effort: a failure or a slow first
-      // pass keeps the first read, and the result is adopted only if it is
-      // strictly better — never trusted blindly.
-      const hint = aiEval.review === 'needs_review' ? retryHintFor(aiEval.reasons) : null
-      if (hint && Date.now() - aiStartedAt < AI_RETRY_MAX_FIRST_PASS_MS) {
-        try {
-          const second = await callVision(hint)
-          aiPasses = 2
-          const assisted2 = candidate ? mergeCandidates(candidate, second) : second
-          const eval2 = evaluateLedger(assisted2, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
-          if (eval2.review === 'approved' || eval2.confidence > aiEval.confidence) {
-            assisted = assisted2
-            aiEval = eval2
-          }
-        } catch (e) {
-          logger.warn('[Extract] AI re-read failed; keeping the first read', {
-            invoice: invoiceId.slice(0, 8), error: e instanceof Error ? e.name : 'UNKNOWN',
-          })
-        }
-      }
-      // Adopt only when the merge strictly improves the outcome; a valid local
-      // approval is never downgraded or overruled by the AI result.
-      if (!evaluation || aiEval.review === 'approved' || aiEval.confidence > evaluation.confidence) {
-        candidate = assisted
-        evaluation = aiEval
-        confidenceSource = 'ai'
-      }
-    }
-
-    // 4) No engine and AI disabled -> a review-only placeholder (empty values,
-    //    never invented) so the invoice deterministically lands in needs_review.
-    if (!evaluation) {
-      evaluation = evaluateLedger({}, { minConfidence: Number.NEGATIVE_INFINITY })
-      confidenceSource = 'human'
     }
 
     const keyVersion = deriveKeyVersion(masterKeyHex)
@@ -244,7 +182,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     logger.info('[Extract] done', {
       invoice: invoiceId.slice(0, 8), review: evaluation.review,
       source: confidenceSource, reasons: evaluation.reasons.slice(0, 4),
-      mime: invoice.content_type, aiPasses,
+      mime: invoice.content_type, pages: result.pagesProcessed,
     })
   } finally {
     plain.fill(0) // wipe plaintext bytes on every exit path (approve, review, throw)

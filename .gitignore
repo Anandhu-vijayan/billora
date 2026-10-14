@@ -46,6 +46,11 @@ next-env.d.ts
 /supabase/.temp
 supabase/.env
 
+# tesseract.js runtime-downloaded language data + cache (never commit)
+*.traineddata
+/eng.traineddata
+/cache/
+
 # editor / OS
 .vscode/*
 !.vscode/extensions.json
