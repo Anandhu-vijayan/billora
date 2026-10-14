@@ -713,7 +713,7 @@ test('G4f Stage-2 session columns are additive; inbound idempotency is untouched
 
 const CLEAN_ROW = {
   invoice_date: '2026-09-05', invoice_number: 'INV-1', vendor_name: 'Acme Traders',
-  supplier_gstin: '27ABCDE1234F1Z5', taxable_value: 1000, cgst_amount: 90,
+  supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 90,
   sgst_amount: 90, igst_amount: 0, total_amount: 1180,
   confidence: {
     invoice_date: 0.95, invoice_number: 0.95, vendor_name: 0.9, supplier_gstin: 0.92,
@@ -1378,7 +1378,7 @@ test('J8 confidence_source stays aligned across statuses + migration + handler',
 const INVOICE_TEXT = [
   'TAX INVOICE',
   'ACME TRADERS PVT LTD',
-  'GSTIN: 27ABCDE1234F1Z5',
+  'GSTIN: 27AAPFU0939F1ZV',
   'Invoice No: INV-2026-0042',
   'Invoice Date: 05/09/2026',
   'Taxable Value: 1,000.00',
@@ -1392,7 +1392,7 @@ test('K1 text-parser: deterministic parse of a real PDF text layer (real module,
   const cand = textParser.parseInvoiceText(INVOICE_TEXT)
   assert.equal(cand.invoice_number, 'INV-2026-0042')
   assert.equal(cand.invoice_date, '05/09/2026')
-  assert.equal(cand.supplier_gstin, '27ABCDE1234F1Z5')
+  assert.equal(cand.supplier_gstin, '27AAPFU0939F1ZV')
   assert.match(cand.vendor_name, /ACME TRADERS/)
   assert.equal(cand.taxable_value, 1000)
   assert.equal(cand.cgst_amount, 90)
@@ -1411,7 +1411,7 @@ test('K1 text-parser: deterministic parse of a real PDF text layer (real module,
   assert.equal(ledger.evaluateLedger(none, { minConfidence: 0.8 }).review, 'needs_review')
   // A partial read (no total) can NEVER auto-approve.
   const partial = textParser.parseInvoiceText(
-    'Invoice No: X-1\nDate: 05/09/2026\nGSTIN: 27ABCDE1234F1Z5\nAcme Traders Pvt Ltd\nTaxable Value: 1000')
+    'Invoice No: X-1\nDate: 05/09/2026\nGSTIN: 27AAPFU0939F1ZV\nAcme Traders Pvt Ltd\nTaxable Value: 1000')
   assert.equal(ledger.evaluateLedger(partial, { minConfidence: 0.8 }).review, 'needs_review')
   assert.equal(textParser.hasMeaningfulText(INVOICE_TEXT), true)
   assert.equal(textParser.hasMeaningfulText('   '), false)
@@ -1420,12 +1420,12 @@ test('K1 text-parser: deterministic parse of a real PDF text layer (real module,
 test('K2 mergeCandidates: AI assists the local parse but never overrules valid local data', () => {
   const localRow = { invoice_number: 'INV-1', supplier_gstin: 'NOTAGSTIN', total_amount: 1000 }
   const aiRow = {
-    invoice_number: 'WRONG', supplier_gstin: '27ABCDE1234F1Z5', total_amount: 999,
+    invoice_number: 'WRONG', supplier_gstin: '27AAPFU0939F1ZV', total_amount: 999,
     vendor_name: 'Acme Traders Pvt Ltd', invoice_date: '05/09/2026',
   }
   const merged = ledger.mergeCandidates(localRow, aiRow)
   assert.equal(merged.invoice_number, 'INV-1', 'valid local text field kept over the AI value')
-  assert.equal(merged.supplier_gstin, '27ABCDE1234F1Z5', 'an INVALID local GSTIN is filled from AI')
+  assert.equal(merged.supplier_gstin, '27AAPFU0939F1ZV', 'an INVALID local GSTIN is filled from AI')
   assert.equal(merged.total_amount, 1000, 'valid local amount kept over AI')
   assert.equal(merged.vendor_name, 'Acme Traders Pvt Ltd', 'AI fills a field local missed')
   assert.equal(merged.invoice_date, '05/09/2026', 'AI fills the missing date')
@@ -1466,7 +1466,7 @@ test('K5 extract handler: PDF reaches the gated AI as a rendered first page; AI 
   assert.ok(gateIdx > 0 && renderIdx > gateIdx, 'first-page rendering happens only inside the AI gate')
   assert.ok(mergeIdx > gateIdx, 'AI merge happens only inside the AI gate')
   assert.ok(s.includes("aiMime = 'image/png'"), 'a rendered PDF is sent as an image')
-  assert.ok(s.includes('const assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate'),
+  assert.ok(s.includes('let assisted = candidate ? mergeCandidates(candidate, aiCandidate) : aiCandidate'),
     'AI fills gaps but valid local fields are preserved')
   assert.ok(s.includes('const isPdf ='), 'PDF vs image media selection is explicit')
 })
@@ -1555,7 +1555,7 @@ test('M2 needs_review invoice with a reliable date is batched WITHOUT being appr
 
 test('M3 missing/ambiguous invoice date never falls back to the upload month', () => {
   const noDate = ledger.evaluateLedger({
-    invoice_number: 'X-1', vendor_name: 'Acme', supplier_gstin: '27ABCDE1234F1Z5',
+    invoice_number: 'X-1', vendor_name: 'Acme', supplier_gstin: '27AAPFU0939F1ZV',
     taxable_value: 100, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 100,
   }, { minConfidence: 0.8 })
   assert.equal(noDate.invoiceDateResolved, false)
@@ -1821,3 +1821,149 @@ test('N8 WhatsApp Review is truthful: delivers a ready workbook now, or states w
   assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Review reads current verified state')
 })
 
+
+// ---- Production extraction hardening: GSTIN, validators, parser, re-read ----
+
+const gstinMod = await importTs('lib/ocr/gstin.ts')
+const mkGstin = (body14) => {
+  const CH = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  let sum = 0
+  for (let i = 0; i < 14; i += 1) {
+    const p = CH.indexOf(body14[i]) * (i % 2 === 0 ? 1 : 2)
+    sum += Math.floor(p / 36) + (p % 36)
+  }
+  return body14 + CH[(36 - (sum % 36)) % 36]
+}
+const SUP_GSTIN = '27AAPFU0939F1ZV'        // Maharashtra supplier (checksum-valid)
+const BUY_GSTIN_KA = mkGstin('29AABCT1332L1Z') // Karnataka buyer
+const BUY_GSTIN_MH = mkGstin('27AABCT1332L1Z') // Maharashtra buyer
+
+test('P1 gstin checksum: real GSTINs pass; a one-character OCR error fails', () => {
+  assert.equal(gstinMod.gstinChecksumOk('27AAPFU0939F1ZV'), true)
+  assert.equal(gstinMod.gstinChecksumOk('32AAACT2727Q1Z5'), true)
+  assert.equal(gstinMod.gstinChecksumOk('27AAPFU0939F1ZW'), false, 'wrong check digit')
+  assert.equal(gstinMod.gstinChecksumOk('27AAPFU0939F1ZV'.replace('0939', 'O939')), false, 'O/0 confusion breaks shape+checksum')
+  assert.equal(gstinMod.gstinChecksumOk('NOTAGSTIN'), false)
+  assert.equal(gstinMod.gstinFullyValid('99ZZZZZ9999Z9Z9'), false)
+})
+
+test('P2 pickSupplierGstin: seller vs buyer by label, by checksum, and by known recipient', () => {
+  const sellerFirst = `Seller GSTIN: ${SUP_GSTIN}\nBill To: Beta\nBuyer GSTIN: ${BUY_GSTIN_KA}`
+  assert.equal(gstinMod.pickSupplierGstin(sellerFirst).value, SUP_GSTIN)
+  assert.equal(gstinMod.pickSupplierGstin(sellerFirst).confidence, 0.9)
+  assert.deepEqual(gstinMod.pickSupplierGstin(sellerFirst).others, [BUY_GSTIN_KA])
+  // Buyer printed FIRST: "first match" would be wrong; labels must win.
+  const buyerFirst = `Bill To\nBeta GSTIN: ${BUY_GSTIN_KA}\nSold By: Acme\nGSTIN: ${SUP_GSTIN}`
+  assert.equal(gstinMod.pickSupplierGstin(buyerFirst).value, SUP_GSTIN)
+  // No labels at all, buyer known: the buyer is excluded outright.
+  const unlabeled = `${BUY_GSTIN_KA}\n${SUP_GSTIN}`
+  assert.equal(gstinMod.pickSupplierGstin(unlabeled, { recipientGstin: BUY_GSTIN_KA }).value, SUP_GSTIN)
+  // A checksum-failing token loses to a valid one.
+  const typo = `GSTIN ${SUP_GSTIN.slice(0, 14)}Q\nGSTIN ${BUY_GSTIN_KA}`
+  assert.equal(gstinMod.pickSupplierGstin(typo).value, BUY_GSTIN_KA)
+  assert.equal(gstinMod.pickSupplierGstin('no gstin here'), null)
+})
+
+test('P3 ledger: checksum-failed GSTIN, total-zero and bad tax structure all route to review', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  const base = { ...CLEAN_ROW }
+  const ok = ledger.evaluateLedger(base, { minConfidence: 0.8, now })
+  assert.equal(ok.review, 'approved')
+  const badSum = ledger.evaluateLedger(hiConf({ supplier_gstin: '27AAPFU0939F1ZW' }), { minConfidence: 0.8, now })
+  assert.ok(badSum.reasons.includes('gstin-checksum-failed'))
+  assert.equal(badSum.review, 'needs_review')
+  const zero = ledger.evaluateLedger(hiConf({ taxable_value: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0 }), { minConfidence: 0.8, now })
+  assert.ok(zero.reasons.includes('total-zero'), 'an extractor returning all zeros is a miss, not an invoice')
+  const both = ledger.evaluateLedger(hiConf({ igst_amount: 180, total_amount: 1360 }), { minConfidence: 0.8, now })
+  assert.ok(both.reasons.includes('igst-with-cgst-sgst'))
+  const uneven = ledger.evaluateLedger(hiConf({ cgst_amount: 100, sgst_amount: 80, total_amount: 1180 }), { minConfidence: 0.8, now })
+  assert.ok(uneven.reasons.includes('cgst-sgst-unequal'))
+  // IGST-only interstate invoice is fine.
+  const igstOnly = ledger.evaluateLedger(hiConf({ cgst_amount: 0, sgst_amount: 0, igst_amount: 180 }), { minConfidence: 0.8, now })
+  assert.equal(igstOnly.review, 'approved')
+})
+
+test('P4 ledger: tax head must agree with supplier/recipient states when both GSTINs are read', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  const interstateIgst = ledger.evaluateLedger(
+    hiConf({ cgst_amount: 0, sgst_amount: 0, igst_amount: 180, recipient_gstin: BUY_GSTIN_KA }), { minConfidence: 0.8, now })
+  assert.equal(interstateIgst.review, 'approved')
+  const igstOnIntra = ledger.evaluateLedger(
+    hiConf({ cgst_amount: 0, sgst_amount: 0, igst_amount: 180, recipient_gstin: BUY_GSTIN_MH }), { minConfidence: 0.8, now })
+  assert.ok(igstOnIntra.reasons.includes('igst-on-intrastate'))
+  const cgstOnInter = ledger.evaluateLedger(hiConf({ recipient_gstin: BUY_GSTIN_KA }), { minConfidence: 0.8, now })
+  assert.ok(cgstOnInter.reasons.includes('cgst-sgst-on-interstate'))
+  const same = ledger.evaluateLedger(hiConf({ recipient_gstin: SUP_GSTIN }), { minConfidence: 0.8, now })
+  assert.ok(same.reasons.includes('supplier-equals-recipient'))
+})
+
+test('P5 ledger: future / pre-GST dates are flagged and never batched', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  const future = ledger.evaluateLedger(hiConf({ invoice_date: '2027-01-05' }), { minConfidence: 0.8, now })
+  assert.ok(future.reasons.includes('invoice-date-future'))
+  assert.equal(future.invoiceDateResolved, false, 'an implausible date must not select a batch month')
+  assert.equal(future.row.invoice_date, '2027-01-05', 'value preserved for the reviewer, not discarded')
+  const old = ledger.evaluateLedger(hiConf({ invoice_date: '2016-03-01' }), { minConfidence: 0.8, now })
+  assert.ok(old.reasons.includes('invoice-date-before-gst'))
+  const tomorrow = ledger.evaluateLedger(hiConf({ invoice_date: '2026-10-15' }), { minConfidence: 0.8, now })
+  assert.equal(tomorrow.invoiceDateResolved, true, 'one day of clock skew is tolerated')
+})
+
+test('P6 text-parser: buyer GSTIN, due date and "Total Qty" can no longer corrupt the row', () => {
+  const text = [
+    'ACME TRADERS PVT LTD', `Seller GSTIN: ${SUP_GSTIN}`, 'Tax Invoice',
+    'Bill To: Beta Corp', `Buyer GSTIN: ${BUY_GSTIN_KA}`,
+    'Invoice No: INV-77', 'Due Date: 30/10/2026', 'Invoice Date: 05/10/2026',
+    'Total Qty: 12', 'Taxable Value: 1000', 'IGST: 180', 'Grand Total: 1,180.00',
+  ].join('\n')
+  const c = textParser.parseInvoiceText(text)
+  assert.equal(c.supplier_gstin, SUP_GSTIN)
+  assert.equal(c.recipient_gstin, BUY_GSTIN_KA)
+  assert.equal(c.invoice_date, '05/10/2026', 'invoice date, not the due date')
+  assert.equal(c.total_amount, 1180, 'grand total, not the quantity')
+  assert.equal(ledger.evaluateLedger(c, { minConfidence: 0.8, now: new Date('2026-10-14T00:00:00Z') }).review, 'approved')
+  // A date that only appears on a due/order line is never adopted.
+  assert.ok(!textParser.parseInvoiceText('Invoice No: Z-9\nDue Date: 30/10/2026').invoice_date)
+  // A bare "Total" is a weak hit: it cannot auto-approve by itself.
+  const weak = textParser.parseInvoiceText(`Invoice No: A-1\nSold By: Acme Traders Pvt Ltd\nGSTIN: ${SUP_GSTIN}\nDate: 05/10/2026\nTaxable Value: 1000\nCGST: 90\nSGST: 90\nTotal 1180.00`)
+  assert.equal(weak.confidence.total_amount, 0.6)
+  assert.equal(ledger.evaluateLedger(weak, { minConfidence: 0.8, now: new Date('2026-10-14T00:00:00Z') }).review, 'needs_review')
+  assert.ok(!textParser.parseInvoiceText('Invoice No: Z-9\nTotal Qty 12').total_amount, 'quantity totals are skipped')
+})
+
+test('P7 retryHintFor: only re-readable failures produce a re-ask, and it forbids guessing', () => {
+  assert.equal(ledger.retryHintFor(['vendor-name-missing', 'invoice-number-missing']), null,
+    'a field that is simply absent is not fixed by asking again')
+  const hint = ledger.retryHintFor(['gstin-checksum-failed', 'total-mismatch:1180.00!=1990.00'])
+  assert.match(hint, /valid GSTIN/)
+  assert.match(hint, /did not equal total_amount/)
+  assert.match(hint, /only if the printed document supports it/)
+})
+
+test('P8 extract handler wiring: second AI pass is bounded and adopts only a strictly better read', () => {
+  const s = extractSrc()
+  assert.ok(s.includes('retryHintFor(aiEval.reasons)'))
+  assert.ok(s.includes('AI_RETRY_MAX_FIRST_PASS_MS'), 'a slow first pass skips the re-read')
+  assert.ok(s.includes('eval2.review === \'approved\' || eval2.confidence > aiEval.confidence'), 'adopt only if better')
+  assert.ok(s.includes('[Extract] no extractor available'), 'a silent empty review row now explains itself in the logs')
+  const w = readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
+  assert.ok(w.includes('minJobWindowMs()'), 'a job cannot start too close to the tick deadline')
+  const v = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
+  assert.ok(v.includes('recipient_gstin') && v.includes('temperature: 0'))
+})
+
+test('P9 ledger: an unprinted tax head is 0 only when the arithmetic reconciles; never when it does not', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  const noCgstSgst = { ...CLEAN_ROW, cgst_amount: undefined, sgst_amount: undefined, igst_amount: 180, total_amount: 1180 }
+  const a = ledger.evaluateLedger(noCgstSgst, { minConfidence: 0.8, now })
+  assert.equal(a.review, 'approved', 'interstate invoice with no CGST/SGST lines is valid')
+  assert.equal(a.row.cgst_amount, 0)
+  // Parser missed the CGST/SGST lines of an intrastate invoice: arithmetic exposes it.
+  const missed = { ...CLEAN_ROW, cgst_amount: undefined, sgst_amount: undefined, igst_amount: undefined, total_amount: 1180 }
+  const b = ledger.evaluateLedger(missed, { minConfidence: 0.8, now })
+  assert.equal(b.review, 'needs_review')
+  assert.ok(b.reasons.some((r) => r.startsWith('total-mismatch')))
+  // Missing total is never defaulted.
+  const noTotal = { ...CLEAN_ROW, total_amount: undefined }
+  assert.ok(ledger.evaluateLedger(noTotal, { minConfidence: 0.8, now }).reasons.includes('non-finite-amount'))
+})

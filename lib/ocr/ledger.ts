@@ -13,6 +13,8 @@
 //     date-resolved row is `approved`.
 //   * The shape matches lib/excel/generator.ts `IndianLedgerRowInput` exactly
 //     (structural typing keeps the two in sync without a runtime import).
+import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
+
 export interface LedgerRow {
   invoice_date: string;
   invoice_number: string;
@@ -31,6 +33,12 @@ export interface LedgerCandidate {
   invoice_number?: string | null;
   vendor_name?: string | null;
   supplier_gstin?: string | null;
+  /**
+   * The BUYER's GSTIN when the source could read it. Never written to the row;
+   * used only to cross-check the supplier (different party) and the tax head
+   * (IGST vs CGST+SGST follows whether the two state codes differ).
+   */
+  recipient_gstin?: string | null;
   taxable_value?: number | string | null;
   cgst_amount?: number | string | null;
   sgst_amount?: number | string | null;
@@ -64,6 +72,9 @@ const REQUIRED_FIELDS = [
   'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
   'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
 ] as const;
+
+// First day of GST (1 July 2017): no valid GST invoice predates it.
+const GST_EPOCH = '2017-07-01';
 
 const money = (n: number): number => Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
 
@@ -142,6 +153,8 @@ function computeMeasured(parts: {
   amountsFinite: boolean;
   amountsNonNegative: boolean;
   arithmeticConsistent: boolean;
+  /** Tax-head / total structure is coherent (see evaluateLedger). */
+  structureConsistent: boolean;
 }): number {
   let m = 1;
   if (!parts.dateResolved) m -= 0.5;
@@ -151,6 +164,7 @@ function computeMeasured(parts: {
   if (!parts.amountsFinite) m -= 0.5;
   if (!parts.amountsNonNegative) m -= 0.4;
   if (!parts.arithmeticConsistent) m -= 0.4;
+  if (!parts.structureConsistent) m -= 0.4;
   return Math.max(0, Math.min(1, m));
 }
 
@@ -170,8 +184,9 @@ export function mergeCandidates(
   const merged: LedgerCandidate = { ...(fallback ?? {}) }
   const confidence: Record<string, number> = { ...(fallback?.confidence ?? {}) }
   const isTextValid = (raw: string | null | undefined): boolean => (raw ?? '').trim() !== ''
-  const isGstinValid = (raw: string | null | undefined): boolean =>
-    GSTIN_RE.test((raw ?? '').trim().toUpperCase())
+  // Full validity (shape + state code + checksum): a local GSTIN that fails the
+  // checksum is an OCR/parse error and must be replaceable by the AI's read.
+  const isGstinValid = (raw: string | null | undefined): boolean => gstinFullyValid(raw ?? '')
   const isDateValid = (raw: string | null | undefined): boolean => parseInvoiceDate(raw) !== null
   const isAmountValid = (raw: number | string | null | undefined): boolean => {
     const n = toNumber(raw)
@@ -202,6 +217,9 @@ export function mergeCandidates(
       if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
     }
   }
+  if (!(merged.recipient_gstin ?? '').trim() && (primary.recipient_gstin ?? '').trim()) {
+    merged.recipient_gstin = primary.recipient_gstin
+  }
   merged.confidence = confidence
   return merged
 }
@@ -213,12 +231,22 @@ export function mergeCandidates(
  */
 export function evaluateLedger(
   candidate: LedgerCandidate,
-  opts: { minConfidence: number },
+  opts: { minConfidence: number; /** Injectable clock (tests). */ now?: Date },
 ): LedgerEvaluation {
   const reasons: string[] = [];
 
-  const iso = parseInvoiceDate(candidate.invoice_date);
-  if (!iso) reasons.push('invoice-date-unresolved');
+  const parsedDate = parseInvoiceDate(candidate.invoice_date);
+  if (!parsedDate) reasons.push('invoice-date-unresolved');
+  // A date that parses but cannot be a real invoice date (in the future, or
+  // before GST existed) is almost always a misread digit. It is flagged and is
+  // NOT treated as resolved, so the invoice is never batched into a wrong month.
+  let iso: string | null = parsedDate;
+  if (parsedDate) {
+    const now = opts.now ?? new Date();
+    const latestOk = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    if (parsedDate > latestOk) { reasons.push('invoice-date-future'); iso = null; }
+    else if (parsedDate < GST_EPOCH) { reasons.push('invoice-date-before-gst'); iso = null; }
+  }
 
   const invoiceNumber = (candidate.invoice_number ?? '').trim();
   if (!invoiceNumber) reasons.push('invoice-number-missing');
@@ -227,18 +255,33 @@ export function evaluateLedger(
   if (!vendorName) reasons.push('vendor-name-missing');
 
   const gstin = (candidate.supplier_gstin ?? '').trim().toUpperCase();
+  let gstinOk = false;
   if (!gstin) reasons.push('gstin-missing');
   else if (!GSTIN_RE.test(gstin)) reasons.push('gstin-invalid');
+  else if (!gstinStateCodeValid(gstin)) reasons.push('gstin-state-invalid');
+  else if (!gstinChecksumOk(gstin)) reasons.push('gstin-checksum-failed');
+  else gstinOk = true;
 
   const taxable = toNumber(candidate.taxable_value);
-  const cgst = toNumber(candidate.cgst_amount);
-  const sgst = toNumber(candidate.sgst_amount);
-  const igst = toNumber(candidate.igst_amount);
   const total = toNumber(candidate.total_amount);
+  // A tax head the document simply does not print (an interstate invoice has no
+  // CGST/SGST lines; an intrastate one has no IGST line) is ABSENT, not
+  // unreadable. It is read as 0 only while taxable and total are both present,
+  // and the arithmetic check below must then still reconcile — so a head that
+  // the parser merely failed to find shows up as a total-mismatch, never as a
+  // silently wrong approved row. A missing taxable/total is never defaulted.
+  const isAbsent = (v: number | string | null | undefined): boolean =>
+    v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+  const taxHead = (v: number | string | null | undefined): number =>
+    isAbsent(v) && Number.isFinite(taxable) && Number.isFinite(total) ? 0 : toNumber(v);
+  const cgst = taxHead(candidate.cgst_amount);
+  const sgst = taxHead(candidate.sgst_amount);
+  const igst = taxHead(candidate.igst_amount);
   const amounts = [taxable, cgst, sgst, igst, total];
   const amountsFinite = amounts.every((n) => Number.isFinite(n));
   const amountsNonNegative = amounts.every((n) => Number.isFinite(n) && n >= 0);
   let arithmeticConsistent = true;
+  let structureConsistent = true;
   if (!amountsFinite) reasons.push('non-finite-amount');
   if (amounts.some((n) => Number.isFinite(n) && n < 0)) reasons.push('negative-amount');
   if (amountsFinite) {
@@ -247,6 +290,33 @@ export function evaluateLedger(
       arithmeticConsistent = false;
       reasons.push(`total-mismatch:${taxSum.toFixed(2)}!=${total.toFixed(2)}`);
     }
+    // Structure checks. Extractors return 0 for "not found", so an all-zero
+    // total is a miss, not an invoice; and the tax heads must be coherent.
+    if (total === 0) { structureConsistent = false; reasons.push('total-zero'); }
+    if (igst > 0 && (cgst > 0 || sgst > 0)) {
+      structureConsistent = false;
+      reasons.push('igst-with-cgst-sgst');
+    } else if (Math.abs(cgst - sgst) > 0.05) {
+      // Intra-state CGST and SGST are always charged at equal rates.
+      structureConsistent = false;
+      reasons.push('cgst-sgst-unequal');
+    }
+    // Tax head vs state: same supplier/recipient state => CGST+SGST; different
+    // => IGST. Checked only when both GSTINs were actually read.
+    const recipient = (candidate.recipient_gstin ?? '').trim().toUpperCase();
+    if (gstinOk && GSTIN_RE.test(recipient)) {
+      const sameState = gstin.slice(0, 2) === recipient.slice(0, 2);
+      if (gstin === recipient) {
+        structureConsistent = false;
+        reasons.push('supplier-equals-recipient');
+      } else if (sameState && igst > 0) {
+        structureConsistent = false;
+        reasons.push('igst-on-intrastate');
+      } else if (!sameState && igst === 0 && (cgst > 0 || sgst > 0)) {
+        structureConsistent = false;
+        reasons.push('cgst-sgst-on-interstate');
+      }
+    }
   }
 
   // Measured confidence is our OWN signal; the model's self-report can only
@@ -254,19 +324,20 @@ export function evaluateLedger(
   // because the deterministic shape looked clean).
   const measuredConfidence = computeMeasured({
     dateResolved: iso !== null,
-    gstinValid: gstin !== '' && GSTIN_RE.test(gstin),
+    gstinValid: gstinOk,
     invoiceNumberPresent: invoiceNumber !== '',
     vendorNamePresent: vendorName !== '',
     amountsFinite,
     amountsNonNegative,
     arithmeticConsistent,
+    structureConsistent,
   });
   const self = selfConfidence(candidate);
   const confidence = self === null ? measuredConfidence : Math.min(measuredConfidence, self);
   if (confidence < opts.minConfidence) reasons.push(`low-confidence:${confidence.toFixed(2)}`);
 
   const row: LedgerRow = {
-    invoice_date: iso ?? (candidate.invoice_date ?? '').trim(),
+    invoice_date: parsedDate ?? (candidate.invoice_date ?? '').trim(),
     invoice_number: invoiceNumber,
     vendor_name: vendorName,
     supplier_gstin: gstin,
@@ -285,4 +356,34 @@ export function evaluateLedger(
     measuredConfidence,
     invoiceDateResolved: iso !== null,
   };
+}
+
+/**
+ * Turn the failed checks of a first read into one precise instruction for a
+ * SECOND, targeted AI read. Only reasons a re-read can plausibly fix are
+ * included (a misread digit, a swapped party, a wrong total); a field that is
+ * simply not on the page is never "fixed" by asking again. Returns null when
+ * nothing is worth re-asking.
+ */
+export function retryHintFor(reasons: readonly string[]): string | null {
+  const lines: string[] = [];
+  for (const r of reasons) {
+    if (r === 'gstin-checksum-failed' || r === 'gstin-invalid' || r === 'gstin-state-invalid') {
+      lines.push('The supplier_gstin you returned is not a valid GSTIN; re-read it character by character (watch O/0, I/1, S/5, B/8) and make sure it is the SELLER\'s, not the buyer\'s.');
+    } else if (r.startsWith('total-mismatch')) {
+      lines.push('taxable_value + cgst_amount + sgst_amount + igst_amount did not equal total_amount (within 1 rupee); re-read each amount from the tax summary and the grand total.');
+    } else if (r === 'total-zero') {
+      lines.push('total_amount came back as 0; locate the grand total / amount payable.');
+    } else if (r === 'igst-with-cgst-sgst' || r === 'cgst-sgst-unequal') {
+      lines.push('The tax heads are inconsistent (an invoice charges either IGST or equal CGST+SGST); re-read the tax amounts.');
+    } else if (r === 'invoice-date-future' || r === 'invoice-date-before-gst' || r === 'invoice-date-unresolved') {
+      lines.push('invoice_date was missing or implausible; re-read the INVOICE date (not the due, order or delivery date).');
+    } else if (r === 'supplier-equals-recipient') {
+      lines.push('supplier_gstin and recipient_gstin were identical; the supplier is the seller who issued the invoice.');
+    }
+  }
+  const unique = [...new Set(lines)];
+  return unique.length === 0
+    ? null
+    : `A previous read of this document failed validation. ${unique.join(' ')} Correct a value only if the printed document supports it; otherwise leave it empty with low confidence.`;
 }

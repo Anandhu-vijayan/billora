@@ -1,23 +1,41 @@
 // scripts/_ts-import.mjs — load a dependency-light TypeScript module from a
 // plain .mjs runner (kept explicit so the suite also runs on Node 20, which
-// has no native type-stripping). Transpiles the
-// source with the installed `typescript` package and dynamic-imports it.
+// has no native type-stripping). Transpiles the source with the installed
+// `typescript` package and dynamic-imports it.
 //
-// Only for modules whose imports are Node builtins or relative paths WITHOUT the
-// `@/` alias (lib/encryption/files.ts qualifies). Used by reencrypt-legacy.mjs
-// and the Stage-1 crypto tests so they exercise the REAL encryption code, not a
-// copy — a divergent reimplementation would silently break Stage-3 decryption.
+// Supports RELATIVE imports between dependency-free modules (e.g. ledger.ts ->
+// ./gstin): every relative `.ts` dependency is transpiled too, into a cache dir
+// that mirrors the source layout, and the import specifiers are rewritten to
+// the emitted `.mjs` files. The `@/` alias is still NOT supported — modules that
+// need it (anything touching Supabase/env/logger) stay out of this loader.
+// Used by reencrypt-legacy.mjs and the tests so they exercise the REAL code,
+// not a copy — a divergent reimplementation would silently break production.
 import ts from 'typescript'
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 let cacheDir
-export async function importTs(tsRelPath) {
-  const abs = resolve(process.cwd(), tsRelPath)
+const compiled = new Map() // absolute .ts path -> emitted .mjs path
+const root = process.cwd()
+
+function resolveRelative(fromAbs, spec) {
+  const base = resolve(dirname(fromAbs), spec)
+  for (const candidate of [`${base}.ts`, join(base, 'index.ts'), base]) {
+    if (candidate.endsWith('.ts') && existsSync(candidate)) return candidate
+  }
+  throw new Error(`_ts-import: cannot resolve relative import "${spec}" from ${fromAbs}`)
+}
+
+function compile(abs) {
+  const cached = compiled.get(abs)
+  if (cached) return cached
+  cacheDir ??= mkdtempSync(join(tmpdir(), 'billora-ts-import-'))
+  const outFile = join(cacheDir, relative(root, abs).replace(/\.ts$/, '.mjs'))
+  compiled.set(abs, outFile) // set first: tolerates import cycles
   const src = readFileSync(abs, 'utf8')
-  const { outputText } = ts.transpileModule(src, {
+  let { outputText } = ts.transpileModule(src, {
     compilerOptions: {
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ES2022,
@@ -25,8 +43,20 @@ export async function importTs(tsRelPath) {
     },
     fileName: abs,
   })
-  cacheDir ??= mkdtempSync(join(tmpdir(), 'billora-ts-import-'))
-  const outFile = join(cacheDir, abs.replace(/[A-Za-z]:|[\\/]/g, '_') + '.mjs')
+  // Rewrite relative specifiers (static + dynamic) to the emitted .mjs files.
+  outputText = outputText.replace(
+    /(\bfrom\s*|\bimport\s*\(\s*)(['"])(\.{1,2}\/[^'"]+)\2/g,
+    (_m, lead, quote, spec) => {
+      const dep = compile(resolveRelative(abs, spec))
+      return `${lead}${quote}${pathToFileURL(dep).href}${quote}`
+    },
+  )
+  mkdirSync(dirname(outFile), { recursive: true })
   writeFileSync(outFile, outputText)
-  return import(pathToFileURL(outFile).href)
+  return outFile
+}
+
+export async function importTs(tsRelPath) {
+  const abs = resolve(root, tsRelPath)
+  return import(pathToFileURL(compile(abs)).href)
 }

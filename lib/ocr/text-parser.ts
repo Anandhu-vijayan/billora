@@ -19,9 +19,7 @@
 // Alias-free + import-only-types so the test harness (transpiles one file, no
 // `@/` resolution) can exercise the REAL parser in-process.
 import type { LedgerCandidate } from './ledger'
-
-// Mirrors lib/ocr/quality.ts + ledger.ts GSTIN_RE exactly (kept in sync by test).
-const GSTIN_RE = /\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b/
+import { pickSupplierGstin } from './gstin'
 
 // Confidence tiers: what we are willing to claim for a given match strength.
 const CONF_STRONG = 0.9 // value sat next to its own explicit label
@@ -49,6 +47,7 @@ function toAmount(raw: string | undefined): number | null {
 function findLabeledAmount(
   text: string,
   labels: RegExp,
+  confidence: number = CONF_STRONG,
 ): { value: number; confidence: number } | null {
   // The label is itself an alternation (cgst|central tax|...); it MUST be
   // wrapped in a non-capturing group or the top-level `|` would leave the
@@ -58,16 +57,35 @@ function findLabeledAmount(
   if (!m) return null
   const value = toAmount(m[1])
   if (value === null) return null
-  return { value, confidence: CONF_STRONG }
+  return { value, confidence }
 }
 
-/** First date-looking token in the text, preferring one near a "date" label. */
+/**
+ * The invoice date. Strict "invoice/bill/document date" labels win; a bare
+ * "Date" label is accepted next, but a date that sits on a due / order /
+ * delivery / PO / vehicle line is NEVER taken (those are different documents'
+ * dates and would silently mis-batch the invoice). A date with no label at all
+ * is a weak hit that ledger.ts cannot auto-approve.
+ */
 function findDate(text: string): { value: string; confidence: number } | null {
-  const labeled = new RegExp(`(?:invoice|bill|doc|inv)?\\s*date[^0-9\\n]{0,6}${DATE_TOKEN}`, 'i')
-  const lm = labeled.exec(text)
-  if (lm) return { value: lm[1], confidence: CONF_STRONG }
-  const any = new RegExp(DATE_TOKEN).exec(text)
-  if (any) return { value: any[1], confidence: CONF_WEAK }
+  const strict = new RegExp(
+    `(?:invoice|bill|document|doc|inv|tax\\s+invoice)\\s*(?:date|dt)[^0-9\\n]{0,8}${DATE_TOKEN}|date\\s+of\\s+(?:invoice|issue)[^0-9\\n]{0,8}${DATE_TOKEN}|\\bdated\\b[^0-9\\n]{0,4}${DATE_TOKEN}`,
+    'i',
+  )
+  const sm = strict.exec(text)
+  if (sm) return { value: sm[1] ?? sm[2] ?? sm[3], confidence: CONF_STRONG }
+
+  const NOT_INVOICE_DATE = /\b(due|order|delivery|dispatch|ship(?:ping)?|po|p\.o\.|purchase\s+order|lr|vehicle|e-?way|payment|valid(?:ity)?)\b/i
+  for (const line of text.split('\n')) {
+    if (NOT_INVOICE_DATE.test(line)) continue
+    const bare = new RegExp(`\\bdate[^0-9\\n]{0,6}${DATE_TOKEN}`, 'i').exec(line)
+    if (bare) return { value: bare[1], confidence: CONF_STRONG }
+  }
+  for (const line of text.split('\n')) {
+    if (NOT_INVOICE_DATE.test(line)) continue
+    const any = new RegExp(DATE_TOKEN).exec(line)
+    if (any) return { value: any[1], confidence: CONF_WEAK }
+  }
   return null
 }
 
@@ -78,11 +96,13 @@ function findInvoiceNumber(text: string): { value: string; confidence: number } 
   return null
 }
 
-function findGstin(text: string): { value: string; confidence: number } | null {
-  const upper = text.toUpperCase()
-  const m = GSTIN_RE.exec(upper)
-  if (m) return { value: m[1], confidence: CONF_STRONG }
-  return null
+function findGstin(
+  text: string,
+  recipientGstin?: string | null,
+): { value: string; confidence: number; recipient?: string } | null {
+  const pick = pickSupplierGstin(text, { recipientGstin })
+  if (!pick) return null
+  return { value: pick.value, confidence: pick.confidence === 0.9 ? CONF_STRONG : CONF_WEAK, recipient: pick.others[0] }
 }
 
 const VENDOR_SUFFIX =
@@ -120,7 +140,10 @@ function findVendor(text: string): { value: string; confidence: number } | null 
  * (e.g. a scanned PDF with no text layer) the caller gets an essentially empty
  * candidate, which ledger.ts routes to needs_review — never a fabricated row.
  */
-export function parseInvoiceText(text: string): LedgerCandidate {
+export function parseInvoiceText(
+  text: string,
+  opts?: { /** The workspace client's own GSTIN (the invoice's buyer), when known. */ recipientGstin?: string | null },
+): LedgerCandidate {
   const normalized = (text ?? '').replace(/\r/g, '')
   const candidate: LedgerCandidate & { confidence: Record<string, number> } = { confidence: {} }
 
@@ -136,10 +159,14 @@ export function parseInvoiceText(text: string): LedgerCandidate {
     candidate.confidence.invoice_date = date.confidence
   }
 
-  const gstin = findGstin(normalized)
+  const gstin = findGstin(normalized, opts?.recipientGstin)
   if (gstin) {
     candidate.supplier_gstin = gstin.value
     candidate.confidence.supplier_gstin = gstin.confidence
+    // The other GSTIN printed on the page is the buyer's; kept only so the
+    // ledger can cross-check the tax head against the two state codes.
+    const buyer = (opts?.recipientGstin ?? '').trim().toUpperCase() || gstin.recipient
+    if (buyer) candidate.recipient_gstin = buyer
   }
 
   const vendor = findVendor(normalized)
@@ -170,7 +197,13 @@ export function parseInvoiceText(text: string): LedgerCandidate {
   }
   const total =
     findLabeledAmount(normalized, /grand\s+total|invoice\s+total|total\s+(?:amount|payable)|amount\s+due|net\s+payable/i)
-    ?? findLabeledAmount(normalized, /\btotal\b/i)
+    // A bare "Total" is a WEAK hit (it can be a quantity or a subtotal), so it
+    // can never auto-approve on its own; quantity/discount/tax totals are skipped.
+    ?? findLabeledAmount(
+      normalized,
+      /\btotal\b(?!\s*(?:qty|quantity|items?|pcs|units?|weight|discount|tax|gst|cgst|sgst|igst|in\s+words))/i,
+      CONF_WEAK,
+    )
   if (total) {
     candidate.total_amount = total.value
     candidate.confidence.total_amount = total.confidence

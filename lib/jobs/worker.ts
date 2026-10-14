@@ -67,6 +67,15 @@ const budgetMs = (): number => {
   return Number.isFinite(parsed) && parsed > 1000 ? parsed : 45_000
 }
 
+// A job may start only if at least this much of the tick budget remains, so a
+// handler that begins just under the deadline cannot run past the platform's
+// hard function timeout (route maxDuration) and be killed mid-write. The first
+// job of a tick always runs — a tick must make progress.
+const minJobWindowMs = (): number => {
+  const parsed = Number.parseInt(process.env.JOB_MIN_WINDOW_MS ?? '', 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 20_000
+}
+
 const tickLimit = (): number => {
   const parsed = Number.parseInt(process.env.JOB_TICK_LIMIT ?? '', 10)
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 25) : 3
@@ -138,7 +147,7 @@ export async function runWorkerTick(
   for (const job of batch) {
     // Time budget exhausted: stop taking more work. These rows keep their
     // lease and recovery returns them to the queue if we never come back.
-    if (Date.now() > deadline) {
+    if (Date.now() > deadline || (result.claimed > 0 && Date.now() > deadline - minJobWindowMs())) {
       logger.warn('[Worker] tick budget reached; leaving remaining leases to lapse', {
         worker, remaining: batch.length - result.claimed,
       })

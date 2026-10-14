@@ -95,6 +95,30 @@ an operator-controlled privacy gate.
 > at rest; workbooks are served only through the authenticated
 > `/api/exports/[id]/download` route after a workspace-membership re-check.
 
+### Validation rules (what decides approved vs needs_review)
+
+`lib/ocr/ledger.ts` never trusts an extractor's own confidence; a row is
+auto-approved only when every check passes:
+
+- **GSTIN**: shape, state code **and mod-36 checksum** (`lib/ocr/gstin.ts`). A
+  regex-valid GSTIN that fails the checksum is treated as an OCR/transcription
+  error. When an invoice prints two GSTINs, the supplier is chosen by label
+  (seller / sold by vs bill to / buyer), checksum validity and, when known, by
+  excluding the recipient — never "first match".
+- **Arithmetic**: taxable + CGST + SGST + IGST = total (±₹1.01 round-off). An
+  unprinted tax head counts as 0 only if this still reconciles.
+- **Structure**: total is non-zero; IGST and CGST/SGST are not both charged;
+  CGST = SGST; and when both GSTINs were read, IGST vs CGST+SGST must agree with
+  the two state codes.
+- **Date**: parses day-first, is not in the future and not before GST (1 Jul
+  2017). An implausible date is flagged and the invoice is not batched.
+
+When the AI read fails a re-readable check (checksum, arithmetic, swapped
+parties, date), the handler makes **one** targeted second AI call that names the
+failed checks, adopts it only if it is strictly better, and skips it when the
+first call was slow. Not yet built (see notes below): image-quality gating,
+per-workspace AI consent, and a calibration set of real invoices.
+
 Extraction accuracy against real Indian invoices is **not yet certified**; the
 deterministic parsing and review logic are unit-tested, but OCR/render quality
 must still be validated on representative documents before production use.

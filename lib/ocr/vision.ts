@@ -33,12 +33,25 @@ export class VisionPermanentError extends Error {
 const SUPPORTED_MIME = /^(image\/(jpeg|png|webp)|application\/pdf)$/i
 
 const VISION_PROMPT = [
-  'You are reading a single GST/tax invoice. Extract ONLY values that are',
-  'explicitly printed on the document. Never guess or infer a number, a date,',
-  'or a GSTIN. If a field is not present or not legible, return an empty string',
-  'for text fields and 0 for the amount fields, and give that field a low',
-  'confidence. Dates must be returned as printed (prefer DD/MM/YYYY or',
-  'YYYY-MM-DD). confidence holds your per-field certainty from 0.0 to 1.0.',
+  'You are reading a single Indian GST tax invoice. Extract ONLY values that are',
+  'explicitly printed on the document. Never guess, infer or compute a number, a',
+  'date, or a GSTIN. If a field is not present or not legible, return an empty',
+  'string for text fields and 0 for amount fields, and give that field a low',
+  'confidence (0.0-1.0 per field; be honest, do not default to high).',
+  'PARTIES: the SUPPLIER is the seller who ISSUED the invoice (letterhead, "Sold',
+  'by", "Seller", "From"). The RECIPIENT is the buyer ("Bill to", "Ship to",',
+  '"Buyer", "Customer"). supplier_gstin and vendor_name belong to the SUPPLIER',
+  'only; put the buyer\'s GSTIN in recipient_gstin. Never swap them.',
+  'AMOUNTS: taxable_value is the total taxable value before tax; cgst_amount,',
+  'sgst_amount and igst_amount are the invoice-level tax amounts per head (not',
+  'rates, not percentages); total_amount is the final payable invoice total',
+  'including tax and round-off. Use plain numbers (no currency symbol, no',
+  'thousands separators).',
+  'DATES: invoice_date is the INVOICE date, never the due, order, delivery or PO',
+  'date. Return it as printed (prefer DD/MM/YYYY or YYYY-MM-DD).',
+  'GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1',
+  'alphanumeric, "Z", 1 alphanumeric. Read it character by character.',
+  'If the page shows several invoices, read only the first/most prominent one.',
 ].join(' ')
 
 const confidenceSchema = {
@@ -71,6 +84,7 @@ const LEDGER_SCHEMA = {
     invoice_number: { type: Type.STRING },
     vendor_name: { type: Type.STRING },
     supplier_gstin: { type: Type.STRING },
+    recipient_gstin: { type: Type.STRING },
     taxable_value: { type: Type.NUMBER },
     cgst_amount: { type: Type.NUMBER },
     sgst_amount: { type: Type.NUMBER },
@@ -79,12 +93,12 @@ const LEDGER_SCHEMA = {
     confidence: confidenceSchema,
   },
   required: [
-    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
     'confidence',
   ],
   propertyOrdering: [
-    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
     'confidence',
   ],
@@ -137,8 +151,14 @@ export async function extractInvoiceFields(args: {
   mimeType: string
   apiKey: string
   model: string
+  /**
+   * Second-pass only: the failed validation checks from the first read (see
+   * retryHintFor in ledger.ts). The model is told what did not add up and asked
+   * to re-read — it is still forbidden to guess.
+   */
+  hint?: string | null
 }): Promise<LedgerCandidate> {
-  const { buffer, mimeType, apiKey, model } = args
+  const { buffer, mimeType, apiKey, model, hint } = args
   if (!SUPPORTED_MIME.test(mimeType)) {
     throw new VisionPermanentError(`UNSUPPORTED_MEDIA_TYPE: ${mimeType}`)
   }
@@ -150,7 +170,7 @@ export async function extractInvoiceFields(args: {
     role: 'user',
     parts: [
       { inlineData: { mimeType, data: buffer.toString('base64') } },
-      { text: VISION_PROMPT },
+      { text: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT },
     ],
   }]
 
@@ -162,7 +182,7 @@ export async function extractInvoiceFields(args: {
         ai.models.generateContent({
           model,
           contents,
-          config: { responseMimeType: 'application/json', responseSchema: LEDGER_SCHEMA },
+          config: { responseMimeType: 'application/json', responseSchema: LEDGER_SCHEMA, temperature: 0 },
         }),
         CALL_TIMEOUT_MS,
         'gemini_generate_content',
