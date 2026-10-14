@@ -1,9 +1,10 @@
 // lib/jobs/handlers/extract-invoice.ts — invoice_extraction job handler.
 //
 // Turns one stored, envelope-encrypted invoice file into a validated ledger row
-// (image/PDF -> data -> review routing) and, on approval, folds the invoice into
-// its (workspace, client, month) batch and — when the batch has no other
-// outstanding extraction work — schedules the register workbook.
+// (image/PDF -> data -> review routing) and folds the invoice into its real
+// (workspace, client, month) batch whenever a reliable invoice date was parsed —
+// for BOTH approved and needs_review invoices — then, when the batch has no other
+// outstanding extraction work, schedules the register workbook.
 //
 // Guarantees this file is responsible for:
 //   * Idempotent (rule 3): an already-approved invoice completes without redoing
@@ -53,9 +54,6 @@ const monthBounds = (dateIso: string): { start: string; end: string } => {
   return { start, end }
 }
 
-/** First day of the month for a timestamp (used when no valid invoice date). */
-const monthOfTimestamp = (ts: string): string => ts.slice(0, 10)
-
 /**
  * Schedule the batch's register workbook job. Scheduling is UNCONDITIONAL and
  * deduped (the partial unique index keeps at most one live register job per
@@ -104,7 +102,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     .select('review_status')
     .eq('workspace_id', workspaceId).eq('invoice_id', invoiceId).maybeSingle()
   if (existing && existing.review_status === 'approved') {
-    await finalizeApproved(db, { workspaceId, invoiceId, jobId: job.id })
+    await finalizeInvoice(db, { workspaceId, invoiceId, jobId: job.id })
     logger.info('[Extract] already approved; skipping provider call', { invoice: invoiceId.slice(0, 8) })
     return
   }
@@ -225,13 +223,26 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     }, { onConflict: 'invoice_id' })
     if (recErr) throw new Error(`RECORD_WRITE_ERROR: ${recErr.message}`)
 
-    // Route the invoice status: approved -> completed, else needs_review.
-    const { error: stErr } = await db.from('invoices').update({ status: evaluation.review })
+    // Route the invoice status. The invoices.status CHECK allows 'completed' but
+    // NOT 'approved' ('approved' is an extracted_records.review_status value, not
+    // an invoice lifecycle state), so a clean extraction lands as 'completed' and
+    // anything unresolved as 'needs_review'.
+    const invoiceStatus = evaluation.review === 'approved' ? 'completed' : 'needs_review'
+    const { error: stErr } = await db.from('invoices').update({ status: invoiceStatus })
       .eq('workspace_id', workspaceId).eq('id', invoiceId)
     if (stErr) throw new Error(`INVOICE_STATUS_ERROR: ${stErr.message}`)
 
-    if (evaluation.review === 'approved') {
-      await finalizeApproved(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)
+    // Batch + register scheduling is NOT restricted to approved invoices: a
+    // needs_review invoice with a reliably parsed date still belongs in its real
+    // (client, month) batch so the register can account for outstanding review
+    // items. When the date is missing/ambiguous we NEVER guess the upload month —
+    // the invoice stays unbatched and visible in the review workflow instead.
+    if (evaluation.invoiceDateResolved) {
+      await finalizeInvoice(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)
+    } else {
+      logger.info('[Extract] no reliable invoice date; left unbatched for review', {
+        invoice: invoiceId.slice(0, 8), reasons: evaluation.reasons.slice(0, 4),
+      })
     }
     logger.info('[Extract] done', {
       invoice: invoiceId.slice(0, 8), review: evaluation.review,
@@ -243,37 +254,56 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
 }
 
 /**
- * Common tail for approved invoices (fresh or replayed): stamp the batch and
- * ensure a register job is scheduled for it. Safe to call more than once (all
- * steps are idempotent and the register enqueue is deduped).
+ * Fold one extracted invoice into its real (client, month) batch and make sure a
+ * register job is scheduled for it. Runs for BOTH approved and needs_review
+ * invoices — what gates batching is a reliably parsed invoice date, not the
+ * review outcome. When the date is missing/ambiguous the invoice is left OUT of
+ * any guessed month (it stays unbatched and visible in review). Every step is
+ * idempotent, so retries and duplicate webhooks never create duplicate invoices,
+ * batches or workbook jobs.
  */
-async function finalizeApproved(
+async function finalizeInvoice(
   db: Db,
   args: { workspaceId: string; invoiceId: string; jobId: string },
   row?: LedgerRow, invoice?: InvoiceRow,
 ): Promise<void> {
   if (!invoice) {
-    // Replay path: we need the client + a date source to resolve the batch.
+    // Replay path: we need the client + the already-resolved batch to re-affirm.
     const { data } = await db.from('invoices')
       .select('id,workspace_id,client_id,batch_id,file_object_path,content_type,file_encryption_key_version,status,received_at')
       .eq('workspace_id', args.workspaceId).eq('id', args.invoiceId).maybeSingle()
     invoice = data as InvoiceRow | undefined
   }
   if (!invoice) return
-  const periodDate = (row && row.invoice_date && /^\d{4}-\d{2}-\d{2}$/.test(row.invoice_date))
-    ? row.invoice_date
-    : monthOfTimestamp(invoice.received_at)
 
-  const { start, end } = monthBounds(periodDate)
-  const { data: batch, error: batchError } = await db.rpc('ensure_invoice_batch', {
-    p_workspace: args.workspaceId, p_client: invoice.client_id, p_start: start, p_end: end,
-  })
-  if (batchError || !batch) throw new Error(`BATCH_ENSURE_ERROR: ${batchError?.message ?? 'no batch id'}`)
-  const batchId = String(batch)
-  if (invoice.batch_id !== batchId) {
+  let batchId: string
+  if (invoice.batch_id) {
+    // Already associated (a prior finalize or the original approval): reuse it.
+    batchId = invoice.batch_id
+  } else {
+    // Resolve the period ONLY from a reliably parsed invoice date. We never fall
+    // back to the upload month: a guessed period would silently file the invoice
+    // into the wrong register.
+    const iso = row && row.invoice_date && /^\d{4}-\d{2}-\d{2}$/.test(row.invoice_date)
+      ? row.invoice_date
+      : null
+    if (!iso) return
+    const { start, end } = monthBounds(iso)
+    const { data: batch, error: batchError } = await db.rpc('ensure_invoice_batch', {
+      p_workspace: args.workspaceId, p_client: invoice.client_id, p_start: start, p_end: end,
+    })
+    if (batchError || !batch) throw new Error(`BATCH_ENSURE_ERROR: ${batchError?.message ?? 'no batch id'}`)
+    batchId = String(batch)
     await db.from('invoices').update({ batch_id: batchId })
       .eq('workspace_id', args.workspaceId).eq('id', args.invoiceId)
   }
+
+  // Make the invoice's batch association and the job's agree: stamp the
+  // extraction job's batch_id so build_register's readiness scan counts this job
+  // as part of the batch (previously extraction jobs kept a NULL batch_id, so the
+  // gate always saw zero outstanding work and could build a premature workbook).
+  await db.from('processing_jobs').update({ batch_id: batchId })
+    .eq('workspace_id', args.workspaceId).eq('id', args.jobId).is('batch_id', null)
 
   // Ensure the batch has a (deduped) register job scheduled. Readiness is
   // re-checked in build_register, so unconditional scheduling here is safe.

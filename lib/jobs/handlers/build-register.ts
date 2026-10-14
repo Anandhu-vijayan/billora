@@ -68,19 +68,33 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   // throw requeues with backoff, so the register rebuilds itself once the last
   // sibling settles — the enqueue gives this job a generous max_attempts so
   // these expected requeues never exhaust into a permanent failure.
-  const { count: outstanding, error: outErr } = await db
-    .from('processing_jobs').select('id', { count: 'exact', head: true })
-    .eq('workspace_id', workspaceId).eq('batch_id', batchId)
-    .eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])
-  if (outErr) throw new Error(`BATCH_READINESS_ERROR: ${outErr.message}`)
-  if ((outstanding ?? 0) > 0) throw new Error(`REGISTER_NOT_READY: ${outstanding} extraction job(s) outstanding`)
-
-  // Approved invoice ids for this batch (still excluding anything deleted).
+  //
+  // NEVER assume processing_jobs.batch_id is populated: an extraction job created
+  // before its invoice was ever finalized carries a NULL batch_id, so a
+  // batch_id-only scan would miss it and build a premature workbook. We count
+  // outstanding extraction two ways and take the larger — jobs stamped into this
+  // batch, and jobs whose target invoice already belongs to this batch.
   const { data: invoiceRows, error: invErr } = await db
     .from('invoices').select('id')
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).neq('status', 'deleted')
   if (invErr) throw new Error(`BATCH_INVOICES_ERROR: ${invErr.message}`)
   const invoiceIds = (invoiceRows ?? []).map((r) => (r as { id: string }).id)
+
+  const { count: outstandingByBatch, error: outErr } = await db
+    .from('processing_jobs').select('id', { count: 'exact', head: true })
+    .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+    .eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])
+  if (outErr) throw new Error(`BATCH_READINESS_ERROR: ${outErr.message}`)
+  let outstanding = outstandingByBatch ?? 0
+  if (invoiceIds.length > 0) {
+    const { count: outstandingByInvoice, error: outErr2 } = await db
+      .from('processing_jobs').select('id', { count: 'exact', head: true })
+      .eq('workspace_id', workspaceId).in('invoice_id', invoiceIds)
+      .eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])
+    if (outErr2) throw new Error(`BATCH_READINESS_ERROR: ${outErr2.message}`)
+    outstanding = Math.max(outstanding, outstandingByInvoice ?? 0)
+  }
+  if (outstanding > 0) throw new Error(`REGISTER_NOT_READY: ${outstanding} extraction job(s) outstanding`)
 
   // Account for the non-approved invoices so they are never silently dropped.
   const { count: flagged } = await db

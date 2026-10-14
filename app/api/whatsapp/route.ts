@@ -20,6 +20,9 @@ import {
   claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed,
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
 } from '@/lib/whatsapp/intake';
+import {
+  ensureBatchRegisters, collectFinalizeState, composeDoneMessage,
+} from '@/lib/whatsapp/finalize';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -163,6 +166,33 @@ async function handleOnboardingSideEffects(
       .eq('workspace_id', workspaceId).eq('status', 'needs_review');
     return count ?? 0;
   };
+  // "Done" is a real finalization, not just an ack. It re-affirms a register job
+  // for every eligible batch, then reads the CURRENT state and sends a TRUTHFUL
+  // result. It never claims the Excel is ready until a verified generated_workbooks
+  // row exists (build_register inserts that row only after an encrypted upload
+  // succeeded), so a ready claim always implies the stored file is available.
+  // While extraction/register jobs are still running it says "still working" and
+  // defers the final result to the register job's delivery. Repeated Done is
+  // idempotent: scheduling is deduped and the reads never mutate processing state.
+  const deliverDone = async (): Promise<void> => {
+    if (!workspaceId) { await deliverText('Nothing to finalize yet — send Hi to start, or just send an invoice.'); return; }
+    try {
+      await ensureBatchRegisters(db, workspaceId);
+      const counts = await collectFinalizeState(db, workspaceId);
+      const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
+      const link = base && counts.readyWorkbookIds.length > 0
+        ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
+        : null;
+      await deliverText(composeDoneMessage(counts, { link }));
+    } catch (e) {
+      // Finalization is read/schedule only; a failure here must never lose work or
+      // rewind intake. Fall back to an honest "queued" message (no ready claim).
+      logger.warn('[WhatsApp] Done finalization deferred', {
+        sender: label, error: e instanceof Error ? e.message : String(e),
+      });
+      await deliverText('Done — your uploads are queued. I\'ll send your register here once processing finishes.');
+    }
+  };
   const sendStateMessage = async (): Promise<void> => {
     if (result.note === 'individual-selected') {
       const held = assignedNow > 0 ? ` I also filed the ${assignedNow} invoice file(s) you sent earlier.` : '';
@@ -195,7 +225,7 @@ async function handleOnboardingSideEffects(
         ? `Welcome back to Billora. Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them, or just send more invoices.`
         : 'Welcome back to Billora — send invoice PDFs or photos here. Send Menu for options.');
     } else if (result.note === 'done') {
-      await deliverText('Done — your uploads are queued for processing. Send more invoices anytime, or type Menu.');
+      await deliverDone();
     } else if (result.note === 'status-requested') {
       const waiting = await countWaitingUploads(db, hmac).catch(() => 0);
       await deliverText(!workspaceId

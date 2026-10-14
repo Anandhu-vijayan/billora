@@ -70,6 +70,9 @@ const pdfSrc = () => readFileSync(new URL('../lib/ocr/pdf.ts', import.meta.url),
 const pdfEngineSrc = () => readFileSync(new URL('../lib/ocr/engines/pdf-text-engine.ts', import.meta.url), 'utf8')
 const nextConfigSrc = () => readFileSync(new URL('../next.config.ts', import.meta.url), 'utf8')
 const readmeSrc = () => readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+const finalizeSrc = () => readFileSync(new URL('../lib/whatsapp/finalize.ts', import.meta.url), 'utf8')
+const fixBatchSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261013130000_fix_batch_period_status.sql', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -94,6 +97,10 @@ const access = await importTs('lib/exports/access.ts')
 // text->field extraction is exercised in-process (a regex drift fails here,
 // not silently in production).
 const textParser = await importTs('lib/ocr/text-parser.ts')
+// finalize.ts has only an erased `import type`, so the REAL Done-finalization
+// logic (truthful message + idempotent register scheduling + verified-ready read)
+// is exercised in-process against a fake query builder, not reimplemented.
+const finalize = await importTs('lib/whatsapp/finalize.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -764,7 +771,11 @@ test('G5f extraction decrypts in-memory, routes review, and only enqueues the re
   assert.ok(s.includes('if (env.EXTRACTION_PROVIDER !== \'gemini\')'), 'unimplemented provider fails closed')
   assert.ok(s.includes('e instanceof VisionTransientError) throw e'), 'transient provider error requeues')
   assert.ok(s.includes("onConflict: 'invoice_id'"), 'extracted_records upsert is idempotent')
-  assert.ok(s.includes('status: evaluation.review'), 'approved->completed / else needs_review')
+  // The invoices.status CHECK allows 'completed' but NOT 'approved' — a clean
+  // extraction must route to 'completed' (extracted_records keeps review_status).
+  assert.ok(s.includes("evaluation.review === 'approved' ? 'completed' : 'needs_review'"), 'approved->completed / else needs_review')
+  assert.ok(s.includes('status: invoiceStatus'), 'invoice status routed from the mapped value')
+  assert.ok(!s.includes("update({ status: evaluation.review })"), 'never write the invalid approved status to invoices')
   // Scheduling is unconditional + deduped here; readiness is enforced in build_register
   // (never gate the enqueue here or two workers finishing together can deadlock).
   assert.ok(s.includes('await enqueueRegisterGeneration(db, args.workspaceId, batchId)'), 'register scheduled on approve')
@@ -1469,5 +1480,193 @@ test('K6 hybrid config + docs: real deps externalized, exposure documented, no o
   assert.match(rm, /hybrid/i)
   assert.match(rm, /not fully offline|not\*\*\s*an offline/i)
   assert.match(rm, /Data-exposure note|Gemini/)
+})
+
+// ---- M: batch finalization, Done finalization & verified workbook delivery ----
+
+// A minimal chainable + thenable PostgREST fake — just enough to drive the REAL
+// finalize.ts reads/scheduling without a live database.
+function fakeDb(resolve) {
+  const mk = (table, verb, filters) => {
+    const run = (mode) => Promise.resolve(resolve({ table, verb, filters, mode }))
+    return {
+      select(cols, opts) { return mk(table, opts && opts.count ? 'count' : verb === 'delete' ? 'delete' : 'select', filters) },
+      insert(row) { return mk(table, 'insert', [...filters, { insert: row }]) },
+      update(row) { return mk(table, 'update', [...filters, { update: row }]) },
+      delete() { return mk(table, 'delete', filters) },
+      eq(c, v) { return mk(table, verb, [...filters, { eq: [c, v] }]) },
+      neq(c, v) { return mk(table, verb, [...filters, { neq: [c, v] }]) },
+      in(c, v) { return mk(table, verb, [...filters, { in: [c, v] }]) },
+      not(c, o, v) { return mk(table, verb, [...filters, { not: [c, o, v] }]) },
+      is(c, v) { return mk(table, verb, [...filters, { is: [c, v] }]) },
+      order() { return mk(table, verb, filters) },
+      limit() { return mk(table, verb, filters) },
+      maybeSingle() { return run('maybeSingle') },
+      single() { return run('single') },
+      then(res, rej) { run('all').then(res, rej) },
+    }
+  }
+  return { from: (table) => mk(table, 'select', []) }
+}
+
+const FC = (o) => ({
+  outstanding: 0, compiling: 0, needsReview: 0, missingDate: 0,
+  readyWorkbooks: 0, readyWorkbookIds: [], ...o,
+})
+
+test('M1 approved invoice with a valid date -> completed + batched + register scheduled', () => {
+  const ev = ledger.evaluateLedger(textParser.parseInvoiceText(INVOICE_TEXT), { minConfidence: 0.8 })
+  assert.equal(ev.review, 'approved')
+  assert.equal(ev.invoiceDateResolved, true, 'a real date is what gates batching')
+  assert.equal(ev.row.invoice_date, '2026-09-05', 'day-first date canonicalised to ISO for the month lookup')
+  const s = extractSrc()
+  assert.ok(s.includes("evaluation.review === 'approved' ? 'completed' : 'needs_review'"))
+  assert.ok(s.includes('if (evaluation.invoiceDateResolved) {'), 'batching gated on a resolved date, not approval')
+  assert.ok(s.includes('await finalizeInvoice(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)'))
+  assert.ok(s.includes("db.rpc('ensure_invoice_batch'"))
+  assert.ok(s.includes('await enqueueRegisterGeneration(db, args.workspaceId, batchId)'), 'register enqueued for the batch')
+})
+
+test('M2 needs_review invoice with a reliable date is batched WITHOUT being approved', () => {
+  const ev = ledger.evaluateLedger({
+    invoice_number: 'INV-9', vendor_name: 'Acme Store Pvt Ltd', invoice_date: '22/01/2026',
+    taxable_value: 500, cgst_amount: 25, sgst_amount: 25, igst_amount: 0, total_amount: 550,
+  }, { minConfidence: 0.8 })
+  assert.equal(ev.review, 'needs_review')
+  assert.equal(ev.invoiceDateResolved, true)
+  const s = extractSrc()
+  assert.ok(!s.includes("if (evaluation.review === 'approved') {\n      await finalize"), 'finalization is no longer restricted to approved')
+  assert.ok(!s.includes("status: 'completed'"), 'a review row is never promoted to a completed invoice status')
+})
+
+test('M3 missing/ambiguous invoice date never falls back to the upload month', () => {
+  const noDate = ledger.evaluateLedger({
+    invoice_number: 'X-1', vendor_name: 'Acme', supplier_gstin: '27ABCDE1234F1Z5',
+    taxable_value: 100, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 100,
+  }, { minConfidence: 0.8 })
+  assert.equal(noDate.invoiceDateResolved, false)
+  const s = extractSrc()
+  assert.ok(!s.includes('monthOfTimestamp'), 'no upload-month helper remains')
+  assert.ok(!s.includes('periodDate'), 'no silent received_at period fallback variable')
+  const fin = s.slice(s.indexOf('async function finalizeInvoice'))
+  assert.match(fin, /if \(!iso\) return/, 'no reliable date -> invoice stays unbatched')
+  assert.ok(finalizeSrc().includes("eq('status', 'needs_review').is('batch_id', null)"), 'unbatched review invoices are counted for attention')
+})
+
+test('M4 image uses the vision path only when the operator enabled AI; disabled -> no provider call', async () => {
+  const saved = process.env.LOCAL_OCR_ENGINE
+  process.env.LOCAL_OCR_ENGINE = 'none'
+  try {
+    const res = await local.tryLocalExtract({ buffer: Buffer.from([0xff, 0xd8]), mimeType: 'image/jpeg' })
+    assert.equal(res.ok, false, 'local seam never fabricates an image read')
+    assert.equal(res.reason, 'no-engine')
+  } finally {
+    if (saved === undefined) delete process.env.LOCAL_OCR_ENGINE; else process.env.LOCAL_OCR_ENGINE = saved
+  }
+  assert.match(visionSrc(), /image\\?\/\(jpeg\|png\|webp\)/, 'JPEG/PNG/WebP are valid vision transports')
+  const s = extractSrc()
+  const gate = s.indexOf('if (aiEnabled && needsFallback)')
+  const provider = s.indexOf('extractInvoiceFields({')
+  assert.ok(gate > 0 && provider > gate, 'provider call lives ONLY inside the aiEnabled gate')
+  assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"), 'AI off by default')
+  assert.ok(pdfEngineSrc().includes("if (!PDF_MIME.test(mimeType ?? '')) return null"), 'pdfjs-text is not claimed to OCR images')
+})
+
+test('M5 Done waits for outstanding extraction and reports a truthful outcome (real module)', () => {
+  const processing = finalize.composeDoneMessage(FC({ outstanding: 2, needsReview: 1 }), { link: 'https://x/api/exports/w1/download' })
+  assert.match(processing, /Still working/)
+  assert.match(processing, /2 invoice\(s\) still processing/)
+  assert.ok(!/register is ready/.test(processing), 'never claims ready while jobs run')
+  assert.ok(!processing.includes('https://x'), 'no link is offered while still processing')
+  assert.match(finalize.composeDoneMessage(FC({ compiling: 1 })), /register still compiling/)
+  const ready = finalize.composeDoneMessage(FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'] }), { link: 'https://x/api/exports/w1/download' })
+  assert.match(ready, /register is ready \(1 workbook\)/)
+  assert.ok(ready.includes('https://x/api/exports/w1/download'), 'link offered once verified-ready')
+})
+
+test('M5b route.ts Done runs real finalization, not a bare ack', () => {
+  const r = routeSrc()
+  assert.ok(r.includes('ensureBatchRegisters(db, workspaceId)'), 'Done re-affirms register jobs')
+  assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Done reads current state')
+  assert.ok(r.includes('composeDoneMessage(counts, { link })'), 'Done sends a truthful result')
+  assert.ok(!r.includes('your uploads are queued for processing. Send more invoices anytime'), 'the old ack-only Done text is gone')
+})
+
+test('M6 repeated Done never duplicates register jobs (idempotent, deduped scheduling)', async () => {
+  const inserted = []
+  const live = new Set(['b2'])
+  const db = fakeDb(({ table, verb, filters }) => {
+    if (table === 'invoices') return { data: [{ batch_id: 'b1' }, { batch_id: 'b2' }, { batch_id: 'b1' }], error: null }
+    if (table === 'processing_jobs') {
+      if (verb === 'delete') return { error: null }
+      if (verb === 'select') { const b = filters.find((f) => f.eq && f.eq[0] === 'batch_id')?.eq[1]; return { data: live.has(b) ? [{ id: 'live' }] : [], error: null } }
+      if (verb === 'insert') { inserted.push(filters.find((f) => f.insert)?.insert); return { error: null } }
+    }
+    return { data: [], count: 0, error: null }
+  })
+  const scheduled = await finalize.ensureBatchRegisters(db, 'ws')
+  assert.equal(scheduled, 1, 'only the batch lacking a live register is scheduled')
+  assert.equal(inserted.length, 1)
+  assert.equal(inserted[0].batch_id, 'b1')
+  assert.equal(inserted[0].job_type, 'register_generation')
+})
+
+test('M6b a concurrent duplicate register enqueue (23505) is a benign no-op, not an error', async () => {
+  const db = fakeDb(({ table, verb }) => {
+    if (table === 'invoices') return { data: [{ batch_id: 'b1' }], error: null }
+    if (table === 'processing_jobs') {
+      if (verb === 'select') return { data: [], error: null }
+      if (verb === 'insert') return { error: { code: '23505' } }
+      return { error: null }
+    }
+    return { data: [], count: 0, error: null }
+  })
+  const scheduled = await finalize.ensureBatchRegisters(db, 'ws')
+  assert.equal(scheduled, 1, 'a 23505 means "already scheduled", never thrown')
+})
+
+test('M7 multiple months / clients resolve to separate batches and one workbook per batch', () => {
+  const s = extractSrc()
+  assert.ok(s.includes('p_client: invoice.client_id'), 'batch scoped to the invoice client (orgs never mix clients)')
+  assert.ok(s.includes('const { start, end } = monthBounds(iso)'), 'period derived ONLY from the parsed date')
+  assert.ok(registerSrc().includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'one deterministic workbook per batch, never merged')
+  assert.ok(registerSrc().includes("in('invoice_id', invoiceIds)"), 'outstanding extraction also checked via invoice membership')
+})
+
+test('M7b batch resolver uses the canonical collecting status, never the removed open one', () => {
+  const sql = fixBatchSqlSrc()
+  const sqlCode = sql.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n')
+  assert.match(sql, /status in \('collecting', 'processing'\)/, 'reuse matches the Phase-1 lifecycle')
+  assert.ok(!/'open'/.test(sqlCode), 'the CHECK-invalid open status is gone from executable SQL (root cause of no-batch / no-register; the word may still appear in comments)')
+  assert.match(sql, /values \(p_workspace, p_client, p_start, p_end, 'collecting'\)/)
+  assert.match(sql, /grant execute on function public\.ensure_invoice_batch\(uuid, uuid, date, date\)\s*\n\s*to service_role/)
+  assert.ok(!/^[ \t]*grant[^\n]*\bto\s+(anon|authenticated)\b/im.test(sql), 'service-role only')
+})
+
+test('M8 no approved rows yields a review/no-export result, never a false success', () => {
+  const msg = finalize.composeDoneMessage(FC({ needsReview: 2, missingDate: 1 }))
+  assert.match(msg, /nothing is ready to export yet/)
+  assert.match(msg, /2 invoice\(s\) need review/)
+  assert.ok(!/register is ready|Download/i.test(msg), 'no false ready/link claim')
+  const s = registerSrc()
+  assert.ok(s.indexOf('rows.length === 0') < s.indexOf('await scheduleDelivery('), 'no-op return precedes any delivery scheduling')
+})
+
+test('M9 a workbook is reported ready only after its row + stored file exist', async () => {
+  const future = new Date(Date.now() + 3600_000).toISOString()
+  const past = new Date(Date.now() - 3600_000).toISOString()
+  const rows = [
+    { id: 'w1', file_object_path: 'whatsapp/exports/a.xlsx', expires_at: future },
+    { id: 'w2', file_object_path: 'whatsapp/exports/b.xlsx', expires_at: past },
+  ]
+  const db = fakeDb(({ table }) => {
+    if (table === 'generated_workbooks') return { data: rows, error: null }
+    return { data: [], count: 0, error: null }
+  })
+  const c = await finalize.collectFinalizeState(db, 'ws')
+  assert.equal(c.readyWorkbooks, 1, 'only the live, stored workbook is counted')
+  assert.deepEqual(c.readyWorkbookIds, ['w1'])
+  const s = registerSrc()
+  assert.ok(s.indexOf('.upload(exportPath') < s.indexOf("from('generated_workbooks').insert"), 'ready row is written only after the encrypted file is stored')
 })
 
