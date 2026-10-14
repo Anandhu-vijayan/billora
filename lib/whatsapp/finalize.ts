@@ -71,6 +71,36 @@ export function composeDoneMessage(
   return 'Done — I have no invoices to compile for this session yet. Send invoice PDFs or photos anytime.'
 }
 
+/**
+ * Pure: turn finalize counts into a truthful "Review" body. Unlike the old
+ * review reply (which only counted rows), this states what is pending, why, and
+ * how to finish it — and hands the download link IMMEDIATELY when a verified
+ * ready workbook exists, instead of relying on some later inbound message to
+ * deliver it. needsReview/missingDate are disjoint, so each is named with its
+ * own count and never summed into the other.
+ */
+export function composeReviewMessage(
+  c: FinalizeCounts,
+  opts?: { link?: string | null },
+): string {
+  const attention = c.needsReview + c.missingDate
+  if (c.readyWorkbooks > 0) {
+    const link = opts?.link ? opts.link : 'your signed-in workspace'
+    const parts: string[] = []
+    if (c.needsReview > 0) parts.push(`${c.needsReview} invoice(s) still need review`)
+    if (c.missingDate > 0) parts.push(`${c.missingDate} have no clear date`)
+    const note = parts.length > 0 ? ` ${parts.join(' and ')} and are NOT in it yet.` : ''
+    return `Your register is ready — download (sign in required): ${link}.${note}`
+  }
+  if (c.outstanding > 0) {
+    return `Still processing ${c.outstanding} invoice(s). I'll tell you here once they're resolved.${attention > 0 ? ` ${attention} already need your review.` : ''}`
+  }
+  if (attention > 0) {
+    return `${attention} invoice(s) need review before a register can be built${c.missingDate > 0 ? ` — ${c.missingDate} have no clear invoice date` : ''}. Correct and confirm each one (an invoice is only filed under the month on its own date, never a guessed one); once confirmed, its workbook is generated automatically.`
+  }
+  return 'Nothing needs your attention right now — keep sending invoices. Send Done to finalize a batch.'
+}
+
 async function countJobs(db: Db, workspaceId: string, jobType: string, statuses: string[]): Promise<number> {
   const { count, error } = await db
     .from('processing_jobs').select('id', { count: 'exact', head: true })

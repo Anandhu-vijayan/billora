@@ -21,7 +21,7 @@ import {
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
 } from '@/lib/whatsapp/intake';
 import {
-  ensureBatchRegisters, collectFinalizeState, composeDoneMessage,
+  ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
 } from '@/lib/whatsapp/finalize';
 
 export async function GET(req: Request) {
@@ -233,10 +233,26 @@ async function handleOnboardingSideEffects(
         : `You're ready. Send invoice PDFs or photos anytime.${waiting > 0 ? ` ${waiting} file(s) are held for a client — send Change client to assign them.` : ''} Send Done when this batch is finished, or Menu for options.`);
     } else if (result.note === 'review-requested') {
       const waiting = await countWaitingUploads(db, hmac).catch(() => 0);
-      const flagged = await countNeedsReview().catch(() => 0);
-      await deliverText(waiting === 0 && flagged === 0
-        ? 'Nothing needs your attention right now — keep sending invoices.'
-        : `Needs attention: ${waiting} file(s) held for a client${flagged > 0 ? `, ${flagged} invoice(s) flagged for review` : ''}. Send Change client to assign held files.`);
+      let body: string;
+      if (!workspaceId) {
+        body = "You're not set up yet — send Hi to begin, or just send an invoice.";
+      } else {
+        try {
+          const counts = await collectFinalizeState(db, workspaceId);
+          const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
+          const link = base && counts.readyWorkbookIds.length > 0
+            ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
+            : null;
+          body = composeReviewMessage(counts, { link });
+        } catch {
+          const flagged = await countNeedsReview().catch(() => 0);
+          body = flagged > 0
+            ? `${flagged} invoice(s) flagged for review.`
+            : 'Nothing needs your attention right now — keep sending invoices.';
+        }
+      }
+      const held = waiting > 0 ? ` Also: ${waiting} file(s) are held for a client — send Change client to assign them.` : '';
+      await deliverText(body + held);
     } else if (result.outbound.kind === 'menu_list') {
       await deliverMenu(result.outbound.workspace);
     } else if (result.outbound.kind === 'text') {

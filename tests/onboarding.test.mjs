@@ -73,6 +73,10 @@ const readmeSrc = () => readFileSync(new URL('../README.md', import.meta.url), '
 const finalizeSrc = () => readFileSync(new URL('../lib/whatsapp/finalize.ts', import.meta.url), 'utf8')
 const fixBatchSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261013130000_fix_batch_period_status.sql', import.meta.url), 'utf8')
+const reviewSrc = () => readFileSync(new URL('../lib/invoices/review.ts', import.meta.url), 'utf8')
+const reviewRouteSrc = () => readFileSync(
+  new URL('../app/api/invoices/[id]/review/route.ts', import.meta.url), 'utf8')
+const batchSrc = () => readFileSync(new URL('../lib/invoices/batch.ts', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -101,6 +105,10 @@ const textParser = await importTs('lib/ocr/text-parser.ts')
 // logic (truthful message + idempotent register scheduling + verified-ready read)
 // is exercised in-process against a fake query builder, not reimplemented.
 const finalize = await importTs('lib/whatsapp/finalize.ts')
+// batch.ts has only an erased `import type`, so the REAL shared batching +
+// idempotent register scheduling (used by BOTH extraction and human review) is
+// exercised in-process against a fake query builder, not reimplemented.
+const batch = await importTs('lib/invoices/batch.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -776,11 +784,13 @@ test('G5f extraction decrypts in-memory, routes review, and only enqueues the re
   assert.ok(s.includes("evaluation.review === 'approved' ? 'completed' : 'needs_review'"), 'approved->completed / else needs_review')
   assert.ok(s.includes('status: invoiceStatus'), 'invoice status routed from the mapped value')
   assert.ok(!s.includes("update({ status: evaluation.review })"), 'never write the invalid approved status to invoices')
-  // Scheduling is unconditional + deduped here; readiness is enforced in build_register
-  // (never gate the enqueue here or two workers finishing together can deadlock).
-  assert.ok(s.includes('await enqueueRegisterGeneration(db, args.workspaceId, batchId)'), 'register scheduled on approve')
+  // Scheduling is delegated to the shared batch module; extract calls resolveInvoiceBatch
+  // which internally does enqueueRegisterGeneration (unconditional + deduped).
+  assert.ok(s.includes('await resolveInvoiceBatch(db,'), 'batch + register scheduled via shared module')
+  const bs = batchSrc()
+  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId)'), 'register scheduled inside batch module')
   assert.ok(!s.includes('outstanding === 0'), 'extract must NOT gate scheduling on batch quiescence')
-  assert.ok(s.includes('max_attempts: 12'), 'register gets a readiness-retry attempt budget')
+  assert.ok(bs.includes('max_attempts: 12'), 'register gets a readiness-retry attempt budget')
   // Every read/write is tenant-scoped.
   assert.ok(s.includes(".eq('workspace_id', workspaceId).eq('id', invoiceId)"))
 })
@@ -1506,7 +1516,10 @@ function fakeDb(resolve) {
       then(res, rej) { run('all').then(res, rej) },
     }
   }
-  return { from: (table) => mk(table, 'select', []) }
+  return {
+    from: (table) => mk(table, 'select', []),
+    rpc: (name, args) => Promise.resolve(resolve({ table: '__rpc__', verb: 'rpc', name, args, filters: [], mode: 'rpc' })),
+  }
 }
 
 const FC = (o) => ({
@@ -1522,9 +1535,10 @@ test('M1 approved invoice with a valid date -> completed + batched + register sc
   const s = extractSrc()
   assert.ok(s.includes("evaluation.review === 'approved' ? 'completed' : 'needs_review'"))
   assert.ok(s.includes('if (evaluation.invoiceDateResolved) {'), 'batching gated on a resolved date, not approval')
-  assert.ok(s.includes('await finalizeInvoice(db, { workspaceId, invoiceId, jobId: job.id }, evaluation.row, invoice)'))
-  assert.ok(s.includes("db.rpc('ensure_invoice_batch'"))
-  assert.ok(s.includes('await enqueueRegisterGeneration(db, args.workspaceId, batchId)'), 'register enqueued for the batch')
+  assert.ok(s.includes('await resolveInvoiceBatch(db, {'), 'shared module called for batching')
+  const bs = batchSrc()
+  assert.ok(bs.includes("db.rpc('ensure_invoice_batch'"), 'batch RPC used within the shared module')
+  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId)'), 'register enqueued within the shared module')
 })
 
 test('M2 needs_review invoice with a reliable date is batched WITHOUT being approved', () => {
@@ -1548,8 +1562,8 @@ test('M3 missing/ambiguous invoice date never falls back to the upload month', (
   const s = extractSrc()
   assert.ok(!s.includes('monthOfTimestamp'), 'no upload-month helper remains')
   assert.ok(!s.includes('periodDate'), 'no silent received_at period fallback variable')
-  const fin = s.slice(s.indexOf('async function finalizeInvoice'))
-  assert.match(fin, /if \(!iso\) return/, 'no reliable date -> invoice stays unbatched')
+  const bs = batchSrc()
+  assert.match(bs, /if \(!iso\) return/, 'no reliable date -> invoice stays unbatched')
   assert.ok(finalizeSrc().includes("eq('status', 'needs_review').is('batch_id', null)"), 'unbatched review invoices are counted for attention')
 })
 
@@ -1626,9 +1640,9 @@ test('M6b a concurrent duplicate register enqueue (23505) is a benign no-op, not
 })
 
 test('M7 multiple months / clients resolve to separate batches and one workbook per batch', () => {
-  const s = extractSrc()
-  assert.ok(s.includes('p_client: invoice.client_id'), 'batch scoped to the invoice client (orgs never mix clients)')
-  assert.ok(s.includes('const { start, end } = monthBounds(iso)'), 'period derived ONLY from the parsed date')
+  const bs = batchSrc()
+  assert.ok(bs.includes('p_client: invoice.client_id'), 'batch scoped to the invoice client (orgs never mix clients)')
+  assert.ok(bs.includes('const { start, end } = monthBounds(iso)'), 'period derived ONLY from the parsed date')
   assert.ok(registerSrc().includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'one deterministic workbook per batch, never merged')
   assert.ok(registerSrc().includes("in('invoice_id', invoiceIds)"), 'outstanding extraction also checked via invoice membership')
 })
@@ -1668,5 +1682,142 @@ test('M9 a workbook is reported ready only after its row + stored file exist', a
   assert.deepEqual(c.readyWorkbookIds, ['w1'])
   const s = registerSrc()
   assert.ok(s.indexOf('.upload(exportPath') < s.indexOf("from('generated_workbooks').insert"), 'ready row is written only after the encrypted file is stored')
+})
+
+// ---- N: shared batching + the human-review -> approve -> register -> workbook chain ----
+
+function batchHarness({ liveRegister = false, rpcId = 'BATCH-1' } = {}) {
+  const ops = { rpc: [], invoiceUpdate: [], jobUpdate: [], jobDelete: 0, liveSelect: 0, inserts: [] }
+  const db = fakeDb(({ table, verb, args, filters }) => {
+    if (table === '__rpc__') { ops.rpc.push(args); return { data: rpcId, error: null } }
+    if (table === 'invoices') {
+      const u = filters.find((f) => f.update)?.update
+      if (u) ops.invoiceUpdate.push(u)
+      return { data: null, error: null }
+    }
+    if (table === 'processing_jobs') {
+      if (verb === 'delete') { ops.jobDelete += 1; return { error: null } }
+      if (verb === 'select') { ops.liveSelect += 1; return { data: liveRegister ? [{ id: 'live' }] : [], error: null } }
+      if (verb === 'insert') {
+        const ins = filters.find((f) => f.insert)?.insert
+        if (ins) ops.inserts.push(ins)
+        return { error: null }
+      }
+      const u = filters.find((f) => f.update)?.update
+      if (u) ops.jobUpdate.push(u)
+      return { error: null }
+    }
+    return { data: null, count: 0, error: null }
+  })
+  return { db, ops }
+}
+
+test('N1 approved+dated invoice resolves the correct month batch from the invoice DATE and schedules a register', async () => {
+  const { db, ops } = batchHarness()
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', jobId: 'JOB',
+    row: { invoice_date: '2026-05-17' }, invoice: { client_id: 'C1', batch_id: null },
+  })
+  assert.equal(batchId, 'BATCH-1')
+  assert.equal(ops.rpc.length, 1, 'resolved the batch via the idempotent RPC')
+  assert.equal(ops.rpc[0].p_client, 'C1', 'batch is client-scoped (org clients never mix)')
+  assert.equal(ops.rpc[0].p_start, '2026-05-01')
+  assert.equal(ops.rpc[0].p_end, '2026-05-31', 'period derived from the invoice date, not the upload date')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1' }], 'invoice linked to its batch')
+  assert.equal(ops.inserts.length, 1)
+  assert.equal(ops.inserts[0].job_type, 'register_generation')
+  assert.equal(ops.inserts[0].batch_id, 'BATCH-1')
+})
+
+test('N2 no reliable invoice date never guesses a month: stays unbatched, no batch, no register job', async () => {
+  const { db, ops } = batchHarness()
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', jobId: 'JOB',
+    row: { invoice_date: '' }, invoice: { client_id: 'C1', batch_id: null },
+  })
+  assert.equal(batchId, null, 'undated invoice is NOT filed into a guessed month')
+  assert.equal(ops.rpc.length, 0)
+  assert.equal(ops.inserts.length, 0, 'no register job scheduled for an unbatched invoice')
+})
+
+test('N3 already-batched + live register -> reuse and dedup, never a duplicate batch or workbook job', async () => {
+  const { db, ops } = batchHarness({ liveRegister: true })
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', jobId: 'JOB',
+    row: { invoice_date: '2026-05-17' }, invoice: { client_id: 'C1', batch_id: 'BATCH-0' },
+  })
+  assert.equal(batchId, 'BATCH-0', 'reuses the existing batch')
+  assert.equal(ops.rpc.length, 0, 'no second batch created')
+  assert.equal(ops.invoiceUpdate.length, 0, 'invoice link untouched')
+  assert.equal(ops.inserts.length, 0, 'a live register job already exists -> no duplicate enqueue')
+})
+
+test('N4 a concurrent duplicate register enqueue (23505) is a benign no-op, not an error', async () => {
+  const db = fakeDb(({ table, verb }) => {
+    if (table === '__rpc__') return { data: 'BATCH-1', error: null }
+    if (table === 'invoices') return { data: null, error: null }
+    if (table === 'processing_jobs') {
+      if (verb === 'select') return { data: [], error: null }
+      if (verb === 'insert') return { error: { code: '23505' } }
+      return { error: null }
+    }
+    return { data: [], count: 0, error: null }
+  })
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', row: { invoice_date: '2026-03-01' }, invoice: { client_id: null, batch_id: null },
+  })
+  assert.equal(batchId, 'BATCH-1', 'a 23505 means a live job already exists; never thrown')
+  assert.equal(batch.monthBounds('2026-02-10').end, '2026-02-28', 'non-leap February month-end is exact')
+})
+
+test('N5 extraction uses the SHARED batching module (no duplicated finalize/month logic left behind)', () => {
+  const s = extractSrc()
+  assert.ok(s.includes("import { resolveInvoiceBatch } from '@/lib/invoices/batch'"), 'extraction imports the shared module')
+  assert.ok(s.includes('await resolveInvoiceBatch(db, {'), 'and calls it')
+  assert.ok(!s.includes('async function finalizeInvoice'), 'the private finalize helper is gone')
+  assert.ok(!s.includes('const monthBounds ='), 'the private monthBounds is gone')
+  assert.ok(!s.includes('async function enqueueRegisterGeneration'), 'the private enqueue helper is gone')
+})
+
+test('N6 applyInvoiceReview: human input wins, gaps come only from already-valid values, approval batches + enqueues', () => {
+  const s = reviewSrc()
+  assert.ok(s.includes('mergeCandidates(args.corrections, existing)'), 'corrections are PRIMARY; engine values only fill genuine gaps (never invented)')
+  assert.ok(s.includes('evaluateLedger(merged'), 'the merge is re-evaluated independently')
+  assert.ok(s.includes("confidence_source: 'human'"), 'a human-confirmed row is attributed to human, not a fake engine')
+  assert.ok(s.includes('review_status: evaluation.review'), 'review outcome drives the stored status')
+  assert.ok(s.includes("evaluation.review === 'approved' ? 'completed' : 'needs_review'"), 'approved -> completed, else stays reviewable')
+  assert.ok(s.includes("evaluation.review === 'approved' && evaluation.invoiceDateResolved"), 'batching gated on approval AND a reliable date')
+  assert.ok(s.includes('resolveInvoiceBatch(db,'), 'approval joins/creates the batch + enqueues register via the shared path')
+  assert.ok(s.includes("throw new Error('REVIEW_INVOICE_NOT_FOUND')"), 'unknown/other-tenant invoice is refused')
+})
+
+test('N7 the review entrypoint authenticates + isolates tenants before mutating anything', () => {
+  const s = reviewRouteSrc()
+  const authGate = s.indexOf("deny(401, 'UNAUTHENTICATED')")
+  const memberGate = s.indexOf("deny(403, 'NOT_MEMBER')")
+  const applyCall = s.indexOf('applyInvoiceReview(db,')
+  assert.ok(authGate > 0 && memberGate > authGate && applyCall > memberGate, '401 -> 403 -> apply precedence')
+  assert.ok(s.includes(".from('workspace_members')"), 'membership re-checked for tenant isolation')
+  assert.ok(s.includes(".select('id,workspace_id')"), 'workspace is taken from the INVOICE row, never the client body')
+  assert.ok(s.includes('workspaceId, invoiceId: id'), 'review is scoped to that workspace')
+})
+
+test('N8 WhatsApp Review is truthful: delivers a ready workbook now, or states what blocks it', () => {
+  const ready = finalize.composeReviewMessage(
+    FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'], needsReview: 2, missingDate: 1 }),
+    { link: 'https://x/api/exports/w1/download' },
+  )
+  assert.match(ready, /register is ready/)
+  assert.ok(ready.includes('https://x/api/exports/w1/download'), 'ready link handed over immediately, not deferred to a future message')
+  assert.match(ready, /2 invoice\(s\) still need review/)
+  const blocked = finalize.composeReviewMessage(FC({ needsReview: 2, missingDate: 1 }))
+  assert.match(blocked, /need review before a register can be built/)
+  assert.match(blocked, /1 have no clear invoice date/)
+  assert.ok(!/register is ready/i.test(blocked), 'no false ready claim while review is outstanding')
+  const clear = finalize.composeReviewMessage(FC({}))
+  assert.match(clear, /Nothing needs your attention/)
+  const r = routeSrc()
+  assert.ok(r.includes('composeReviewMessage(counts, { link })'), 'the Review command renders the truthful body')
+  assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Review reads current verified state')
 })
 
