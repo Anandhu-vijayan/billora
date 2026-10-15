@@ -20,12 +20,14 @@ import { bucketFor } from '@/lib/supabase/server'
 import { logger } from '@/lib/logger'
 import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   decryptFile, deriveKeyVersion, isMediaDecryptFailure, resolveFileKeyConfig,
 } from '@/lib/encryption/files'
 import { encryptExtractedPayload } from '@/lib/encryption'
 import { evaluateLedger } from '@/lib/ocr/ledger'
 import { resolveInvoiceBatch } from '@/lib/invoices/batch'
+import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
 import {
   extractInvoice as runExtraction,
   InvoiceExtractionError,
@@ -45,8 +47,10 @@ interface InvoiceRow {
   received_at: string
 }
 
+type Db = SupabaseClient
+
 export async function extractInvoice(ctx: JobContext): Promise<void> {
-  const { db, job } = ctx
+  const { db, job, assertLease } = ctx
   if (!job.invoice_id) throw new PermanentJobError('EXTRACT_MISSING_TARGET: invoice job without invoice_id')
   const invoiceId = job.invoice_id
   const workspaceId = job.workspace_id
@@ -59,8 +63,8 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     .select('review_status')
     .eq('workspace_id', workspaceId).eq('invoice_id', invoiceId).maybeSingle()
   if (existing && existing.review_status === 'approved') {
-    await resolveInvoiceBatch(db, { workspaceId, invoiceId, jobId: job.id })
-    logger.info('[Extract] already approved; skipping provider call', { invoice: invoiceId.slice(0, 8) })
+    await resolveInvoiceBatch(db, { workspaceId, invoiceId, jobId: job.id, assertLease })
+    logger.info('[Extract] already approved; skipping provider call', { invoiceId, jobId: job.id })
     return
   }
 
@@ -137,7 +141,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     // indistinguishable from a model failure in the logs.
     if (confidenceSource === 'human' && evaluation.review === 'needs_review') {
       logger.warn('[Extract] no extractor available: local OCR missed and AI is gated off', {
-        invoice: invoiceId.slice(0, 8),
+        invoiceId, jobId: job.id,
         mime: invoice.content_type,
         aiGate: env.EXTRACTION_ALLOW_AI !== true ? 'EXTRACTION_ALLOW_AI is not true' : 'EXTRACTION_AI_TIER is not paid',
         reasons: evaluation.reasons.slice(0, 4),
@@ -147,6 +151,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     const keyVersion = deriveKeyVersion(masterKeyHex)
     const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
 
+    await assertLease()
     const { error: recErr } = await db.from('extracted_records').upsert({
       workspace_id: workspaceId,
       invoice_id: invoiceId,
@@ -157,12 +162,18 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'invoice_id' })
     if (recErr) throw new Error(`RECORD_WRITE_ERROR: ${recErr.message}`)
+    logger.info('[Extract] result saved', {
+      invoiceId, jobId: job.id, review: evaluation.review,
+      source: confidenceSource, confidence: evaluation.confidence,
+      reasonCodes: evaluation.reasons.slice(0, 8),
+    })
 
     // Route the invoice status. The invoices.status CHECK allows 'completed' but
     // NOT 'approved' ('approved' is an extracted_records.review_status value, not
     // an invoice lifecycle state), so a clean extraction lands as 'completed' and
     // anything unresolved as 'needs_review'.
     const invoiceStatus = evaluation.review === 'approved' ? 'completed' : 'needs_review'
+    await assertLease()
     const { error: stErr } = await db.from('invoices').update({ status: invoiceStatus })
       .eq('workspace_id', workspaceId).eq('id', invoiceId)
     if (stErr) throw new Error(`INVOICE_STATUS_ERROR: ${stErr.message}`)
@@ -173,19 +184,53 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     // items. When the date is missing/ambiguous we NEVER guess the upload month —
     // the invoice stays unbatched and visible in the review workflow instead.
     if (evaluation.invoiceDateResolved) {
-      await resolveInvoiceBatch(db, { workspaceId, invoiceId, jobId: job.id, row: evaluation.row, invoice })
+      const batchId = await resolveInvoiceBatch(db, {
+        workspaceId, invoiceId, jobId: job.id, row: evaluation.row, invoice, assertLease,
+      })
+      logger.info('[Extract] batch assignment complete', { invoiceId, jobId: job.id, batchId })
     } else {
       logger.info('[Extract] no reliable invoice date; left unbatched for review', {
-        invoice: invoiceId.slice(0, 8), reasons: evaluation.reasons.slice(0, 4),
+        invoiceId, jobId: job.id, reasonCodes: evaluation.reasons.slice(0, 8),
       })
     }
-    logger.info('[Extract] done', {
-      invoice: invoiceId.slice(0, 8), review: evaluation.review,
-      source: confidenceSource, reasons: evaluation.reasons.slice(0, 4),
-      mime: invoice.content_type, pages: result.pagesProcessed,
+    if (evaluation.review === 'needs_review') {
+      await queueReviewNotice(db, workspaceId, job.id, invoiceId, assertLease)
+    }
+    logger.info('[Extract] complete', {
+      invoiceId, jobId: job.id, review: evaluation.review,
+      source: confidenceSource, reasonCodes: evaluation.reasons.slice(0, 8),
+      mimeType: invoice.content_type, pagesProcessed: result.pagesProcessed,
     })
   } finally {
     plain.fill(0) // wipe plaintext bytes on every exit path (approve, review, throw)
   }
+}
+
+async function queueReviewNotice(
+  db: Db,
+  workspaceId: string,
+  jobId: string,
+  invoiceId: string,
+  assertLease: () => Promise<void>,
+): Promise<void> {
+  const { data, error } = await db.from('whatsapp_identities').select('sender_hmac')
+    .eq('workspace_id', workspaceId).limit(1)
+  if (error) {
+    logger.warn('[Extract] review notice deferred: sender lookup failed', { invoiceId, jobId, code: error.code ?? null })
+    return
+  }
+  const senderHmac = (data?.[0]?.sender_hmac as string | undefined) ?? null
+  if (!senderHmac) {
+    logger.info('[Extract] review notice unavailable: no WhatsApp sender linked', { invoiceId, jobId })
+    return
+  }
+  await assertLease()
+  const queued = await updateSessionDeliveryState(db, senderHmac, {
+    pending_reply_body: 'One or more invoices need review and are not included in an Excel register until corrected. Reply Review or choose Menu > Review to see what needs attention.',
+    last_reply_error_code: null,
+  })
+  logger.info(queued
+    ? '[Extract] review notice queued for next inbound message'
+    : '[Extract] review notice deferred: delivery state could not be saved', { invoiceId, jobId })
 }
 

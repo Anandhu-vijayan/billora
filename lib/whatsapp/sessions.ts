@@ -164,13 +164,15 @@ export async function updateSessionDeliveryState(
     pending_reply_body?: string | null
     upload_ack_sent_at?: string | null
   },
-): Promise<void> {
+): Promise<boolean> {
   const { error } = await db.from('whatsapp_sessions').update(patch).eq('sender_hmac', senderHmac)
   if (error) {
     logger.error('[WhatsApp] delivery-state update failed', {
       kind: classifyDbError(error.code, error.message), ...safeDbFields(error),
     })
+    return false
   }
+  return true
 }
 
 /**

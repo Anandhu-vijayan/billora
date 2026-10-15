@@ -240,7 +240,7 @@ test('C3 logs carry no PII: no raw phones, bodies, or full provider ids', () => 
   assert.ok(!/logger\.[a-z]+\([^)]*accessToken\s*:/.test(send + media), 'must not log access token')
   assert.ok(!/logger\.[a-z]+\([^)]*textBody\s*:/.test(route), 'must not log message body')
   assert.match(route, /shortId/)
-  assert.match(send, /shortId: messageId\.slice\(-8\)/)
+  assert.match(send, /providerMessageIdSuffix: messageId\?\.slice\(-8\)/)
 })
 test('A7 session snapshot carries workspace/client/batch + idempotency key', () => {
   const s = snap('collecting', { workspaceId: 'w1', clientId: 'c1', batchId: 'b1', lastProviderMessageId: 'wamid.9' })
@@ -498,10 +498,18 @@ test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes suc
   assert.match(worker, /if \(jobTypes\.length === 0\)/)
   assert.match(queue, /if \(args\.jobTypes\.length === 0\) return \[\]/)
   assert.match(worker, /registerJobHandler/)
+  assert.match(worker, /while \(result\.claimed < maxJobs\)/)
+  assert.match(worker, /claimJobs\(db, \{ worker, jobTypes, limit: 1, leaseSeconds \}\)/)
   // Lease is renewed while the handler runs, and released afterwards.
   assert.match(worker, /startHeartbeat\(db, job, worker, leaseSeconds\)/)
   assert.match(worker, /renewLease\(db, job\.id, worker, leaseSeconds\)/)
-  assert.match(worker, /stopHeartbeat\(\)/)
+  assert.match(worker, /heartbeat\.stop\(\)/)
+  assert.match(worker, /JOB_LEASE_RENEWAL_UNCONFIRMED/)
+  assert.match(worker, /assertLease: heartbeat\.assertOwned/)
+  assert.match(worker, /await heartbeat\.assertOwned\(\)/)
+  assert.match(worker, /new JobLeaseLostError\('JOB_LEASE_RENEWAL_REFUSED'\)/)
+  assert.match(worker, /Math\.floor\(\(leaseSeconds \* 1000\) \/ 4\)/, 'heartbeat renews every quarter lease')
+  assert.match(worker, /randomUUID\(\)}/, 'simultaneous worker requests have distinct owner IDs')
   // A lost lease means our write is discarded, reported as fenced — not success.
   assert.match(worker, /const owned = await completeJob\(db, job\.id, worker\)/)
   assert.match(worker, /else result\.fenced \+= 1/)
@@ -790,8 +798,13 @@ test('G5f extraction decrypts in-memory, routes review, and only enqueues the re
   // Scheduling is delegated to the shared batch module; extract calls resolveInvoiceBatch
   // which internally does enqueueRegisterGeneration (unconditional + deduped).
   assert.ok(s.includes('await resolveInvoiceBatch(db,'), 'batch + register scheduled via shared module')
+  assert.match(s, /await assertLease\(\)[\s\S]*?from\('extracted_records'\)\.upsert/)
+  assert.match(s, /\[Extract\] result saved/)
+  assert.match(s, /\[Extract\] batch assignment complete/)
+  assert.match(s, /queueReviewNotice\(db, workspaceId, job\.id, invoiceId, assertLease\)/)
+  assert.match(s, /Reply Review or choose Menu > Review/)
   const bs = batchSrc()
-  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId)'), 'register scheduled inside batch module')
+  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)'), 'register scheduled inside batch module')
   assert.ok(!s.includes('outstanding === 0'), 'extract must NOT gate scheduling on batch quiescence')
   assert.ok(bs.includes('max_attempts: 12'), 'register gets a readiness-retry attempt budget')
   // Every read/write is tenant-scoped.
@@ -820,6 +833,11 @@ test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, ver
   // No raw bucket/signed URL is ever handed out for an encrypted object.
   assert.ok(!s.includes('createSignedUrl'), 'encrypted workbook must not be served via a raw signed URL')
   assert.ok(s.includes('status: \'expired\''), 'prior workbook retired (freshness)')
+  assert.match(s, /\[Register\] workbook generated/)
+  assert.match(s, /\[Register\] workbook stored/)
+  assert.match(s, /\[Register\] workbook ready/)
+  assert.match(s, /need review and are not included/)
+  assert.match(s, /await assertLease\(\)/)
   assert.match(s, /version, generated_at: new Date\(\)/)
   // Delivery links to OUR authenticated route, gated on PUBLIC_APP_URL.
   assert.ok(s.includes('/api/exports/${workbookId}/download'), 'delivery via authenticated route')
@@ -834,6 +852,21 @@ test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, ver
   assert.ok(s.includes('SEND_DEFERRED'))
   // A batch with nothing approved is a no-op completion, not a failure.
   assert.match(s, /rows\.length === 0[\s\S]*return/)
+})
+
+test('E7 WhatsApp send and delivery callbacks log Meta response metadata without credentials', () => {
+  const send = sendSrc()
+  const route = routeSrc()
+  assert.match(send, /\[WhatsApp\] Meta send response/)
+  for (const field of ['httpStatus', 'providerMessageIdSuffix', 'providerErrorCode', 'providerErrorSubcode', 'providerTraceId']) {
+    assert.ok(send.includes(field), `send response logs ${field}`)
+  }
+  assert.match(route, /\[WhatsApp\] delivery status received/)
+  assert.match(route, /providerMessageIdSuffix: delivery\.id\?\.slice\(-8\)/)
+  assert.match(route, /workbookId \? \{ workbookId \} : undefined/)
+  assert.match(send, /headers: \{ Authorization: `Bearer \$\{token\}`/)
+  const loggedFields = send.split(/logger\.(?:info|warn|error|debug)\(/).slice(1).join('\n')
+  assert.ok(!/logger\.[a-z]+\([^)]*\btoken\b/i.test(loggedFields), 'authorization token is never logged')
 })
 
 test('G6c Stage-3 migration wires batch linkage, register dedup, and the batch RPC (service-role only)', () => {
@@ -1554,7 +1587,7 @@ test('M1 approved invoice with a valid date -> completed + batched + register sc
   assert.ok(s.includes('await resolveInvoiceBatch(db, {'), 'shared module called for batching')
   const bs = batchSrc()
   assert.ok(bs.includes("db.rpc('ensure_invoice_batch'"), 'batch RPC used within the shared module')
-  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId)'), 'register enqueued within the shared module')
+  assert.ok(bs.includes('await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)'), 'register enqueued within the shared module')
 })
 
 test('M2 needs_review invoice with a reliable date is batched WITHOUT being approved', () => {

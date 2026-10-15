@@ -49,7 +49,7 @@ async function findOwnerSenderHmac(db: Db, workspaceId: string): Promise<string 
 }
 
 export async function buildRegister(ctx: JobContext): Promise<void> {
-  const { db, job } = ctx
+  const { db, job, assertLease } = ctx
   const workspaceId = job.workspace_id
   if (!job.batch_id) throw new PermanentJobError('REGISTER_MISSING_BATCH')
   const batchId = job.batch_id
@@ -101,7 +101,7 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     .from('invoices').select('id', { count: 'exact', head: true })
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).eq('status', 'needs_review')
   if ((flagged ?? 0) > 0) {
-    logger.info('[Register] batch has invoices awaiting review', { batch: batchId.slice(0, 8), needsReview: flagged })
+    logger.info('[Register] batch has invoices awaiting review', { batchId, jobId: job.id, needsReview: flagged })
   }
 
   if (invoiceIds.length === 0) return // nothing to do; completes as a no-op
@@ -127,11 +127,13 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   }
 
   if (rows.length === 0) {
-    logger.info('[Register] no approved rows to render; completing as no-op', { batch: batchId.slice(0, 8) })
+    logger.info('[Register] no approved rows to render; completing as no-op', { batchId, jobId: job.id, needsReview: flagged ?? 0 })
     return // a "no approved rows" batch is a successful no-op, not a failure
   }
 
+  logger.info('[Register] workbook generation started', { batchId, jobId: job.id, rowCount: rows.length })
   const workbook = await buildComplianceExcelWorkbook(rows)
+  logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')
   // Encrypt the register AT REST: vendor names, GSTINs and amounts are customer
@@ -139,15 +141,20 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   // logical spreadsheetml type + extension are retained as object metadata so
   // the download route can name the file it streams after decrypting in memory.
   const enc = encryptFile(workbook, masterKeyHex, { context: exportPath })
+  await assertLease()
   const { error: upErr } = await db.storage.from(exportsBucket)
     .upload(exportPath, enc.container, {
       contentType: 'application/octet-stream', upsert: true,
       metadata: { original_mime: SPREADSHEET_MIME, original_extension: 'xlsx' },
     })
   if (upErr) throw new Error(`WORKBOOK_UPLOAD_ERROR: ${upErr.message}`)
+  logger.info('[Register] workbook stored', {
+    batchId, jobId: job.id, sizeBytes: enc.sizeBytes, rowCount: rows.length,
+  })
 
   // Freshness: retire prior workbooks for this batch, then insert the new one
   // with a monotonic version. The insert is what makes it the current register.
+  await assertLease()
   await db.from('generated_workbooks')
     .update({ status: 'expired' })
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).in('status', ['ready', 'sent'])
@@ -156,6 +163,7 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   const version = ((prior ?? [])[0]?.version as number | undefined ?? 0) + 1
 
   const expiresAt = new Date(Date.now() + WORKBOOK_LINK_TTL_SECONDS * 1000).toISOString()
+  await assertLease()
   const { data: inserted, error: gwErr } = await db.from('generated_workbooks').insert({
     workspace_id: workspaceId, batch_id: batchId, file_object_path: exportPath,
     file_encryption_key_version: enc.keyVersion, size_bytes: enc.sizeBytes,
@@ -163,9 +171,10 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   }).select('id').single()
   if (gwErr || !inserted) throw new Error(`WORKBOOK_ROW_ERROR: ${gwErr?.message ?? 'no id'}`)
   const workbookId = (inserted as { id: string }).id
+  logger.info('[Register] workbook ready', { workbookId, batchId, jobId: job.id, rowCount: rows.length })
 
   // Delivery is best-effort and NEVER fails the generation job (rule 5).
-  await scheduleDelivery(db, workspaceId, workbookId, rows.length, expiresAt)
+  await scheduleDelivery(db, workspaceId, workbookId, job.id, rows.length, flagged ?? 0, expiresAt, assertLease)
 }
 
 /**
@@ -176,28 +185,43 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
  * pending reply is send-only bookkeeping — a failure here cannot fail the
  * generation job (rule 5), and the workbook row persists for a later retry.
  */
-async function scheduleDelivery(db: Db, workspaceId: string, workbookId: string, rowCount: number, expiresAt: string): Promise<void> {
+async function scheduleDelivery(
+  db: Db,
+  workspaceId: string,
+  workbookId: string,
+  jobId: string,
+  rowCount: number,
+  needsReview: number,
+  expiresAt: string,
+  assertLease: () => Promise<void>,
+): Promise<void> {
   try {
     const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
     if (!base) {
       // No public origin configured: the register is stored + ready, but we have
       // no safe way to hand out a link, so delivery is honestly deferred.
-      logger.info('[Register] PUBLIC_APP_URL unset; workbook ready, delivery deferred', { workspace: workspaceId.slice(0, 8) })
+      logger.info('[Register] public URL unset; workbook ready, delivery deferred', { workbookId, jobId })
       return
     }
     const senderHmac = await findOwnerSenderHmac(db, workspaceId)
     if (!senderHmac) {
-      logger.info('[Register] no linked WhatsApp sender; workbook ready for later delivery', { workspace: workspaceId.slice(0, 8) })
+      logger.info('[Register] no linked WhatsApp sender; workbook ready for later delivery', { workbookId, jobId })
       return
     }
     const link = `${base}/api/exports/${workbookId}/download`
-    const body = `Your invoice register is ready — ${rowCount} invoice(s). Secure download (sign in required): ${link} (valid until ${expiresAt}).`
-    await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
-    logger.info('[Register] delivery queued on next inbound reply', { workspace: workspaceId.slice(0, 8) })
+    const reviewNote = needsReview > 0
+      ? ` ${needsReview} invoice(s) need review and are not included. Reply Review or choose Menu > Review.`
+      : ''
+    const body = `Your invoice register is ready — ${rowCount} invoice(s). Secure download (sign in required): ${link} (valid until ${expiresAt}).${reviewNote}`
+    await assertLease()
+    const queued = await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
+    logger.info(queued
+      ? '[Register] delivery queued for next inbound reply'
+      : '[Register] delivery deferred: delivery state could not be saved', { workbookId, jobId, rowCount })
   } catch (e) {
     // Delivery is orthogonal to generation; swallow so the job still completes.
     logger.warn('[Register] SEND_DEFERRED: delivery scheduling failed', {
-      error: e instanceof Error ? e.message : String(e),
+      jobId, workbookId, error: e instanceof Error ? e.message : String(e),
     })
   }
 }

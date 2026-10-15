@@ -28,6 +28,8 @@ export interface JobContext {
   worker: string
   /** Remaining lease in seconds; long handlers should checkpoint often. */
   leaseSeconds: number
+  /** Renews and verifies ownership before a handler commits durable output. */
+  assertLease(): Promise<void>
 }
 
 export type JobHandler = (ctx: JobContext) => Promise<void>
@@ -81,25 +83,57 @@ const tickLimit = (): number => {
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 25) : 3
 }
 
-/**
- * Keep the lease alive while a handler runs. Renewal is best-effort: if it
- * starts failing the handler still finishes and its write gets fenced, which is
- * the correct outcome for a worker that cannot reach the database.
- */
-function startHeartbeat(db: Db, job: ClaimedJob, worker: string, leaseSeconds: number): () => void {
-  const everyMs = Math.max(5_000, Math.floor((leaseSeconds * 1000) / 3))
-  const timer = setInterval(() => {
-    renewLease(db, job.id, worker, leaseSeconds)
-      .then((ok) => {
-        if (!ok) logger.warn('[Worker] lease renewal refused; result will be fenced', { job: job.id.slice(0, 8) })
+export class JobLeaseLostError extends Error {
+  override name = 'JobLeaseLostError'
+}
+
+interface LeaseHeartbeat {
+  assertOwned(): Promise<void>
+  stop(): void
+}
+
+/** Renew often and fail closed if ownership cannot be confirmed. */
+function startHeartbeat(db: Db, job: ClaimedJob, worker: string, leaseSeconds: number): LeaseHeartbeat {
+  const everyMs = Math.max(1_000, Math.floor((leaseSeconds * 1000) / 4))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let inFlight: Promise<void> | null = null
+  let lost: JobLeaseLostError | null = null
+  let stopped = false
+
+  const renew = (): Promise<void> => {
+    if (lost) return Promise.reject(lost)
+    if (inFlight) return inFlight
+    inFlight = renewLease(db, job.id, worker, leaseSeconds).then((owned) => {
+      if (!owned) throw new JobLeaseLostError('JOB_LEASE_RENEWAL_REFUSED')
+    }).catch((error: unknown) => {
+      lost = error instanceof JobLeaseLostError
+        ? error
+        : new JobLeaseLostError('JOB_LEASE_RENEWAL_UNCONFIRMED')
+      logger.error('[Worker] lease ownership lost or unconfirmed', {
+        jobId: job.id, worker, reason: lost.message,
       })
-      .catch((e: unknown) => {
-        logger.warn('[Worker] lease renewal error', {
-          job: job.id.slice(0, 8), error: e instanceof Error ? e.message : String(e),
-        })
-      })
-  }, everyMs)
-  return () => clearInterval(timer)
+      throw lost
+    }).finally(() => {
+      inFlight = null
+    })
+    return inFlight
+  }
+
+  const schedule = (): void => {
+    if (stopped || lost) return
+    timer = setTimeout(() => {
+      void renew().then(schedule, () => undefined)
+    }, everyMs)
+  }
+  schedule()
+
+  return {
+    assertOwned: renew,
+    stop() {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    },
+  }
 }
 
 /**
@@ -111,7 +145,7 @@ export async function runWorkerTick(
   db: Db,
   args?: { worker?: string; limit?: number; leaseSeconds?: number },
 ): Promise<TickResult> {
-  const worker = args?.worker ?? `w_${randomUUID().slice(0, 8)}`
+  const worker = args?.worker ?? `w_${randomUUID()}`
   const leaseSeconds = args?.leaseSeconds ?? JOB_LEASE_SECONDS
   const result: TickResult = {
     worker, recovered: 0, claimed: 0, completed: 0, requeued: 0, failed: 0, fenced: 0, idle: true,
@@ -139,21 +173,17 @@ export async function runWorkerTick(
   }
 
   const deadline = Date.now() + budgetMs()
-  const batch = await claimJobs(db, {
-    worker, jobTypes, limit: args?.limit ?? tickLimit(), leaseSeconds,
-  })
-  result.idle = batch.length === 0
-
-  for (const job of batch) {
-    // Time budget exhausted: stop taking more work. These rows keep their
-    // lease and recovery returns them to the queue if we never come back.
+  const maxJobs = Math.min(Math.max(1, args?.limit ?? tickLimit()), 25)
+  while (result.claimed < maxJobs) {
     if (Date.now() > deadline || (result.claimed > 0 && Date.now() > deadline - minJobWindowMs())) {
-      logger.warn('[Worker] tick budget reached; leaving remaining leases to lapse', {
-        worker, remaining: batch.length - result.claimed,
-      })
+      logger.info('[Worker] tick budget reached before next claim', { worker, claimed: result.claimed })
       break
     }
+    const batch = await claimJobs(db, { worker, jobTypes, limit: 1, leaseSeconds })
+    const job = batch[0]
+    if (!job) break
     result.claimed += 1
+    result.idle = false
     const handler = handlers.get(job.job_type)
     if (!handler) {
       // Defensive: registeredJobTypes() should prevent this. Requeue without
@@ -166,13 +196,22 @@ export async function runWorkerTick(
       continue
     }
 
-    const stopHeartbeat = startHeartbeat(db, job, worker, leaseSeconds)
+    const heartbeat = startHeartbeat(db, job, worker, leaseSeconds)
     try {
-      await handler({ db, job, worker, leaseSeconds })
+      await handler({ db, job, worker, leaseSeconds, assertLease: heartbeat.assertOwned })
+      await heartbeat.assertOwned()
       const owned = await completeJob(db, job.id, worker)
       if (owned) result.completed += 1
-      else result.fenced += 1
+      else {
+        result.fenced += 1
+        logger.warn('[Worker] completion fenced after handler', { jobId: job.id, worker })
+      }
     } catch (e: unknown) {
+      if (e instanceof JobLeaseLostError) {
+        result.fenced += 1
+        logger.warn('[Worker] handler stopped after lease loss', { jobId: job.id, worker })
+        continue
+      }
       const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
       const code = detail.split(':')[0] || 'JOB_HANDLER_ERROR'
       const permanent = isPermanentJobFailure(e)
@@ -189,11 +228,11 @@ export async function runWorkerTick(
       else if (outcome === 'failed') result.failed += 1
       else result.fenced += 1
       logger.warn('[Worker] job failed', {
-        job: job.id.slice(0, 8), type: job.job_type, attempt: job.attempts,
+        jobId: job.id, type: job.job_type, attempt: job.attempts,
         outcome, error: code, detail: detail.slice(0, 200),
       })
     } finally {
-      stopHeartbeat()
+      heartbeat.stop()
     }
   }
 

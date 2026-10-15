@@ -57,7 +57,13 @@ export function monthBounds(dateIso: string): { start: string; end: string } {
  * example a second invoice approved after the first workbook shipped) can
  * re-enqueue; a concurrent 23505 is a benign no-op (a live job already exists).
  */
-export async function enqueueRegisterGeneration(db: Db, workspaceId: string, batchId: string): Promise<void> {
+export async function enqueueRegisterGeneration(
+  db: Db,
+  workspaceId: string,
+  batchId: string,
+  assertLease?: () => Promise<void>,
+): Promise<void> {
+  await assertLease?.()
   await db.from('processing_jobs')
     .delete()
     .eq('workspace_id', workspaceId)
@@ -70,6 +76,7 @@ export async function enqueueRegisterGeneration(db: Db, workspaceId: string, bat
     .eq('job_type', 'register_generation').in('status', ['queued', 'processing'])
     .limit(1)
   if ((live ?? []).length > 0) return
+  await assertLease?.()
   // A generous attempt budget: readiness requeues are expected while siblings
   // are still extracting, and must not exhaust into a settled-failed register.
   const { error } = await db.from('processing_jobs').insert({
@@ -101,6 +108,7 @@ export async function resolveInvoiceBatch(
     jobId?: string
     row?: DateBearingRow
     invoice?: BatchInvoiceRef
+    assertLease?: () => Promise<void>
   },
 ): Promise<string | null> {
   const { workspaceId, invoiceId } = args
@@ -127,11 +135,13 @@ export async function resolveInvoiceBatch(
       : null
     if (!iso) return null
     const { start, end } = monthBounds(iso)
+    await args.assertLease?.()
     const { data: batch, error: batchError } = await db.rpc('ensure_invoice_batch', {
       p_workspace: workspaceId, p_client: invoice.client_id ?? null, p_start: start, p_end: end,
     })
     if (batchError || !batch) throw new Error(`BATCH_ENSURE_ERROR: ${batchError?.message ?? 'no batch id'}`)
     batchId = String(batch)
+    await args.assertLease?.()
     const { error: linkErr } = await db.from('invoices').update({ batch_id: batchId })
       .eq('workspace_id', workspaceId).eq('id', invoiceId)
     if (linkErr) throw new Error(`BATCH_LINK_ERROR: ${linkErr.message}`)
@@ -142,12 +152,13 @@ export async function resolveInvoiceBatch(
   // the batch (previously extraction jobs kept a NULL batch_id, so the gate always
   // saw zero outstanding work and could build a premature workbook).
   if (args.jobId) {
+    await args.assertLease?.()
     await db.from('processing_jobs').update({ batch_id: batchId })
       .eq('workspace_id', workspaceId).eq('id', args.jobId).is('batch_id', null)
   }
 
   // Ensure the batch has a (deduped) register job scheduled. Readiness is
   // re-checked in build_register, so unconditional scheduling here is safe.
-  await enqueueRegisterGeneration(db, workspaceId, batchId)
+  await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)
   return batchId
 }

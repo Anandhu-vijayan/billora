@@ -50,6 +50,12 @@ interface IncomingMessage {
   text?: { body?: string }; image?: IncomingMedia; document?: IncomingMedia;
   interactive?: { type?: string; button_reply?: InteractiveReply; list_reply?: InteractiveReply };
 }
+interface DeliveryStatus {
+  id?: string
+  status?: string
+  timestamp?: string
+  errors?: Array<{ code?: number; title?: string; message?: string }>
+}
 
 /**
  * Provisioning + conditional persist FIRST, outbound sends SECOND.
@@ -296,7 +302,7 @@ export async function POST(request: Request) {
       return new Response('Forbidden', { status: 401 });
     }
     let payload: { entry?: Array<{ changes?: Array<{ value?: {
-      messages?: IncomingMessage[]; statuses?: Array<{ status?: string }>;
+      messages?: IncomingMessage[]; statuses?: DeliveryStatus[];
     } }> }> };
     try { payload = JSON.parse(rawText); }
     catch {
@@ -305,12 +311,22 @@ export async function POST(request: Request) {
       });
       return NextResponse.json({ status: 'SKIPPED_NON_JSON_BODY' }, { status: 200 });
     }
-    const value = payload.entry?.[0]?.changes?.[0]?.value;
-    const messages = value?.messages ?? [];
+    const changes = (payload.entry ?? []).flatMap((entry) => entry.changes ?? []);
+    const values = changes.map((change) => change.value).filter((value) => value !== undefined);
+    const messages = values.flatMap((value) => value?.messages ?? []);
+    const statuses = values.flatMap((value) => value?.statuses ?? []);
+    for (const delivery of statuses) {
+      logger.info('[WhatsApp] delivery status received', {
+        providerMessageIdSuffix: delivery.id?.slice(-8) ?? null,
+        status: delivery.status ?? 'unknown',
+        timestamp: delivery.timestamp ?? null,
+        errorCodes: (delivery.errors ?? []).map((error) => error.code).filter((code) => code !== undefined),
+      });
+    }
     if (messages.length === 0) {
       // Delivery receipts/statuses carry no inbound message to process.
       logger.info('[WhatsApp] non-message delivery skipped', {
-        hasMessages: !!value?.messages, statuses: value?.statuses?.[0]?.status ?? null,
+        hasMessages: messages.length > 0, statusCount: statuses.length,
       });
       return NextResponse.json({ status: 'SKIPPED_STATUS_UPDATE' }, { status: 200 });
     }
@@ -440,7 +456,8 @@ async function resendPendingReply(db: Db, hmac: string, to: string): Promise<voi
       .eq('sender_hmac', hmac).maybeSingle();
     const body = (data?.pending_reply_body as string | null) ?? null;
     if (!body) return;
-    const o = await sendText(to, body);
+    const workbookId = /\/api\/exports\/([0-9a-f-]{36})\/download/i.exec(body)?.[1];
+    const o = await sendText(to, body, workbookId ? { workbookId } : undefined);
     if (o === 'ok') {
       await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
       logger.info('[WhatsApp] deferred reply resent');

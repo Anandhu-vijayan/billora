@@ -19,7 +19,10 @@ function graphBase(): string {
   return `https://graph.facebook.com/${process.env.WHATSAPP_GRAPH_VERSION || 'v21.0'}`
 }
 
-async function postMessage(payload: Record<string, unknown>): Promise<SendOutcome> {
+async function postMessage(
+  payload: Record<string, unknown>,
+  correlation: { workbookId?: string } = {},
+): Promise<SendOutcome> {
   const token = process.env.WHATSAPP_ACCESS_TOKEN || ''
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || ''
   if (!token || !phoneNumberId) {
@@ -36,12 +39,30 @@ async function postMessage(payload: Record<string, unknown>): Promise<SendOutcom
       signal: ctrl.signal,
     })
     const body = (await res.json().catch(() => null)) as
-      { messages?: Array<{ id?: string }>; error?: { message?: string; code?: number } } | null
+      {
+        messages?: Array<{ id?: string }>
+        error?: { message?: string; code?: number; error_subcode?: number; type?: string; fbtrace_id?: string }
+      } | null
     const messageId = body?.messages?.[0]?.id
-    // Never claim success unless Meta confirms with a message id. Log only a
-    // short id label — never the full provider id or anything else.
+    const outcome: SendOutcome = res.ok && messageId
+      ? 'ok'
+      : res.status === 401 || res.status === 403
+        || (body?.error?.code !== undefined && BLOCKED_ERROR_CODES.has(body.error.code))
+        ? 'blocked'
+        : 'transient'
+    const responseFields = {
+      httpStatus: res.status,
+      outcome,
+      providerMessageIdSuffix: messageId?.slice(-8) ?? null,
+      providerErrorCode: body?.error?.code ?? null,
+      providerErrorSubcode: body?.error?.error_subcode ?? null,
+      providerErrorType: body?.error?.type ?? null,
+      providerTraceId: body?.error?.fbtrace_id ?? null,
+      ...correlation,
+    }
+    logger.info('[WhatsApp] Meta send response', responseFields)
+
     if (res.ok && messageId) {
-      logger.info('[WhatsApp] message sent', { shortId: messageId.slice(-8) })
       return 'ok'
     }
     const errorCode = body?.error?.code
@@ -53,7 +74,7 @@ async function postMessage(payload: Record<string, unknown>): Promise<SendOutcom
       })
       return 'blocked'
     }
-    logger.error('[WhatsApp] send failed (transient)', { status: res.status, error: body?.error?.message ?? null })
+    logger.error('[WhatsApp] send failed (transient)', responseFields)
     return 'transient'
   } catch (e) {
     logger.error('[WhatsApp] send error (transient)', { error: e instanceof Error ? e.message : String(e) })
@@ -63,8 +84,8 @@ async function postMessage(payload: Record<string, unknown>): Promise<SendOutcom
   }
 }
 
-export function sendText(to: string, body: string): Promise<SendOutcome> {
-  return postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } })
+export function sendText(to: string, body: string, correlation?: { workbookId?: string }): Promise<SendOutcome> {
+  return postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }, correlation)
 }
 
 export function sendAccountTypeButtons(to: string): Promise<SendOutcome> {
