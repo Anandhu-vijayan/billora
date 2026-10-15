@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { isUsableGeminiApiKey } from './env-validation'
 
 const HEX_64 = /^[0-9a-fA-F]{64}$/
 
@@ -34,7 +35,7 @@ const serverSchema = z.object({
   // NEVER commit the real value; rotate by re-keying whatsapp_identities.
   WHATSAPP_IDENTITY_HMAC_KEY: z.string().min(32, 'WHATSAPP_IDENTITY_HMAC_KEY must be at least 32 chars').optional(),
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
-  GEMINI_API_KEY: z.string().min(1).optional(),
+  GEMINI_API_KEY: z.string().trim().min(1).optional(),
   GEMINI_MODEL: z.string().min(1).default('gemini-3.8-flash'),
   // 32-byte hex master key for local AES-256-GCM payload encryption.
   ENCRYPTION_MASTER_KEY: z
@@ -83,6 +84,17 @@ const serverSchema = z.object({
   JOB_TICK_BUDGET_MS: z.string().optional(),
   JOB_BACKOFF_BASE_SECONDS: z.string().optional(),
   JOB_BACKOFF_CAP_SECONDS: z.string().optional(),
+}).superRefine((env, ctx) => {
+  if (!env.EXTRACTION_ALLOW_AI) return
+  if (env.EXTRACTION_AI_TIER !== 'paid') {
+    ctx.addIssue({ code: 'custom', path: ['EXTRACTION_AI_TIER'], message: 'AI extraction requires the paid tier' })
+  }
+  if (env.EXTRACTION_PROVIDER !== 'gemini') {
+    ctx.addIssue({ code: 'custom', path: ['EXTRACTION_PROVIDER'], message: 'AI extraction currently requires Gemini' })
+  }
+  if (!isUsableGeminiApiKey(env.GEMINI_API_KEY)) {
+    ctx.addIssue({ code: 'custom', path: ['GEMINI_API_KEY'], message: 'A valid Gemini API key is required when AI extraction is enabled' })
+  }
 })
 
 export type ServerEnv = z.infer<typeof serverSchema>

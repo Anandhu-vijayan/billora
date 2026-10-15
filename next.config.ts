@@ -11,6 +11,9 @@ const nextConfig: NextConfig = {
   // require them at runtime instead, so a deploy without them fails closed rather
   // than breaking the build.
   serverExternalPackages: ["pdfjs-dist", "@napi-rs/canvas", "sharp", "tesseract.js"],
+  outputFileTracingIncludes: {
+    "/api/jobs/worker": ["./eng.traineddata"],
+  },
   async headers() {
     const supabaseHost = process.env.NEXT_PUBLIC_SUPABASE_URL
       ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).host

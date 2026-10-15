@@ -111,7 +111,7 @@ function probeEngineModule(id: string): unknown | null {
   // Returns the manifest path on a hit (truthy), null on a miss — same
   // contract as before.
   try {
-    let dir = resolvePath(process.cwd())
+    let dir = resolvePath(/*turbopackIgnore: true*/ process.cwd())
     for (let depth = 0; depth < 12; depth += 1) {
       const manifest = join(dir, 'node_modules', slug, 'package.json')
       if (existsSync(manifest)) return manifest

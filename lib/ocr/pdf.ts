@@ -38,6 +38,7 @@ interface PdfPage {
 
 const RENDER_SCALE = 2 // ~144 dpi at letter size: legible for vision, bounded.
 const MAX_RENDER_DIM = 2400 // hard ceiling so a huge page cannot balloon memory.
+const MAX_PDF_PAGES = 10
 
 /** Resolve pdf.js's bundled standard-fonts dir so glyph rendering has data. */
 function standardFontDataUrl(): string | undefined {
@@ -80,18 +81,22 @@ async function openDoc(pdfjs: PdfModule, buffer: Buffer): Promise<PdfDoc> {
 }
 
 /**
- * Extract the full embedded text layer (all pages, '\n'-joined lines). Returns
- * '' for a scanned/image PDF (no text operators) — an honest empty, never a
- * guess. Throws only on a genuinely unreadable file; the caller maps that to a
- * local miss.
+ * Extract the embedded text layer from at most ten pages. Returns '' for a
+ * scanned/image PDF (no text operators) — an honest empty, never a guess.
  */
-export async function extractPdfTextLayer(buffer: Buffer): Promise<string> {
+export async function extractPdfTextLayer(
+  buffer: Buffer,
+  maxPages = MAX_PDF_PAGES,
+): Promise<string> {
+  if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > MAX_PDF_PAGES) {
+    throw new Error(`maxPages must be between 1 and ${MAX_PDF_PAGES}`)
+  }
   const pdfjs = await loadPdfjs()
   if (!pdfjs) throw new Error('PDF_ENGINE_UNAVAILABLE: pdf.js not resolvable')
   const doc = await openDoc(pdfjs, buffer)
   try {
     const chunks: string[] = []
-    for (let n = 1; n <= doc.numPages; n += 1) {
+    for (let n = 1; n <= Math.min(doc.numPages, maxPages); n += 1) {
       const page = await doc.getPage(n)
       const content = await page.getTextContent()
       chunks.push(content.items.map((it) => it.str).join('\n'))

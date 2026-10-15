@@ -1,6 +1,8 @@
 
 import 'server-only'
 
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import sharp from 'sharp'
 import { createWorker } from 'tesseract.js'
 
@@ -22,6 +24,7 @@ const MAX_IMAGE_PIXELS = 40_000_000
 const MAX_PDF_PAGES = 10
 const MAX_RENDER_DIMENSION = 2400
 const OCR_LANGUAGE = 'eng'
+const OCR_LANGUAGE_DATA = join(process.cwd(), `${OCR_LANGUAGE}.traineddata`)
 
 const IMAGE_MIME_TYPES = new Set([
   'image/jpeg',
@@ -214,11 +217,14 @@ async function normalizeImageToPng(buffer: Buffer): Promise<Buffer> {
     })
       .rotate()
       .flatten({ background: '#ffffff' })
+      .greyscale()
+      .normalize()
+      .sharpen()
       .resize({
         width: MAX_RENDER_DIMENSION,
         height: MAX_RENDER_DIMENSION,
         fit: 'inside',
-        withoutEnlargement: true,
+        withoutEnlargement: false,
       })
       .png()
       .toBuffer()
@@ -231,11 +237,31 @@ async function normalizeImageToPng(buffer: Buffer): Promise<Buffer> {
   }
 }
 
-async function recognizeText(png: Buffer): Promise<string> {
-  let worker: Awaited<ReturnType<typeof createWorker>> | undefined
+type OcrWorker = Awaited<ReturnType<typeof createWorker>>
+
+async function withOcrWorker<T>(run: (worker: OcrWorker) => Promise<T>): Promise<T> {
+  if (!existsSync(OCR_LANGUAGE_DATA)) {
+    throw new InvoiceExtractionError('LOCAL_OCR_LANGUAGE_DATA_UNAVAILABLE')
+  }
+
+  let worker: OcrWorker | undefined
+  try {
+    worker = await createWorker(OCR_LANGUAGE, undefined, {
+      langPath: process.cwd(),
+      gzip: false,
+    })
+    return await run(worker)
+  } catch (error) {
+    if (error instanceof InvoiceExtractionError) throw error
+    throw new InvoiceExtractionError('LOCAL_OCR_FAILED', true)
+  } finally {
+    if (worker) await worker.terminate().catch(() => undefined)
+  }
+}
+
+async function recognizeText(png: Buffer, worker: OcrWorker): Promise<string> {
 
   try {
-    worker = await createWorker(OCR_LANGUAGE)
     const result = await worker.recognize(png)
     const text = result.data.text || ''
     // Metadata only (never the OCR text itself): proves whether the worker ran
@@ -249,10 +275,6 @@ async function recognizeText(png: Buffer): Promise<string> {
       error: error instanceof Error ? error.message : String(error),
     })
     throw new InvoiceExtractionError('LOCAL_OCR_FAILED', true)
-  } finally {
-    if (worker) {
-      await worker.terminate().catch(() => undefined)
-    }
   }
 }
 
@@ -329,36 +351,40 @@ async function extractScannedPdf(
   const pageCount = Math.min(pdf.numPages, maxPages)
 
   try {
-    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
-      const page = await pdf.getPage(pageNumber)
-      const baseViewport = page.getViewport({ scale: 1 })
-      const scale = Math.min(
-        2,
-        MAX_RENDER_DIMENSION / Math.max(baseViewport.width, baseViewport.height),
-      )
-      const viewport = page.getViewport({ scale: Math.max(scale, 0.5) })
-      const width = Math.max(1, Math.ceil(viewport.width))
-      const height = Math.max(1, Math.ceil(viewport.height))
+    await withOcrWorker(async (worker) => {
+      for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+        const page = await pdf.getPage(pageNumber)
+        const baseViewport = page.getViewport({ scale: 1 })
+        const scale = Math.min(
+          2,
+          MAX_RENDER_DIMENSION / Math.max(baseViewport.width, baseViewport.height),
+        )
+        const viewport = page.getViewport({ scale })
+        const width = Math.max(1, Math.ceil(viewport.width))
+        const height = Math.max(1, Math.ceil(viewport.height))
 
-      if (width * height > MAX_IMAGE_PIXELS) {
-        throw new InvoiceExtractionError('PDF_PAGE_PIXEL_LIMIT_EXCEEDED')
+        if (width > MAX_RENDER_DIMENSION || height > MAX_RENDER_DIMENSION
+          || width * height > MAX_IMAGE_PIXELS) {
+          throw new InvoiceExtractionError('PDF_PAGE_PIXEL_LIMIT_EXCEEDED')
+        }
+
+        const surface = canvas.createCanvas(width, height)
+        const context = surface.getContext('2d')
+
+        await page.render({
+          canvasContext: context,
+          viewport,
+        }).promise
+
+        const png = await normalizeImageToPng(surface.toBuffer('image/png'))
+        const text = await recognizeText(png, worker)
+
+        if (hasMeaningfulText(text)) {
+          const candidate = parseInvoiceText(text)
+          if (candidateHasUsefulFields(candidate)) candidates.push(candidate)
+        }
       }
-
-      const surface = canvas.createCanvas(width, height)
-      const context = surface.getContext('2d')
-
-      await page.render({
-        canvasContext: context,
-        viewport,
-      }).promise
-
-      const png = surface.toBuffer('image/png')
-      const text = await recognizeText(png)
-
-      if (hasMeaningfulText(text)) {
-        candidates.push(parseInvoiceText(text))
-      }
-    }
+    })
   } catch (error) {
     if (error instanceof InvoiceExtractionError) throw error
     throw new InvoiceExtractionError('PDF_PAGE_EXTRACTION_FAILED', true)
@@ -377,7 +403,7 @@ async function extractLocal(
   if (mimeType === PDF_MIME) {
     // Prefer genuine embedded text before spending CPU on OCR.
     try {
-      const text = await extractPdfTextLayer(buffer)
+      const text = await extractPdfTextLayer(buffer, maxPdfPages)
 
       if (hasMeaningfulText(text)) {
         const candidate = parseInvoiceText(text)
@@ -402,7 +428,7 @@ async function extractLocal(
   }
 
   const png = await normalizeImageToPng(buffer)
-  const text = await recognizeText(png)
+  const text = await withOcrWorker((worker) => recognizeText(png, worker))
   const meaningful = hasMeaningfulText(text)
   if (!meaningful) {
     // An image that OCRs to almost nothing is the exact silent failure that
@@ -414,8 +440,10 @@ async function extractLocal(
     })
   }
 
+  const parsed = meaningful ? parseInvoiceText(text) : null
+
   return {
-    candidate: meaningful ? parseInvoiceText(text) : null,
+    candidate: parsed && candidateHasUsefulFields(parsed) ? parsed : null,
     pagesProcessed: 1,
   }
 }

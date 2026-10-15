@@ -67,24 +67,24 @@ Billora extracts invoice fields using a **hybrid local-first pipeline**. It is
 explicitly **not** an offline product: an optional cloud assistant exists behind
 an operator-controlled privacy gate.
 
-1. **Local PDF text layer (private, default).** `pdf.js` (`pdfjs-dist`) reads a
-   digital PDF's embedded text layer entirely on the server — no network, no
-   model. A deterministic parser (`lib/ocr/text-parser.ts`) maps that text to
-   invoice fields and `lib/ocr/ledger.ts` scores each field from *objective*
-   checks (GSTIN shape, a resolvable day-first date, finite/non-negative amounts
-   that add up). A complete, consistent result may be auto-approved.
-2. **Scanned / image input.** These have no text layer, so the local engine
-   honestly produces no candidate. For a PDF we rasterize **only the first page**
-   (a real render via `@napi-rs/canvas`) rather than pretending it parsed.
-3. **Optional AI assistant (gated).** Only when an operator sets
-   `EXTRACTION_ALLOW_AI=true` **and** confirms a paid tier (`EXTRACTION_AI_TIER=paid`
-   after completing paid API activation) is Google Gemini consulted — for the
-   fields the local parser could not resolve. AI **assists**: valid local values
+1. **Local-first extraction (private, default).** `pdf.js` (`pdfjs-dist`) reads
+    up to 10 pages of embedded PDF text; scanned PDFs are rendered and OCR'd page
+  by page within the same limit. Uploaded images use Tesseract.js. Sharp
+  normalizes orientation, contrast and resolution before OCR. The English
+  `eng.traineddata` model is loaded locally; no OCR text or image is sent to a
+  network service by this step. A deterministic parser maps recognized text to
+  fields, and `lib/ocr/ledger.ts` evaluates the actual field values and
+  validation checks before any row can be approved.
+2. **Optional AI assistant (gated).** Only when an operator sets
+  `EXTRACTION_ALLOW_AI=true`, confirms a paid tier (`EXTRACTION_AI_TIER=paid`
+  after completing paid API activation), and supplies a usable Gemini API key
+  with `EXTRACTION_PROVIDER=gemini` is Google Gemini consulted — for the fields
+  the local parser could not resolve. AI **assists**: valid local values
    are kept and AI only fills gaps (`mergeCandidates`); its output is
    independently re-validated and can never silently overrule good local data or
    bypass the deterministic checks. Transient provider errors requeue; malformed
    or refused responses are handled as permanent failures.
-4. **Human review.** Anything still incomplete, inconsistent or low-confidence is
+3. **Human review.** Anything still incomplete, inconsistent or low-confidence is
    stored with `review_status='needs_review'` and a clear reason. Nothing is ever
    fabricated to force an approval.
 

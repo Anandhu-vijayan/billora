@@ -88,6 +88,7 @@ const conv = await importTs('lib/whatsapp/conversation.ts')
 // ledger.ts is dependency-free (no aliases/provider imports), so the REAL
 // extraction-review decision logic is exercised in-process, not reimplemented.
 const ledger = await importTs('lib/ocr/ledger.ts')
+const envValidation = await importTs('lib/env-validation.ts')
 // file-type.ts + statuses.ts are alias-free, so the REAL byte-sniffer, the REAL
 // size/pixel/page limits, and the REAL accepted-type set are tested in-process
 // rather than reimplemented (a drift in either would fail here, not silently).
@@ -1191,6 +1192,10 @@ test('J1 env: AI is OFF by default and the safe posture reveals no secrets', () 
   assert.match(e, /EXTRACTION_ALLOW_AI: boolFromEnv\(false\)/, 'privacy gate defaults to false')
   assert.match(e, /EXTRACTION_AI_TIER: z\.enum\(\['free', 'paid'\]\)\.default\('paid'\)/)
   assert.match(e, /LOCAL_OCR_ENGINE: z\.enum\(\['none', 'pdfjs-text', 'pdftotext', 'tesseract'\]\)\.default\('pdfjs-text'\)/)
+    assert.match(e, /\.superRefine\(\(env, ctx\) => \{/)
+    assert.match(e, /isUsableGeminiApiKey\(env\.GEMINI_API_KEY\)/)
+    assert.equal(envValidation.isUsableGeminiApiKey('your_actual_api_key'), false)
+    assert.equal(envValidation.isUsableGeminiApiKey('AIzaSyAProductionKeyThatIsLongEnough'), true)
   assert.match(e, /PUBLIC_APP_URL: z\.string\(\)\.url\(\)\.optional\(\)/)
   // boolFromEnv must reject the zod-coerce trap (only true/1 are truthy).
   assert.match(e, /s === '1' \|\| s === 'true' \? 'true' : 'false'/)
@@ -1439,6 +1444,7 @@ test('K3 pdf.ts: a REAL pdf.js text layer + first-page-only rasterization, hones
   assert.ok(p.includes('pdfjs-dist/legacy/build/pdf.mjs'), 'loads the real pdf.js engine')
   assert.ok(p.includes('@napi-rs/canvas'), 'renders through a real canvas')
   assert.ok(p.includes('getTextContent'), 'extracts the embedded text layer')
+  assert.ok(p.includes('Math.min(doc.numPages, maxPages)'), 'limits text extraction to the configured page cap')
   assert.ok(p.includes('standardFontDataUrl'), 'supplies standard-font data for rendering')
   // Rasterization must render ONLY the first page (never iterate all pages).
   const render = p.slice(p.indexOf('export async function renderFirstPageToPng'), p.indexOf('export async function pdfEngineAvailable'))
@@ -1466,8 +1472,13 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   assert.ok(e.includes("import sharp from 'sharp'"), 'image decode/normalize runs through sharp')
   assert.ok(e.includes("from 'tesseract.js'"), 'local OCR runs through tesseract.js')
   assert.ok(e.includes('const MAX_PDF_PAGES = 10'), 'scanned PDF page count is bounded')
-  assert.ok(e.includes('extractPdfTextLayer(buffer)'), 'a digital PDF text layer is preferred before OCR')
-  assert.ok(e.includes('extractScannedPdf(') && e.includes('recognizeText(png)'), 'scanned PDFs are rasterized then OCR-read')
+  assert.ok(e.includes('extractPdfTextLayer(buffer, maxPdfPages)'), 'a digital PDF text layer is preferred before OCR')
+  assert.ok(e.includes('extractScannedPdf(') && e.includes('recognizeText(png, worker)'), 'scanned PDFs are rasterized then OCR-read')
+  assert.ok(e.includes('langPath: process.cwd()') && e.includes('gzip: false'), 'Tesseract loads the bundled traineddata locally')
+  assert.ok(e.includes('.greyscale()') && e.includes('.normalize()'), 'OCR input receives contrast normalization')
+  assert.ok(e.includes('await withOcrWorker(async (worker)'), 'one worker is reused across scanned PDF pages')
+  assert.ok(e.includes('width > MAX_RENDER_DIMENSION || height > MAX_RENDER_DIMENSION'), 'PDF page dimensions stay under the hard ceiling')
+  assert.ok(e.includes('candidateHasUsefulFields(parsed)'), 'text length alone cannot count as a local extraction candidate')
   // The gated AI merge lives in the engine; non-Gemini image formats are normalized.
   assert.ok(/allowAI = false/.test(e), 'AI is opt-in at the engine boundary (defaults false)')
   assert.ok(e.includes('mergeCandidates(candidate, aiCandidate)'), 'AI fills gaps but valid local fields are preserved')
