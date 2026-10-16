@@ -120,6 +120,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       buffer: plain,
       mimeType: invoice.content_type,
       minConfidence: env.EXTRACTION_MIN_CONFIDENCE,
+      amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
       allowAI,
       apiKey: allowAI ? (env.GEMINI_API_KEY || '') : undefined,
       model: env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL,
@@ -134,7 +135,10 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     // Re-evaluate the returned candidate independently so the handler owns the
     // canonical row and the date-resolved batching gate (the engine never returns
     // a canonicalised ledger row, only the fields it located).
-    const evaluation = evaluateLedger(result.candidate, { minConfidence: env.EXTRACTION_MIN_CONFIDENCE })
+    const evaluation = evaluateLedger(result.candidate, {
+      minConfidence: env.EXTRACTION_MIN_CONFIDENCE,
+      amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
+    })
     const confidenceSource: ExtractionSource = result.source
 
     // Say WHY nothing could read the file: a silent empty review row was previously
@@ -165,6 +169,13 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     logger.info('[Extract] result saved', {
       invoiceId, jobId: job.id, review: evaluation.review,
       source: confidenceSource, confidence: evaluation.confidence,
+      presentFieldNames: [
+        'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+        'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+      ].filter((field) => {
+        const value = result.candidate[field as keyof typeof result.candidate]
+        return value !== undefined && value !== null && value !== ''
+      }),
       reasonCodes: evaluation.reasons.slice(0, 8),
     })
 

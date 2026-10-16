@@ -36,7 +36,7 @@ const serverSchema = z.object({
   WHATSAPP_IDENTITY_HMAC_KEY: z.string().min(32, 'WHATSAPP_IDENTITY_HMAC_KEY must be at least 32 chars').optional(),
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
   GEMINI_API_KEY: z.string().trim().min(1).optional(),
-  GEMINI_MODEL: z.string().min(1).default('gemini-3.8-flash'),
+  GEMINI_MODEL: z.string().min(1).default('gemini-flash-lite-latest'),
   // 32-byte hex master key for local AES-256-GCM payload encryption.
   ENCRYPTION_MASTER_KEY: z
     .string()
@@ -57,6 +57,7 @@ const serverSchema = z.object({
   // AI provider; tesseract is reserved and unimplemented.
   EXTRACTION_PROVIDER: z.enum(['gemini', 'tesseract']).default('gemini'),
   EXTRACTION_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.8),
+  EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS: z.coerce.number().int().min(0).max(10000).default(101),
   // Vision model for invoice extraction; defaults to GEMINI_MODEL when unset.
   EXTRACTION_VISION_MODEL: z.string().min(1).optional(),
   // PRIVACY GATE. AI is OFF by default: real customer invoices are never sent

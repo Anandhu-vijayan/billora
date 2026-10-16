@@ -17,9 +17,11 @@
 // Nothing here touches the database or storage; it is a pure provider call and
 // its result is only ever a candidate the caller validates before trusting.
 import { GoogleGenAI, Type } from '@google/genai'
+import { logger } from '@/lib/logger'
 import type { LedgerCandidate } from '@/lib/ocr/ledger'
+import { buildGeminiInvoiceRequest } from '@/lib/ocr/gemini-request'
 
-const CALL_TIMEOUT_MS = 25_000
+const CALL_TIMEOUT_MS = 15_000
 
 export class VisionTransientError extends Error {
   override name = 'VisionTransientError'
@@ -29,15 +31,32 @@ export class VisionPermanentError extends Error {
   override name = 'VisionPermanentError'
 }
 
+const TEXT_FIELDS = [
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
+] as const
+const OPTIONAL_EVIDENCE_FIELDS = [
+  'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words',
+] as const
+const AMOUNT_FIELDS = [
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+] as const
+const CONFIDENCE_FIELDS = [
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+  'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words',
+] as const
+const RESPONSE_FIELDS = [...TEXT_FIELDS, ...OPTIONAL_EVIDENCE_FIELDS, ...AMOUNT_FIELDS, 'confidence'] as const
+
 /** Only these transport types are meaningful image/PDF inputs for vision. */
 const SUPPORTED_MIME = /^(image\/(jpeg|png|webp)|application\/pdf)$/i
 
 const VISION_PROMPT = [
   'You are reading a single Indian GST tax invoice. Extract ONLY values that are',
   'explicitly printed on the document. Never guess, infer or compute a number, a',
-  'date, or a GSTIN. If a field is not present or not legible, return an empty',
-  'string for text fields and 0 for amount fields, and give that field a low',
-  'confidence (0.0-1.0 per field; be honest, do not default to high).',
+  'date, or a GSTIN. If a text field is not present or not legible, return an',
+  'empty string. For amount fields return null when unknown and numeric 0 only',
+  'when zero is explicitly printed or the tax head is demonstrably absent.',
+  'Give every extracted field a confidence (0.0-1.0; never default to high).',
   'PARTIES: the SUPPLIER is the seller who ISSUED the invoice (letterhead, "Sold',
   'by", "Seller", "From"). The RECIPIENT is the buyer ("Bill to", "Ship to",',
   '"Buyer", "Customer"). supplier_gstin and vendor_name belong to the SUPPLIER',
@@ -46,7 +65,10 @@ const VISION_PROMPT = [
   'sgst_amount and igst_amount are the invoice-level tax amounts per head (not',
   'rates, not percentages); total_amount is the final payable invoice total',
   'including tax and round-off. Use plain numbers (no currency symbol, no',
-  'thousands separators).',
+  'thousands separators). If the tax-rate percentages are explicitly printed,',
+  'return them as strings without the percent sign; otherwise return an empty',
+  'string. Copy the printed total amount-in-words exactly, or return an empty',
+  'string when it is absent. Never infer a rate or amount-in-words.',
   'DATES: invoice_date is the INVOICE date, never the due, order, delivery or PO',
   'date. Return it as printed (prefer DD/MM/YYYY or YYYY-MM-DD).',
   'GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1',
@@ -61,11 +83,11 @@ const confidenceSchema = {
     invoice_number: { type: Type.NUMBER },
     vendor_name: { type: Type.NUMBER },
     supplier_gstin: { type: Type.NUMBER },
-    taxable_value: { type: Type.NUMBER },
-    cgst_amount: { type: Type.NUMBER },
-    sgst_amount: { type: Type.NUMBER },
-    igst_amount: { type: Type.NUMBER },
-    total_amount: { type: Type.NUMBER },
+    taxable_value: { type: Type.NUMBER, nullable: true },
+    cgst_amount: { type: Type.NUMBER, nullable: true },
+    sgst_amount: { type: Type.NUMBER, nullable: true },
+    igst_amount: { type: Type.NUMBER, nullable: true },
+    total_amount: { type: Type.NUMBER, nullable: true },
   },
   required: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
@@ -90,23 +112,27 @@ const LEDGER_SCHEMA = {
     sgst_amount: { type: Type.NUMBER },
     igst_amount: { type: Type.NUMBER },
     total_amount: { type: Type.NUMBER },
+    cgst_rate_percent: { type: Type.STRING, nullable: true },
+    sgst_rate_percent: { type: Type.STRING, nullable: true },
+    igst_rate_percent: { type: Type.STRING, nullable: true },
+    total_amount_in_words: { type: Type.STRING, nullable: true },
     confidence: confidenceSchema,
   },
   required: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
-    'confidence',
+    'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
   ],
   propertyOrdering: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
-    'confidence',
+    'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
   ],
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new VisionTransientError(`${label}: timeout ${ms}ms`)), ms)
+    const timer = setTimeout(() => reject(new VisionTransientError('GEMINI_TIMEOUT')), ms)
     p.then(
       (v) => { clearTimeout(timer); resolve(v) },
       (e) => { clearTimeout(timer); reject(e) },
@@ -116,11 +142,32 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 /** Classify a raw thrown provider error into transient vs permanent. */
 function classifyProviderError(error: unknown): Error {
-  const msg = error instanceof Error ? error.message : String(error)
-  if (/(\b429\b|rate.?limit|\b5\d\d\b|unavailable|deadline|timeout|overloaded|temporar|network|socket)/i.test(msg)) {
-    return new VisionTransientError(msg.slice(0, 200))
+  const status = providerStatus(error)
+  const reason = providerFailureReason(error)
+  if (status === 429 || (status !== null && status >= 500)
+    || reason === 'timeout' || reason === 'network') {
+    return new VisionTransientError(reason)
   }
-  return new VisionPermanentError(msg.slice(0, 200))
+  return new VisionPermanentError(reason)
+}
+
+function providerFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const status = providerStatus(error)
+  if (status === 429) return 'rate_limited'
+  if (status !== null && status >= 500) return 'provider_unavailable'
+  if (/timeout|deadline/i.test(message)) return 'timeout'
+  if (/\b429\b|rate.?limit/i.test(message)) return 'rate_limited'
+  if (/\b5\d\d\b|unavailable|overloaded|temporar/i.test(message)) return 'provider_unavailable'
+  if (/network|socket|fetch/i.test(message)) return 'network'
+  return 'provider_error'
+}
+
+function providerStatus(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+  const value = (error as { status?: unknown; statusCode?: unknown }).status
+    ?? (error as { statusCode?: unknown }).statusCode
+  return typeof value === 'number' && Number.isInteger(value) ? value : null
 }
 
 /** Parse the model's JSON text into a candidate; malformed output is permanent. */
@@ -137,14 +184,54 @@ export function parseVisionJson(text: string): LedgerCandidate {
   } catch {
     throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
   }
-  if (!json || typeof json !== 'object') throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  return json as LedgerCandidate
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  }
+  const candidate = json as Record<string, unknown>
+  const keys = Object.keys(candidate).sort()
+  const expectedKeys = [...RESPONSE_FIELDS].sort()
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+    throw new VisionPermanentError('VISION_SCHEMA_KEYS_INVALID')
+  }
+  for (const field of TEXT_FIELDS) {
+    if (typeof candidate[field] !== 'string') {
+      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    }
+  }
+  for (const field of OPTIONAL_EVIDENCE_FIELDS) {
+    if (candidate[field] !== null && typeof candidate[field] !== 'string') {
+      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    }
+  }
+  for (const field of AMOUNT_FIELDS) {
+    const value = candidate[field]
+    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) {
+      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    }
+  }
+  if (!candidate.confidence || typeof candidate.confidence !== 'object' || Array.isArray(candidate.confidence)) {
+    throw new VisionPermanentError('VISION_CONFIDENCE_INVALID')
+  }
+  const confidence = candidate.confidence as Record<string, unknown>
+  const confidenceKeys = Object.keys(confidence).sort()
+  const expectedConfidenceKeys = [...CONFIDENCE_FIELDS].sort()
+  if (confidenceKeys.length !== expectedConfidenceKeys.length
+    || confidenceKeys.some((key, index) => key !== expectedConfidenceKeys[index])) {
+    throw new VisionPermanentError('VISION_CONFIDENCE_KEYS_INVALID')
+  }
+  for (const field of CONFIDENCE_FIELDS) {
+    const value = confidence[field]
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+      throw new VisionPermanentError(`VISION_CONFIDENCE_INVALID:${field}`)
+    }
+  }
+  return candidate as unknown as LedgerCandidate
 }
 
 /**
  * Send one invoice document to Gemini and return the raw extracted candidate.
- * A single in-handler retry covers a transient blip; persistent failures throw
- * VisionTransientError (retryable) or VisionPermanentError (terminal).
+ * Transient failures are retried by the durable job queue, not here, so a worker
+ * request never spends its whole execution budget on duplicate provider calls.
  */
 export async function extractInvoiceFields(args: {
   buffer: Buffer
@@ -166,37 +253,50 @@ export async function extractInvoiceFields(args: {
   if (!buffer || buffer.length === 0) throw new VisionPermanentError('EMPTY_MEDIA')
 
   const ai = new GoogleGenAI({ apiKey })
-  const contents = [{
-    role: 'user',
-    parts: [
-      { inlineData: { mimeType, data: buffer.toString('base64') } },
-      { text: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT },
-    ],
-  }]
+  const request = buildGeminiInvoiceRequest({
+    model,
+    mimeType,
+    imageBase64: buffer.toString('base64'),
+    prompt: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT,
+    responseSchema: LEDGER_SCHEMA,
+  })
 
-  let lastTransient: Error | null = null
-  // Two attempts total (one retry) — but only for transient failures.
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model,
-          contents,
-          config: { responseMimeType: 'application/json', responseSchema: LEDGER_SCHEMA, temperature: 0 },
-        }),
-        CALL_TIMEOUT_MS,
-        'gemini_generate_content',
-      )
-      const text = (response as { text?: string }).text ?? ''
-      return parseVisionJson(text)
-    } catch (e) {
-      const classified = e instanceof VisionTransientError || e instanceof VisionPermanentError
-        ? e
-        : classifyProviderError(e)
-      if (classified instanceof VisionPermanentError) throw classified
-      lastTransient = classified
-      // one retry on transient, then fall through to rethrow below
-    }
+  const imagePart = request.contents[0].parts.find((part) => 'inlineData' in part)
+  const promptPart = request.contents[0].parts.find((part) => 'text' in part)
+  if (!imagePart || !('inlineData' in imagePart) || !promptPart || !('text' in promptPart)) {
+    throw new VisionPermanentError('INVALID_GEMINI_REQUEST_SHAPE')
   }
-  throw lastTransient ?? new VisionTransientError('VISION_UNAVAILABLE')
+
+  const startedAt = Date.now()
+  logger.info('[Vision] Gemini request prepared', {
+    model,
+    mimeType,
+    imageBytes: buffer.length,
+    encodedImageBytes: imagePart.inlineData.data.length,
+    promptBytes: Buffer.byteLength(promptPart.text, 'utf8'),
+    contentPartCount: request.contents[0].parts.length,
+    responseMimeType: request.config.responseMimeType,
+    schemaFieldNames: Object.keys(LEDGER_SCHEMA.properties),
+  })
+  try {
+    const response = await withTimeout(
+      ai.models.generateContent(request),
+      CALL_TIMEOUT_MS,
+    )
+    const text = (response as { text?: string }).text ?? ''
+    const candidate = parseVisionJson(text)
+    return candidate
+  } catch (error) {
+    const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError
+      ? error
+      : classifyProviderError(error)
+    logger.warn('[Vision] Gemini request failed', {
+      model,
+      durationMs: Date.now() - startedAt,
+      failureClass: classified instanceof VisionTransientError ? 'transient' : 'permanent',
+      failureReason: providerFailureReason(error),
+      httpStatus: providerStatus(error),
+    })
+    throw classified
+  }
 }

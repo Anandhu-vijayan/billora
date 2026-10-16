@@ -14,17 +14,19 @@
 //   * The shape matches lib/excel/generator.ts `IndianLedgerRowInput` exactly
 //     (structural typing keeps the two in sync without a runtime import).
 import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
+import { validateInvoiceCrossChecks } from './validators'
+import { minorUnitsToNumber, minorUnitsToString, moneyToMinorUnits } from './validators/money'
 
 export interface LedgerRow {
   invoice_date: string;
   invoice_number: string;
   vendor_name: string;
   supplier_gstin: string;
-  taxable_value: number;
-  cgst_amount: number;
-  sgst_amount: number;
-  igst_amount: number;
-  total_amount: number;
+  taxable_value: number | null;
+  cgst_amount: number | null;
+  sgst_amount: number | null;
+  igst_amount: number | null;
+  total_amount: number | null;
 }
 
 /** A raw extraction candidate: values plus an optional per-field confidence. */
@@ -44,6 +46,10 @@ export interface LedgerCandidate {
   sgst_amount?: number | string | null;
   igst_amount?: number | string | null;
   total_amount?: number | string | null;
+  cgst_rate_percent?: number | string | null;
+  sgst_rate_percent?: number | string | null;
+  igst_rate_percent?: number | string | null;
+  total_amount_in_words?: string | null;
   confidence?: Record<string, number> | null;
 }
 
@@ -76,7 +82,13 @@ const REQUIRED_FIELDS = [
 // First day of GST (1 July 2017): no valid GST invoice predates it.
 const GST_EPOCH = '2017-07-01';
 
-const money = (n: number): number => Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
+const money = (n: number): number | null => Number.isFinite(n) ? n : null
+
+const PLACEHOLDER_TEXT = /^(?:n\/?a|na|tbd|unknown|placeholder|sample|test|(?:add|enter|insert|your|company|vendor|supplier|invoice)\s+(?:company\s+)?(?:name|number|no\.?|details|here)|(?:company|vendor|supplier|invoice)\s+(?:name|number|no\.?))$/i
+
+function isPlaceholderText(value: string): boolean {
+  return PLACEHOLDER_TEXT.test(value.trim().replace(/[:._-]+/g, ' ').replace(/\s+/g, ' '))
+}
 
 /** Parse the common Indian + ISO invoice date spellings to `YYYY-MM-DD`. */
 function parseInvoiceDate(raw: string | null | undefined): string | null {
@@ -109,13 +121,8 @@ function validateParts(year: number, month: number, day: number): boolean {
 }
 
 function toNumber(v: number | string | null | undefined): number {
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string') {
-    const cleaned = v.replace(/[,\s]/g, '').replace(/₹/g, '');
-    const n = Number.parseFloat(cleaned);
-    return Number.isFinite(n) ? n : Number.NaN;
-  }
-  return Number.NaN;
+  const minor = moneyToMinorUnits(v)
+  return minor === null ? Number.NaN : minorUnitsToNumber(minor)
 }
 
 /**
@@ -220,6 +227,15 @@ export function mergeCandidates(
   if (!(merged.recipient_gstin ?? '').trim() && (primary.recipient_gstin ?? '').trim()) {
     merged.recipient_gstin = primary.recipient_gstin
   }
+  for (const field of ['cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words'] as const) {
+    const primaryValue = primary[field]
+    const fallbackValue = fallback?.[field]
+    if (primaryValue !== undefined && primaryValue !== null && primaryValue !== '') {
+      ;(merged as Record<string, unknown>)[field] = primaryValue
+    } else if (fallbackValue !== undefined) {
+      ;(merged as Record<string, unknown>)[field] = fallbackValue
+    }
+  }
   merged.confidence = confidence
   return merged
 }
@@ -231,7 +247,11 @@ export function mergeCandidates(
  */
 export function evaluateLedger(
   candidate: LedgerCandidate,
-  opts: { minConfidence: number; /** Injectable clock (tests). */ now?: Date },
+  opts: {
+    minConfidence: number
+    amountToleranceMinorUnits?: number
+    /** Injectable clock (tests). */ now?: Date
+  },
 ): LedgerEvaluation {
   const reasons: string[] = [];
 
@@ -249,10 +269,14 @@ export function evaluateLedger(
   }
 
   const invoiceNumber = (candidate.invoice_number ?? '').trim();
-  if (!invoiceNumber) reasons.push('invoice-number-missing');
+  const invoiceNumberValid = invoiceNumber !== '' && !isPlaceholderText(invoiceNumber)
+  if (!invoiceNumber) reasons.push('invoice-number-missing')
+  else if (!invoiceNumberValid) reasons.push('invoice-number-placeholder')
 
   const vendorName = (candidate.vendor_name ?? '').trim();
-  if (!vendorName) reasons.push('vendor-name-missing');
+  const vendorNameValid = vendorName !== '' && !isPlaceholderText(vendorName)
+  if (!vendorName) reasons.push('vendor-name-missing')
+  else if (!vendorNameValid) reasons.push('vendor-name-placeholder')
 
   const gstin = (candidate.supplier_gstin ?? '').trim().toUpperCase();
   let gstinOk = false;
@@ -264,31 +288,34 @@ export function evaluateLedger(
 
   const taxable = toNumber(candidate.taxable_value);
   const total = toNumber(candidate.total_amount);
-  // A tax head the document simply does not print (an interstate invoice has no
-  // CGST/SGST lines; an intrastate one has no IGST line) is ABSENT, not
-  // unreadable. It is read as 0 only while taxable and total are both present,
-  // and the arithmetic check below must then still reconcile — so a head that
-  // the parser merely failed to find shows up as a total-mismatch, never as a
-  // silently wrong approved row. A missing taxable/total is never defaulted.
-  const isAbsent = (v: number | string | null | undefined): boolean =>
-    v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
-  const taxHead = (v: number | string | null | undefined): number =>
-    isAbsent(v) && Number.isFinite(taxable) && Number.isFinite(total) ? 0 : toNumber(v);
-  const cgst = taxHead(candidate.cgst_amount);
-  const sgst = taxHead(candidate.sgst_amount);
-  const igst = taxHead(candidate.igst_amount);
+  // Unknown tax heads remain unknown. Zero is accepted only when the extractor
+  // explicitly returned numeric/string zero; absence cannot be inferred from the
+  // arithmetic or the invoice's apparent tax structure.
+  const cgst = toNumber(candidate.cgst_amount);
+  const sgst = toNumber(candidate.sgst_amount);
+  const igst = toNumber(candidate.igst_amount);
   const amounts = [taxable, cgst, sgst, igst, total];
-  const amountsFinite = amounts.every((n) => Number.isFinite(n));
+  const amountMinorUnits = [
+    moneyToMinorUnits(candidate.taxable_value),
+    moneyToMinorUnits(candidate.cgst_amount),
+    moneyToMinorUnits(candidate.sgst_amount),
+    moneyToMinorUnits(candidate.igst_amount),
+    moneyToMinorUnits(candidate.total_amount),
+  ];
+  const amountsFinite = amountMinorUnits.every((value) => value !== null);
   const amountsNonNegative = amounts.every((n) => Number.isFinite(n) && n >= 0);
   let arithmeticConsistent = true;
   let structureConsistent = true;
   if (!amountsFinite) reasons.push('non-finite-amount');
   if (amounts.some((n) => Number.isFinite(n) && n < 0)) reasons.push('negative-amount');
   if (amountsFinite) {
-    const taxSum = taxable + cgst + sgst + igst;
-    if (Math.abs(taxSum - total) > 1.01) {
+    const [taxableMinor, cgstMinor, sgstMinor, igstMinor, totalMinor] = amountMinorUnits as bigint[];
+    const taxSumMinor = taxableMinor + cgstMinor + sgstMinor + igstMinor;
+    const differenceMinor = taxSumMinor > totalMinor ? taxSumMinor - totalMinor : totalMinor - taxSumMinor;
+    const toleranceMinorUnits = BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101)))
+    if (differenceMinor > toleranceMinorUnits) {
       arithmeticConsistent = false;
-      reasons.push(`total-mismatch:${taxSum.toFixed(2)}!=${total.toFixed(2)}`);
+      reasons.push(`total-mismatch:${minorUnitsToString(taxSumMinor)}!=${minorUnitsToString(totalMinor)}`);
     }
     // Structure checks. Extractors return 0 for "not found", so an all-zero
     // total is a miss, not an invoice; and the tax heads must be coherent.
@@ -296,7 +323,10 @@ export function evaluateLedger(
     if (igst > 0 && (cgst > 0 || sgst > 0)) {
       structureConsistent = false;
       reasons.push('igst-with-cgst-sgst');
-    } else if (Math.abs(cgst - sgst) > 0.05) {
+    } else if (amountMinorUnits[1] !== null && amountMinorUnits[2] !== null
+      && (amountMinorUnits[1] > amountMinorUnits[2]
+        ? amountMinorUnits[1] - amountMinorUnits[2]
+        : amountMinorUnits[2] - amountMinorUnits[1]) > BigInt(5)) {
       // Intra-state CGST and SGST are always charged at equal rates.
       structureConsistent = false;
       reasons.push('cgst-sgst-unequal');
@@ -319,19 +349,35 @@ export function evaluateLedger(
     }
   }
 
+  const crossChecks = validateInvoiceCrossChecks({
+    taxableValue: candidate.taxable_value,
+    cgstAmount: candidate.cgst_amount,
+    sgstAmount: candidate.sgst_amount,
+    igstAmount: candidate.igst_amount,
+    totalAmount: candidate.total_amount,
+    toleranceMinorUnits: BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101))),
+    taxRates: {
+      ...(candidate.cgst_rate_percent == null ? {} : { cgst: candidate.cgst_rate_percent }),
+      ...(candidate.sgst_rate_percent == null ? {} : { sgst: candidate.sgst_rate_percent }),
+      ...(candidate.igst_rate_percent == null ? {} : { igst: candidate.igst_rate_percent }),
+    },
+    totalAmountInWords: candidate.total_amount_in_words,
+  });
+  reasons.push(...crossChecks.reasons);
+
   // Measured confidence is our OWN signal; the model's self-report can only
   // lower it (a source that is unsure of a field must not be auto-approved just
   // because the deterministic shape looked clean).
-  const measuredConfidence = computeMeasured({
+  const measuredConfidence = Math.max(0, computeMeasured({
     dateResolved: iso !== null,
     gstinValid: gstinOk,
-    invoiceNumberPresent: invoiceNumber !== '',
-    vendorNamePresent: vendorName !== '',
+    invoiceNumberPresent: invoiceNumberValid,
+    vendorNamePresent: vendorNameValid,
     amountsFinite,
     amountsNonNegative,
     arithmeticConsistent,
     structureConsistent,
-  });
+  }) - crossChecks.measuredConfidencePenalty);
   const self = selfConfidence(candidate);
   const confidence = self === null ? measuredConfidence : Math.min(measuredConfidence, self);
   if (confidence < opts.minConfidence) reasons.push(`low-confidence:${confidence.toFixed(2)}`);
@@ -380,6 +426,14 @@ export function retryHintFor(reasons: readonly string[]): string | null {
       lines.push('invoice_date was missing or implausible; re-read the INVOICE date (not the due, order or delivery date).');
     } else if (r === 'supplier-equals-recipient') {
       lines.push('supplier_gstin and recipient_gstin were identical; the supplier is the seller who issued the invoice.');
+    } else if (r.startsWith('tax-rate-mismatch:') || r.startsWith('tax-rate-amount-missing:')) {
+      lines.push('The printed tax percentage and extracted tax amount did not agree; re-read the taxable value, rate and corresponding tax amount. Do not calculate a replacement unless the printed values support it.');
+    } else if (r === 'tax-rate-invalid:cgst' || r === 'tax-rate-invalid:sgst' || r === 'tax-rate-invalid:igst') {
+      lines.push('A printed tax rate could not be parsed as a percentage from 0 to 100; re-read it exactly as printed.');
+    } else if (r === 'tax-rate-cgst-sgst-unequal' || r === 'tax-rate-igst-with-cgst-sgst') {
+      lines.push('The printed tax rates conflict with the tax-head structure; re-read the rate and tax summary without inferring values.');
+    } else if (r === 'amount-words-total-mismatch') {
+      lines.push('The printed total in words disagrees with the numeric total; re-read both and do not choose one unless the document is clear.');
     }
   }
   const unique = [...new Set(lines)];

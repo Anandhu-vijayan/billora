@@ -103,9 +103,32 @@ function startHeartbeat(db: Db, job: ClaimedJob, worker: string, leaseSeconds: n
   const renew = (): Promise<void> => {
     if (lost) return Promise.reject(lost)
     if (inFlight) return inFlight
-    inFlight = renewLease(db, job.id, worker, leaseSeconds).then((owned) => {
-      if (!owned) throw new JobLeaseLostError('JOB_LEASE_RENEWAL_REFUSED')
-    }).catch((error: unknown) => {
+    inFlight = (async () => {
+      let lastError: unknown
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          const owned = await renewLease(db, job.id, worker, leaseSeconds)
+          if (!owned) throw new JobLeaseLostError('JOB_LEASE_RENEWAL_REFUSED')
+          if (attempt > 1) {
+            logger.info('[Worker] lease renewal recovered after transient error', {
+              jobId: job.id, worker, attempt,
+            })
+          }
+          return
+        } catch (error) {
+          if (error instanceof JobLeaseLostError) throw error
+          lastError = error
+          if (attempt === 1) {
+            logger.warn('[Worker] lease renewal transient error; retrying', {
+              jobId: job.id, worker, attempt,
+              errorType: error instanceof Error ? error.name : 'unknown',
+            })
+            await new Promise((resolve) => setTimeout(resolve, 300))
+          }
+        }
+      }
+      throw lastError
+    })().catch((error: unknown) => {
       lost = error instanceof JobLeaseLostError
         ? error
         : new JobLeaseLostError('JOB_LEASE_RENEWAL_UNCONFIRMED')

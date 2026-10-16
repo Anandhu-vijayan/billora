@@ -1,0 +1,17 @@
+﻿{
+    "invoice_date":  "2025-04-22",
+    "supplier_name":  "Add Company Name",
+    "supplier_gstin":  "29AAAAA1234F000",
+    "invoice_number":  "PPP/0001/25-26",
+    "place_of_supply":  "09 - Uttar Pradesh",
+    "taxable_value":  100000.0,
+    "cgst":  null,
+    "sgst":  null,
+    "igst":  18000.0,
+    "cess":  0.0,
+    "invoice_total":  116800.0,
+    "currency":  "INR",
+    "review_notes":  [
+
+                     ]
+}

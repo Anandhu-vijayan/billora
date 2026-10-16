@@ -75,6 +75,9 @@ an operator-controlled privacy gate.
   network service by this step. A deterministic parser maps recognized text to
   fields, and `lib/ocr/ledger.ts` evaluates the actual field values and
   validation checks before any row can be approved.
+  Money arithmetic is reconciled in integer paise. Printed tax rates and total
+  amounts in words are independent cross-checks; a disagreement sends the row
+  to review and never rewrites an extracted value.
 2. **Optional AI assistant (gated).** Only when an operator sets
   `EXTRACTION_ALLOW_AI=true`, confirms a paid tier (`EXTRACTION_AI_TIER=paid`
   after completing paid API activation), and supplies a usable Gemini API key

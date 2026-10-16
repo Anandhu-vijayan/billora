@@ -1,0 +1,35 @@
+﻿{
+    "candidates":  [
+                       {
+                           "content":  {
+                                           "parts":  [
+                                                         {
+                                                             "text":  "{\n  \"invoice_date\": \"2025-04-22\",\n  \"supplier_name\": \"Add Company Name\",\n  \"supplier_gstin\": \"29AAAAA1234F000\",\n  \"invoice_number\": \"PPP/0001/25-26\",\n  \"place_of_supply\": \"09 - Uttar Pradesh\",\n  \"taxable_value\": 100000.0,\n  \"cgst\": null,\n  \"sgst\": null,\n  \"igst\": 18000.0,\n  \"cess\": 0.0,\n  \"invoice_total\": 116800.0,\n  \"currency\": \"INR\",\n  \"review_notes\": []\n}",
+                                                             "thoughtSignature":  "EmAKXgFpFH0T5E+CpyKWnAtIQEFXpz7AD7h8llHHfhL5cY2/e5cC+worClIKnChhTAy9RwMiuMZlqnoj/bwTpUGjmrDwNA4x3VWKJ8Rfw2TN+2MFMyE+/fvj1TdibFNiAfc="
+                                                         }
+                                                     ],
+                                           "role":  "model"
+                                       },
+                           "finishReason":  "STOP",
+                           "index":  0
+                       }
+                   ],
+    "usageMetadata":  {
+                          "promptTokenCount":  1291,
+                          "candidatesTokenCount":  186,
+                          "totalTokenCount":  1477,
+                          "promptTokensDetails":  [
+                                                      {
+                                                          "modality":  "IMAGE",
+                                                          "tokenCount":  1092
+                                                      },
+                                                      {
+                                                          "modality":  "TEXT",
+                                                          "tokenCount":  199
+                                                      }
+                                                  ],
+                          "serviceTier":  "standard"
+                      },
+    "modelVersion":  "gemini-3.5-flash-lite",
+    "responseId":  "sUPSat-OKcOJg8UP16WOkQs"
+}

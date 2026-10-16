@@ -505,6 +505,9 @@ test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes suc
   assert.match(worker, /renewLease\(db, job\.id, worker, leaseSeconds\)/)
   assert.match(worker, /heartbeat\.stop\(\)/)
   assert.match(worker, /JOB_LEASE_RENEWAL_UNCONFIRMED/)
+  assert.match(worker, /attempt <= 2/)
+  assert.match(worker, /lease renewal transient error; retrying/)
+  assert.match(worker, /JOB_LEASE_RENEWAL_REFUSED/)
   assert.match(worker, /assertLease: heartbeat\.assertOwned/)
   assert.match(worker, /await heartbeat\.assertOwned\(\)/)
   assert.match(worker, /new JobLeaseLostError\('JOB_LEASE_RENEWAL_REFUSED'\)/)
@@ -886,11 +889,20 @@ test('G6c Stage-3 migration wires batch linkage, register dedup, and the batch R
 
 test('G6d vision is provider-gated with a strict schema and transient/permanent taxonomy', () => {
   const s = visionSrc()
+  const request = readFileSync(new URL('../lib/ocr/gemini-request.ts', import.meta.url), 'utf8')
   assert.ok(s.includes('class VisionTransientError') && s.includes('class VisionPermanentError'))
-  assert.ok(s.includes("responseMimeType: 'application/json'"))
+  assert.ok(s.includes('buildGeminiInvoiceRequest'))
+  assert.ok(request.includes("responseMimeType: 'application/json'"))
   assert.ok(s.includes('responseSchema: LEDGER_SCHEMA'))
   assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
   assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
+  assert.ok(s.includes('cgst_rate_percent') && s.includes('total_amount_in_words'), 'Gemini schema returns optional printed corroboration evidence')
+  assert.ok(s.includes('const CALL_TIMEOUT_MS = 15_000'), 'each provider request has a bounded timeout')
+  assert.ok(s.includes("new VisionTransientError('GEMINI_TIMEOUT')"), 'timeout classification does not include raw provider response text')
+  assert.ok(s.includes("logger.warn('[Vision] Gemini request failed'"), 'provider failures log structured timing and classification')
+  assert.ok(s.includes('failureReason: providerFailureReason(error)'), 'provider failure reason is logged without raw response content')
+  assert.ok(s.includes('status === 429') && s.includes('status >= 500'), 'HTTP status alone can classify rate limits and provider outages')
+  assert.ok(!/for \(let attempt = 0; attempt < 2/.test(s), 'queue backoff owns retries; a request does not immediately spend a second timeout')
 })
 
 test('G6e JOB_TYPES alignment: both Phase-4 job kinds stay in the TS enum and phase3 CHECK', () => {
@@ -1512,6 +1524,11 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   assert.ok(e.includes('await withOcrWorker(async (worker)'), 'one worker is reused across scanned PDF pages')
   assert.ok(e.includes('width > MAX_RENDER_DIMENSION || height > MAX_RENDER_DIMENSION'), 'PDF page dimensions stay under the hard ceiling')
   assert.ok(e.includes('candidateHasUsefulFields(parsed)'), 'text length alone cannot count as a local extraction candidate')
+  assert.ok(e.includes("'[Extract] local evaluation complete'"), 'logs parsed-field count and validation reasons without field values')
+  assert.ok(e.includes("'[Extract] AI fallback started'"), 'logs why the privacy-authorized AI fallback was needed')
+  assert.ok(e.includes("'[Extract] AI fallback failed transiently'"), 'logs transient fallback timing for worker diagnosis')
+  assert.ok(e.includes('localCandidatePreserved: candidate !== null'), 'a temporary AI outage preserves local extraction for human review')
+  assert.ok(e.includes('rather than re-running OCR after a provider outage'), 'transient AI failure no longer requeues local OCR work')
   // The gated AI merge lives in the engine; non-Gemini image formats are normalized.
   assert.ok(/allowAI = false/.test(e), 'AI is opt-in at the engine boundary (defaults false)')
   assert.ok(e.includes('mergeCandidates(candidate, aiCandidate)'), 'AI fills gaps but valid local fields are preserved')
@@ -2001,7 +2018,18 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   const w = readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
   assert.ok(w.includes('minJobWindowMs()'), 'a job cannot start too close to the tick deadline')
   const v = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
-  assert.ok(v.includes('recipient_gstin') && v.includes('temperature: 0'))
+  const request = readFileSync(new URL('../lib/ocr/gemini-request.ts', import.meta.url), 'utf8')
+  assert.ok(v.includes('recipient_gstin') && v.includes('buildGeminiInvoiceRequest'))
+  // Gemini 3+ rejects legacy sampling params: the request builder sends
+  // responseMimeType + responseSchema only, never temperature/top_p/top_k.
+  assert.ok(request.includes("responseMimeType: 'application/json'"))
+  assert.ok(!/temperature|top_p|top_k/.test(request), 'no legacy sampling parameters')
+  // Bounded second pass: one targeted re-read via retryHintFor, adopted only
+  // on strict improvement, merged so valid local fields are never downgraded.
+  const eng = extractorSrc()
+  assert.ok(eng.includes('retryHintFor('), 'second pass derives its hint from the failed checks')
+  assert.ok(eng.includes('AI second pass started') && eng.includes('AI second pass completed'), 'second pass is logged')
+  assert.ok(/extractInvoiceFields\(\s*mimeType === PDF_MIME/.test(eng), 'second pass reuses the same media path + model')
 })
 
 test('P9 ledger: an unprinted tax head is 0 only when the arithmetic reconciles; never when it does not', () => {

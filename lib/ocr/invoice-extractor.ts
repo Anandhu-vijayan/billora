@@ -10,6 +10,7 @@ import { logger } from '@/lib/logger'
 import {
   evaluateLedger,
   mergeCandidates,
+  retryHintFor,
   type LedgerCandidate,
 } from '@/lib/ocr/ledger'
 import { parseInvoiceText, hasMeaningfulText } from '@/lib/ocr/text-parser'
@@ -46,6 +47,7 @@ export interface InvoiceExtractionOptions {
   buffer: Buffer
   mimeType: string
   minConfidence?: number
+  amountToleranceMinorUnits?: number
 
   /**
    * AI is disabled unless explicitly enabled by the caller.
@@ -292,6 +294,40 @@ function candidateHasUsefulFields(candidate: LedgerCandidate): boolean {
   )
 }
 
+function candidateFieldCount(candidate: LedgerCandidate | null): number {
+  return candidatePresentFields(candidate).length
+}
+
+function candidatePresentFields(candidate: LedgerCandidate | null): string[] {
+  if (!candidate) return []
+  const fields = [
+    candidate.invoice_date,
+    candidate.invoice_number,
+    candidate.vendor_name,
+    candidate.supplier_gstin,
+    candidate.taxable_value,
+    candidate.cgst_amount,
+    candidate.sgst_amount,
+    candidate.igst_amount,
+    candidate.total_amount,
+  ]
+  const names = [
+    'invoice_date',
+    'invoice_number',
+    'vendor_name',
+    'supplier_gstin',
+    'taxable_value',
+    'cgst_amount',
+    'sgst_amount',
+    'igst_amount',
+    'total_amount',
+  ]
+  return names.filter((_, index) => {
+    const value = fields[index]
+    return value !== undefined && value !== null && value !== ''
+  })
+}
+
 /**
  * Combine page candidates without discarding values that were already found.
  * mergeCandidates preserves independently valid values in its primary input.
@@ -454,9 +490,10 @@ export async function extractInvoice(
   const {
     buffer,
     minConfidence = 0.8,
+    amountToleranceMinorUnits = 101,
     allowAI = false,
     apiKey,
-    model = 'gemini-3.8-flash',
+    model = 'gemini-flash-lite-latest',
     maxPdfPages = MAX_PDF_PAGES,
   } = options
 
@@ -472,6 +509,7 @@ export async function extractInvoice(
   let candidate: LedgerCandidate | null = null
   let source: ExtractionSource = 'human'
   let pagesProcessed = 0
+  let localErrorCode: string | null = null
 
   try {
     const local = await extractLocal(buffer, mimeType, maxPdfPages)
@@ -482,12 +520,27 @@ export async function extractInvoice(
   } catch (error) {
     // Local decode/OCR errors are not proof the invoice is empty.
     // Allow the explicitly authorized vision fallback to attempt extraction.
+    localErrorCode = error instanceof InvoiceExtractionError
+      ? error.message.split(':')[0]
+      : 'LOCAL_EXTRACTION_FAILED'
     if (!allowAI) throw error
   }
 
   let evaluation = candidate
-    ? evaluateLedger(candidate, { minConfidence })
+    ? evaluateLedger(candidate, { minConfidence, amountToleranceMinorUnits })
     : null
+
+  logger.info('[Extract] local evaluation complete', {
+    mimeType,
+    hasCandidate: candidate !== null,
+    fieldCount: candidateFieldCount(candidate),
+    presentFieldNames: candidatePresentFields(candidate),
+    review: evaluation?.review ?? 'no_candidate',
+    confidence: evaluation?.confidence ?? null,
+    reasonCodes: evaluation?.reasons.slice(0, 8) ?? [],
+    localErrorCode,
+    pagesProcessed,
+  })
 
   const needsAI = !evaluation || evaluation.review === 'needs_review'
 
@@ -496,6 +549,15 @@ export async function extractInvoice(
       throw new InvoiceExtractionError('AI_ENABLED_BUT_API_KEY_MISSING')
     }
 
+    logger.info('[Extract] AI fallback started', {
+      mimeType,
+      model,
+      localFieldCount: candidateFieldCount(candidate),
+      localFieldNames: candidatePresentFields(candidate),
+      reasonCodes: evaluation?.reasons.slice(0, 8) ?? ['local-candidate-missing'],
+      localErrorCode,
+    })
+    const aiStartedAt = Date.now()
     try {
       let aiCandidate: LedgerCandidate
 
@@ -521,11 +583,65 @@ export async function extractInvoice(
         })
       }
 
-      const assisted = candidate
+      let assisted = candidate
         ? mergeCandidates(candidate, aiCandidate)
         : aiCandidate
 
-      const aiEvaluation = evaluateLedger(assisted, { minConfidence })
+      let aiEvaluation = evaluateLedger(assisted, { minConfidence, amountToleranceMinorUnits })
+      let secondPass = false
+      // Bounded second pass: a targeted re-read can fix a misread digit, a
+      // swapped party or a wrong total — but a field simply absent from the
+      // page is never "fixed" by asking again (retryHintFor returns null for
+      // those reasons). Exactly one extra provider call, same model; the hint
+      // still forbids guessing and the merge below can never downgrade a
+      // validated local approval.
+      if (aiEvaluation.review === 'needs_review') {
+        const hint = retryHintFor(aiEvaluation.reasons)
+        if (hint) {
+          secondPass = true
+          logger.info('[Extract] AI second pass started', {
+            model,
+            durationMs: Date.now() - aiStartedAt,
+            reasonCodes: aiEvaluation.reasons.slice(0, 8),
+          })
+          const retryCandidate = await extractInvoiceFields(
+            mimeType === PDF_MIME
+              ? { buffer, mimeType: PDF_MIME, apiKey, model, hint }
+              : { buffer: await normalizeImageToPng(buffer), mimeType: 'image/png', apiKey, model, hint },
+          )
+          const retryAssisted = candidate
+            ? mergeCandidates(candidate, retryCandidate)
+            : retryCandidate
+          const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits })
+          logger.info('[Extract] AI second pass completed', {
+            model,
+            durationMs: Date.now() - aiStartedAt,
+            fieldCount: candidateFieldCount(retryCandidate),
+            fieldNames: candidatePresentFields(retryCandidate),
+            review: retryEvaluation.review,
+            confidence: retryEvaluation.confidence,
+            reasonCodes: retryEvaluation.reasons.slice(0, 8),
+          })
+          // Adopt the re-read only when it strictly improves the outcome:
+          // an approval, or a higher measured confidence than the first read.
+          // Keep `assisted` in sync: the adoption block below persists it.
+          if (retryEvaluation.review === 'approved' || retryEvaluation.confidence > aiEvaluation.confidence) {
+            aiCandidate = retryCandidate
+            assisted = retryAssisted
+            aiEvaluation = retryEvaluation
+          }
+        }
+      }
+      logger.info('[Extract] AI fallback completed', {
+        model,
+        durationMs: Date.now() - aiStartedAt,
+        fieldCount: candidateFieldCount(aiCandidate),
+        fieldNames: candidatePresentFields(aiCandidate),
+        review: aiEvaluation.review,
+        confidence: aiEvaluation.confidence,
+        reasonCodes: aiEvaluation.reasons.slice(0, 8),
+        secondPass,
+      })
 
       if (
         !evaluation ||
@@ -538,9 +654,23 @@ export async function extractInvoice(
       }
     } catch (error) {
       if (error instanceof VisionTransientError) {
-        throw new InvoiceExtractionError('VISION_TEMPORARILY_UNAVAILABLE', true)
+        logger.warn('[Extract] AI fallback failed transiently', {
+          model,
+          durationMs: Date.now() - aiStartedAt,
+          failureCode: error.message.split(':')[0] || 'VISION_TRANSIENT',
+          localCandidatePreserved: candidate !== null,
+        })
+        // The cloud assistant is optional. Keep the local candidate and persist
+        // it for human review rather than re-running OCR after a provider outage.
       }
-      throw error
+      else {
+        logger.warn('[Extract] AI fallback failed permanently', {
+          model,
+          durationMs: Date.now() - aiStartedAt,
+          failureCode: error instanceof Error ? error.message.split(':')[0] : 'VISION_PERMANENT',
+        })
+        throw error
+      }
     }
   }
 

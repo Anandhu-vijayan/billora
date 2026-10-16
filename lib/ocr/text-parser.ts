@@ -20,15 +20,13 @@
 // `@/` resolution) can exercise the REAL parser in-process.
 import type { LedgerCandidate } from './ledger'
 import { pickSupplierGstin } from './gstin'
+import { parseIndianAmountWords } from './validators/amount-words'
 
 // Confidence tiers: what we are willing to claim for a given match strength.
 const CONF_STRONG = 0.9 // value sat next to its own explicit label
 const CONF_WEAK = 0.6 // inferred positionally / contextually
 
 const DATE_TOKEN = '(\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{4}|\\d{4}-\\d{2}-\\d{2})'
-// A money token: optional ₹, grouped digits, optional decimals. Keeps the raw
-// text so we can normalize; ledger re-validates finiteness + non-negativity.
-const MONEY_TOKEN = '([0-9][0-9,]*(?:\\.[0-9]{1,2})?)'
 
 /** Turn a captured money string into a finite number, or null when not clean. */
 function toAmount(raw: string | undefined): number | null {
@@ -49,15 +47,37 @@ function findLabeledAmount(
   labels: RegExp,
   confidence: number = CONF_STRONG,
 ): { value: number; confidence: number } | null {
-  // The label is itself an alternation (cgst|central tax|...); it MUST be
-  // wrapped in a non-capturing group or the top-level `|` would leave the
-  // earlier alternatives without their money-capture suffix.
-  const re = new RegExp(`(?:${labels.source})[^0-9₹\\n]{0,24}₹?\\s*${MONEY_TOKEN}`, 'i')
-  const m = re.exec(text)
-  if (!m) return null
-  const value = toAmount(m[1])
-  if (value === null) return null
-  return { value, confidence }
+  for (const line of text.split('\n')) {
+    const labelMatch = labels.exec(line)
+    if (!labelMatch) continue
+    const tail = line.slice(labelMatch.index + labelMatch[0].length)
+    const afterRate = tail.replace(
+      /^[^0-9₹]{0,24}(?:\d{1,3}(?:\.\d{1,2})?\s*%\s*)?/,
+      '',
+    )
+    const amountMatch = /^[\s:=-]*₹?\s*([0-9][0-9,]*(?:\.\d{1,2})?)(?!\s*%)/.exec(afterRate)
+    const value = toAmount(amountMatch?.[1])
+    if (value !== null) return { value, confidence }
+  }
+  return null
+}
+
+function findLabeledRate(text: string, labels: RegExp): number | null {
+  const re = new RegExp(`(?:${labels.source})[^0-9\\n]{0,16}(\\d{1,3}(?:\\.\\d{1,2})?)\\s*%`, 'i')
+  const match = re.exec(text)
+  if (!match) return null
+  const rate = Number(match[1])
+  return Number.isFinite(rate) && rate >= 0 && rate <= 100 ? rate : null
+}
+
+function findAmountInWords(text: string): string | null {
+  for (const line of text.split('\n')) {
+    const labeled = /(?:amount|total)\s+in\s+words?\s*[:=-]?\s*(.+)/i.exec(line)
+    const candidate = labeled?.[1]?.trim()
+      ?? (/\b(?:rupees?|inr|rs\.?)\b/i.test(line) && /\bonly\b/i.test(line) ? line.trim() : null)
+    if (candidate && parseIndianAmountWords(candidate) !== null) return candidate
+  }
+  return null
 }
 
 /**
@@ -195,6 +215,14 @@ export function parseInvoiceText(
     candidate.igst_amount = igst.value
     candidate.confidence.igst_amount = igst.confidence
   }
+  const cgstRate = findLabeledRate(normalized, /cgst|central\s+tax/i)
+  const sgstRate = findLabeledRate(normalized, /sgst|state\s+tax/i)
+  const igstRate = findLabeledRate(normalized, /igst|integrated\s+tax/i)
+  if (cgstRate !== null) candidate.cgst_rate_percent = cgstRate
+  if (sgstRate !== null) candidate.sgst_rate_percent = sgstRate
+  if (igstRate !== null) candidate.igst_rate_percent = igstRate
+  const amountInWords = findAmountInWords(normalized)
+  if (amountInWords) candidate.total_amount_in_words = amountInWords
   const total =
     findLabeledAmount(normalized, /grand\s+total|invoice\s+total|total\s+(?:amount|payable)|amount\s+due|net\s+payable/i)
     // A bare "Total" is a WEAK hit (it can be a quantity or a subtotal), so it

@@ -6,11 +6,14 @@ export interface IndianLedgerRowInput {
   invoice_number: string;
   vendor_name: string;
   supplier_gstin: string;
-  taxable_value: number;
-  cgst_amount: number;
-  sgst_amount: number;
-  igst_amount: number;
-  total_amount: number;
+  // Amounts arrive null when unknown (never guessed). Only approved rows reach
+  // the workbook, and approved inter-state rows legitimately carry null for
+  // the unused tax head — the renderer below coalesces those to 0.
+  taxable_value: number | null;
+  cgst_amount: number | null;
+  sgst_amount: number | null;
+  igst_amount: number | null;
+  total_amount: number | null;
 }
 
 export async function buildComplianceExcelWorkbook(records: IndianLedgerRowInput[]): Promise<Buffer> {

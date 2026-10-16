@@ -97,8 +97,12 @@ export async function applyInvoiceReview(
   // what the reviewer left blank. evaluateLedger then scores the MERGE independently
   // so nothing is trusted blindly and no field is invented.
   const merged = mergeCandidates(args.corrections, existing)
-  const minConfidence = args.minConfidence ?? getEnv().EXTRACTION_MIN_CONFIDENCE
-  const evaluation = evaluateLedger(merged, { minConfidence })
+  const env = getEnv()
+  const minConfidence = args.minConfidence ?? env.EXTRACTION_MIN_CONFIDENCE
+  const evaluation = evaluateLedger(merged, {
+    minConfidence,
+    amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
+  })
 
   const keyVersion = deriveKeyVersion(masterKeyHex)
   const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
