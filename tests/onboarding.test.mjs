@@ -1527,8 +1527,9 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   assert.ok(e.includes("'[Extract] local evaluation complete'"), 'logs parsed-field count and validation reasons without field values')
   assert.ok(e.includes("'[Extract] AI fallback started'"), 'logs why the privacy-authorized AI fallback was needed')
   assert.ok(e.includes("'[Extract] AI fallback failed transiently'"), 'logs transient fallback timing for worker diagnosis')
-  assert.ok(e.includes('localCandidatePreserved: candidate !== null'), 'a temporary AI outage preserves local extraction for human review')
-  assert.ok(e.includes('rather than re-running OCR after a provider outage'), 'transient AI failure no longer requeues local OCR work')
+  assert.ok(e.includes('localCandidatePreserved: candidate !== null'), 'the transient log still records whether a local candidate survived')
+  assert.ok(e.includes('if (!currentBestIsSufficient) {') && e.includes("throw new InvoiceExtractionError('VISION_TEMPORARILY_UNAVAILABLE', true)"), 'a transient AI failure over an INSUFFICIENT result requeues the job (never silently completes on known-bad data)')
+  assert.ok(e.includes('const currentBestIsSufficient = isResultSufficient(evaluation)'), 'sufficiency is measured before deciding to keep vs requeue')
   // The gated AI merge lives in the engine; non-Gemini image formats are normalized.
   assert.ok(/allowAI = false/.test(e), 'AI is opt-in at the engine boundary (defaults false)')
   assert.ok(e.includes('mergeCandidates(candidate, aiCandidate)'), 'AI fills gaps but valid local fields are preserved')
@@ -2046,4 +2047,27 @@ test('P9 ledger: an unprinted tax head is 0 only when the arithmetic reconciles;
   // Missing total is never defaulted.
   const noTotal = { ...CLEAN_ROW, total_amount: undefined }
   assert.ok(ledger.evaluateLedger(noTotal, { minConfidence: 0.8, now }).reasons.includes('non-finite-amount'))
+})
+
+test('P10 retry handling: a transient AI failure over an insufficient result requeues, never silently completes', () => {
+  const eng = extractorSrc()
+  // The engine must decide by SUFFICIENCY, not always swallow. The old bug kept
+  // a known-bad local result and let the job "complete" -> stranded needs_review.
+  assert.ok(eng.includes('function isResultSufficient(evaluation: LedgerEvaluation | null)'), 'sufficiency helper exists')
+  assert.ok(eng.includes('const currentBestIsSufficient = isResultSufficient(evaluation)'), 'transient path measures the current best')
+  assert.ok(eng.includes('if (!currentBestIsSufficient) {'), 'insufficient + transient -> do NOT swallow')
+  assert.ok(eng.includes("throw new InvoiceExtractionError('VISION_TEMPORARILY_UNAVAILABLE', true)"), 'rethrown as a RETRYABLE extraction error')
+  assert.ok(!eng.includes('The cloud assistant is optional'), 'the old unconditional-swallow comment is gone')
+  assert.ok(eng.includes('throw error'), 'permanent/unexpected vision faults still propagate (raw, for the handler to classify)')
+
+  // The handler owns the taxonomy: transient -> requeue, permanent -> settle now.
+  const s = extractSrc()
+  assert.ok(s.includes("import { VisionTransientError, VisionPermanentError } from '@/lib/ocr/vision'"), 'handler imports the provider taxonomy')
+  assert.ok(s.includes('if (e instanceof VisionTransientError) throw e'), 'a leaked transient still requeues')
+  assert.ok(s.includes('if (e instanceof VisionPermanentError) throw new PermanentJobError'), 'a leaked permanent fault settles immediately (no retry storm)')
+
+  // The queue only treats PermanentJobError as terminal; everything else backs
+  // off within the bounded attempt budget, so requeue-on-transient is real.
+  const q = readFileSync(new URL('../lib/jobs/queue.ts', import.meta.url), 'utf8')
+  assert.ok(q.includes("error.name === 'PermanentJobError'"), 'only PermanentJobError settles for good')
 })

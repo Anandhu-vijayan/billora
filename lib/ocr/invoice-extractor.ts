@@ -12,6 +12,7 @@ import {
   mergeCandidates,
   retryHintFor,
   type LedgerCandidate,
+  type LedgerEvaluation,
 } from '@/lib/ocr/ledger'
 import { parseInvoiceText, hasMeaningfulText } from '@/lib/ocr/text-parser'
 import { extractPdfTextLayer } from '@/lib/ocr/pdf'
@@ -484,6 +485,15 @@ async function extractLocal(
   }
 }
 
+/**
+ * A result is "sufficient" only when it independently cleared review (approved).
+ * Used to decide whether a transient AI failure may be swallowed (we already
+ * hold a good row) or MUST be propagated for retry (what we hold is known-bad).
+ */
+function isResultSufficient(evaluation: LedgerEvaluation | null): boolean {
+  return evaluation !== null && evaluation.review === 'approved'
+}
+
 export async function extractInvoice(
   options: InvoiceExtractionOptions,
 ): Promise<InvoiceExtractionResult> {
@@ -654,16 +664,33 @@ export async function extractInvoice(
       }
     } catch (error) {
       if (error instanceof VisionTransientError) {
+        // We only enter the AI block when the local result was ALREADY
+        // insufficient, so in the common case the best we hold here is still
+        // insufficient. Swallowing the error would "complete" the job on a
+        // known-bad candidate and strand the invoice in needs_review forever.
+        // Preserve it ONLY when it is independently sufficient (an approved
+        // first pass that a later provider call could not improve); otherwise
+        // propagate a retryable error so the worker requeues the whole job.
+        const currentBestIsSufficient = isResultSufficient(evaluation)
         logger.warn('[Extract] AI fallback failed transiently', {
           model,
           durationMs: Date.now() - aiStartedAt,
           failureCode: error.message.split(':')[0] || 'VISION_TRANSIENT',
+          currentBestIsSufficient,
           localCandidatePreserved: candidate !== null,
         })
-        // The cloud assistant is optional. Keep the local candidate and persist
-        // it for human review rather than re-running OCR after a provider outage.
+        if (!currentBestIsSufficient) {
+          throw new InvoiceExtractionError('VISION_TEMPORARILY_UNAVAILABLE', true)
+        }
+        logger.info('[Extract] keeping current best result despite transient AI failure', {
+          review: evaluation?.review ?? 'no_candidate',
+          confidence: evaluation?.confidence ?? null,
+        })
       }
       else {
+        // Permanent / unexpected provider fault: a retry can never help. Rethrow
+        // the raw error so the handler classifies VisionPermanentError as a
+        // permanent failure (settle immediately) instead of spinning retries.
         logger.warn('[Extract] AI fallback failed permanently', {
           model,
           durationMs: Date.now() - aiStartedAt,

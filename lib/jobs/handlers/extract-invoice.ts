@@ -34,6 +34,7 @@ import {
   type ExtractionSource,
   type InvoiceExtractionResult,
 } from '@/lib/ocr/invoice-extractor'
+import { VisionTransientError, VisionPermanentError } from '@/lib/ocr/vision'
 
 interface InvoiceRow {
   id: string
@@ -129,6 +130,12 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         if (!e.retryable) throw new PermanentJobError(`EXTRACTION_FAILED: ${e.message}`)
         throw e // transient OCR / vision fault -> the worker requeues
       }
+      // A transient provider fault that reached us unwrapped must still requeue,
+      // never settle; a permanent provider fault (bad key, unparseable output,
+      // unsupported type) can never succeed on retry, so it settles immediately
+      // instead of burning the queue's bounded attempt budget.
+      if (e instanceof VisionTransientError) throw e
+      if (e instanceof VisionPermanentError) throw new PermanentJobError(`EXTRACTION_FAILED: ${e.message}`)
       throw e
     })
 
