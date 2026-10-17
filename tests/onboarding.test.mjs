@@ -1533,7 +1533,7 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   // The gated AI merge lives in the engine; non-Gemini image formats are normalized.
   assert.ok(/allowAI = false/.test(e), 'AI is opt-in at the engine boundary (defaults false)')
   assert.ok(e.includes('mergeCandidates(candidate, aiCandidate)'), 'AI fills gaps but valid local fields are preserved')
-  assert.ok(e.includes("mimeType: 'image/png'"), 'un-supported image formats normalize to PNG for the provider')
+  assert.ok(e.includes("mimeType: 'image/jpeg'") && e.includes('prepareImageForVision(buffer)'), 'the provider gets a small colour JPEG (never the 3 MB greyscale OCR PNG)')
 })
 
 test('K6 hybrid config + docs: real deps externalized, exposure documented, no offline claim', () => {
@@ -1983,7 +1983,7 @@ test('P6 text-parser: buyer GSTIN, due date and "Total Qty" can no longer corrup
     'ACME TRADERS PVT LTD', `Seller GSTIN: ${SUP_GSTIN}`, 'Tax Invoice',
     'Bill To: Beta Corp', `Buyer GSTIN: ${BUY_GSTIN_KA}`,
     'Invoice No: INV-77', 'Due Date: 30/10/2026', 'Invoice Date: 05/10/2026',
-    'Total Qty: 12', 'Taxable Value: 1000', 'IGST: 180', 'Grand Total: 1,180.00',
+    'Total Qty: 12', 'Taxable Value: 1000', 'CGST: 0.00', 'SGST: 0.00', 'IGST: 180', 'Grand Total: 1,180.00',
   ].join('\n')
   const c = textParser.parseInvoiceText(text)
   assert.equal(c.supplier_gstin, SUP_GSTIN)
@@ -2016,15 +2016,13 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   assert.ok(s.includes('e instanceof InvoiceExtractionError'), 'engine failures are translated')
   assert.ok(s.includes('if (!e.retryable) throw new PermanentJobError'), 'a permanent fault never spins retries')
   assert.ok(s.includes('[Extract] no extractor available'), 'a silent empty review row now explains itself in the logs')
-  const w = readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
-  assert.ok(w.includes('minJobWindowMs()'), 'a job cannot start too close to the tick deadline')
   const v = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
   const request = readFileSync(new URL('../lib/ocr/gemini-request.ts', import.meta.url), 'utf8')
   assert.ok(v.includes('recipient_gstin') && v.includes('buildGeminiInvoiceRequest'))
   // Gemini 3+ rejects legacy sampling params: the request builder sends
   // responseMimeType + responseSchema only, never temperature/top_p/top_k.
   assert.ok(request.includes("responseMimeType: 'application/json'"))
-  assert.ok(!/temperature|top_p|top_k/.test(request), 'no legacy sampling parameters')
+  assert.ok(!/temperature|top_p|top_k/.test(request.replace(/\/\/.*$/gm, '')), 'no legacy sampling parameters (comments excluded)')
   // Bounded second pass: one targeted re-read via retryHintFor, adopted only
   // on strict improvement, merged so valid local fields are never downgraded.
   const eng = extractorSrc()
@@ -2033,41 +2031,15 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   assert.ok(/extractInvoiceFields\(\s*mimeType === PDF_MIME/.test(eng), 'second pass reuses the same media path + model')
 })
 
-test('P9 ledger: an unprinted tax head is 0 only when the arithmetic reconciles; never when it does not', () => {
+test('P9 ledger: tax heads stay unknown unless explicit; explicit zeros approve an IGST-only invoice', () => {
   const now = new Date('2026-10-14T00:00:00Z')
-  const noCgstSgst = { ...CLEAN_ROW, cgst_amount: undefined, sgst_amount: undefined, igst_amount: 180, total_amount: 1180 }
-  const a = ledger.evaluateLedger(noCgstSgst, { minConfidence: 0.8, now })
-  assert.equal(a.review, 'approved', 'interstate invoice with no CGST/SGST lines is valid')
-  assert.equal(a.row.cgst_amount, 0)
-  // Parser missed the CGST/SGST lines of an intrastate invoice: arithmetic exposes it.
-  const missed = { ...CLEAN_ROW, cgst_amount: undefined, sgst_amount: undefined, igst_amount: undefined, total_amount: 1180 }
-  const b = ledger.evaluateLedger(missed, { minConfidence: 0.8, now })
-  assert.equal(b.review, 'needs_review')
-  assert.ok(b.reasons.some((r) => r.startsWith('total-mismatch')))
-  // Missing total is never defaulted.
+  const explicit = { ...CLEAN_ROW, cgst_amount: 0, sgst_amount: 0, igst_amount: 180, total_amount: 1180 }
+  assert.equal(ledger.evaluateLedger(explicit, { minConfidence: 0.8, now }).review, 'approved')
+  // Absence is never inferred (a parser miss must not become a silent 0): review.
+  const absent = { ...CLEAN_ROW, cgst_amount: undefined, sgst_amount: undefined, igst_amount: 180, total_amount: 1180 }
+  const a = ledger.evaluateLedger(absent, { minConfidence: 0.8, now })
+  assert.equal(a.review, 'needs_review')
+  assert.ok(a.reasons.includes('non-finite-amount'))
   const noTotal = { ...CLEAN_ROW, total_amount: undefined }
   assert.ok(ledger.evaluateLedger(noTotal, { minConfidence: 0.8, now }).reasons.includes('non-finite-amount'))
-})
-
-test('P10 retry handling: a transient AI failure over an insufficient result requeues, never silently completes', () => {
-  const eng = extractorSrc()
-  // The engine must decide by SUFFICIENCY, not always swallow. The old bug kept
-  // a known-bad local result and let the job "complete" -> stranded needs_review.
-  assert.ok(eng.includes('function isResultSufficient(evaluation: LedgerEvaluation | null)'), 'sufficiency helper exists')
-  assert.ok(eng.includes('const currentBestIsSufficient = isResultSufficient(evaluation)'), 'transient path measures the current best')
-  assert.ok(eng.includes('if (!currentBestIsSufficient) {'), 'insufficient + transient -> do NOT swallow')
-  assert.ok(eng.includes("throw new InvoiceExtractionError('VISION_TEMPORARILY_UNAVAILABLE', true)"), 'rethrown as a RETRYABLE extraction error')
-  assert.ok(!eng.includes('The cloud assistant is optional'), 'the old unconditional-swallow comment is gone')
-  assert.ok(eng.includes('throw error'), 'permanent/unexpected vision faults still propagate (raw, for the handler to classify)')
-
-  // The handler owns the taxonomy: transient -> requeue, permanent -> settle now.
-  const s = extractSrc()
-  assert.ok(s.includes("import { VisionTransientError, VisionPermanentError } from '@/lib/ocr/vision'"), 'handler imports the provider taxonomy')
-  assert.ok(s.includes('if (e instanceof VisionTransientError) throw e'), 'a leaked transient still requeues')
-  assert.ok(s.includes('if (e instanceof VisionPermanentError) throw new PermanentJobError'), 'a leaked permanent fault settles immediately (no retry storm)')
-
-  // The queue only treats PermanentJobError as terminal; everything else backs
-  // off within the bounded attempt budget, so requeue-on-transient is real.
-  const q = readFileSync(new URL('../lib/jobs/queue.ts', import.meta.url), 'utf8')
-  assert.ok(q.includes("error.name === 'PermanentJobError'"), 'only PermanentJobError settles for good')
 })

@@ -129,6 +129,10 @@ function startHeartbeat(db: Db, job: ClaimedJob, worker: string, leaseSeconds: n
       }
       throw lastError
     })().catch((error: unknown) => {
+      // A renewal that was already in flight when the handler finished races the
+      // job's own settlement (the row has just left 'processing'), so it is
+      // refused. That is expected once stop() was called: not an ownership loss.
+      if (stopped) throw error
       lost = error instanceof JobLeaseLostError
         ? error
         : new JobLeaseLostError('JOB_LEASE_RENEWAL_UNCONFIRMED')
@@ -223,6 +227,7 @@ export async function runWorkerTick(
     try {
       await handler({ db, job, worker, leaseSeconds, assertLease: heartbeat.assertOwned })
       await heartbeat.assertOwned()
+      heartbeat.stop() // stop renewing BEFORE the job settles
       const owned = await completeJob(db, job.id, worker)
       if (owned) result.completed += 1
       else {
@@ -230,6 +235,7 @@ export async function runWorkerTick(
         logger.warn('[Worker] completion fenced after handler', { jobId: job.id, worker })
       }
     } catch (e: unknown) {
+      heartbeat.stop() // never renew a lease while (or after) failing the job
       if (e instanceof JobLeaseLostError) {
         result.fenced += 1
         logger.warn('[Worker] handler stopped after lease loss', { jobId: job.id, worker })

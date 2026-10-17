@@ -40,12 +40,21 @@ const OPTIONAL_EVIDENCE_FIELDS = [
 const AMOUNT_FIELDS = [
   'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
 ] as const
-const CONFIDENCE_FIELDS = [
+// The confidence object the model is ASKED for (see confidenceSchema below) has
+// exactly these nine keys. The four optional evidence fields carry no confidence
+// of their own. The validator below must accept what the schema asks for: the
+// previous validator demanded 13 keys while the schema requested 9, so EVERY
+// valid Gemini answer was rejected as VISION_CONFIDENCE_KEYS_INVALID (permanent).
+const CORE_CONFIDENCE_FIELDS = [
   'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
   'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
-  'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words',
 ] as const
-const RESPONSE_FIELDS = [...TEXT_FIELDS, ...OPTIONAL_EVIDENCE_FIELDS, ...AMOUNT_FIELDS, 'confidence'] as const
+/** Confidence for an unknown amount may legitimately be null (schema: nullable). */
+const NULLABLE_CONFIDENCE_FIELDS = new Set<string>([
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+])
+/** Keys that MUST be present in a response; the optional evidence fields may be absent. */
+const REQUIRED_RESPONSE_FIELDS = [...TEXT_FIELDS, ...AMOUNT_FIELDS, 'confidence'] as const
 
 /** Only these transport types are meaningful image/PDF inputs for vision. */
 const SUPPORTED_MIME = /^(image\/(jpeg|png|webp)|application\/pdf)$/i
@@ -55,7 +64,10 @@ const VISION_PROMPT = [
   'explicitly printed on the document. Never guess, infer or compute a number, a',
   'date, or a GSTIN. If a text field is not present or not legible, return an',
   'empty string. For amount fields return null when unknown and numeric 0 only',
-  'when zero is explicitly printed or the tax head is demonstrably absent.',
+  'when zero is explicitly printed or the tax head is demonstrably absent. An',
+  'invoice charges EITHER IGST OR CGST+SGST, never both: when IGST is charged',
+  'return 0 for cgst_amount and sgst_amount; when CGST and SGST are charged',
+  'return 0 for igst_amount.',
   'Give every extracted field a confidence (0.0-1.0; never default to high).',
   'PARTIES: the SUPPLIER is the seller who ISSUED the invoice (letterhead, "Sold',
   'by", "Seller", "From"). The RECIPIENT is the buyer ("Bill to", "Ship to",',
@@ -188,10 +200,11 @@ export function parseVisionJson(text: string): LedgerCandidate {
     throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
   }
   const candidate = json as Record<string, unknown>
-  const keys = Object.keys(candidate).sort()
-  const expectedKeys = [...RESPONSE_FIELDS].sort()
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
-    throw new VisionPermanentError('VISION_SCHEMA_KEYS_INVALID')
+  // Required keys must be present. Optional evidence fields may be absent (read
+  // as null) and unknown extra keys are ignored: failing a whole invoice (a
+  // PERMANENT job failure) over metadata drift is far costlier than ignoring it.
+  for (const key of REQUIRED_RESPONSE_FIELDS) {
+    if (!(key in candidate)) throw new VisionPermanentError('VISION_SCHEMA_KEYS_INVALID')
   }
   for (const field of TEXT_FIELDS) {
     if (typeof candidate[field] !== 'string') {
@@ -199,6 +212,7 @@ export function parseVisionJson(text: string): LedgerCandidate {
     }
   }
   for (const field of OPTIONAL_EVIDENCE_FIELDS) {
+    if (candidate[field] === undefined) candidate[field] = null
     if (candidate[field] !== null && typeof candidate[field] !== 'string') {
       throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     }
@@ -212,19 +226,21 @@ export function parseVisionJson(text: string): LedgerCandidate {
   if (!candidate.confidence || typeof candidate.confidence !== 'object' || Array.isArray(candidate.confidence)) {
     throw new VisionPermanentError('VISION_CONFIDENCE_INVALID')
   }
-  const confidence = candidate.confidence as Record<string, unknown>
-  const confidenceKeys = Object.keys(confidence).sort()
-  const expectedConfidenceKeys = [...CONFIDENCE_FIELDS].sort()
-  if (confidenceKeys.length !== expectedConfidenceKeys.length
-    || confidenceKeys.some((key, index) => key !== expectedConfidenceKeys[index])) {
-    throw new VisionPermanentError('VISION_CONFIDENCE_KEYS_INVALID')
-  }
-  for (const field of CONFIDENCE_FIELDS) {
-    const value = confidence[field]
+  const rawConfidence = candidate.confidence as Record<string, unknown>
+  const confidence: Record<string, number> = {}
+  for (const field of CORE_CONFIDENCE_FIELDS) {
+    if (!(field in rawConfidence)) throw new VisionPermanentError('VISION_CONFIDENCE_KEYS_INVALID')
+    const value = rawConfidence[field]
+    // A null confidence for an unknown amount means "no belief": score it 0 so
+    // the ledger can only ever downgrade, never approve, on it.
+    if (value === null && NULLABLE_CONFIDENCE_FIELDS.has(field)) { confidence[field] = 0; continue }
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
       throw new VisionPermanentError(`VISION_CONFIDENCE_INVALID:${field}`)
     }
+    confidence[field] = value
   }
+  // Normalised: exactly the keys downstream consumes, all finite numbers in [0, 1].
+  candidate.confidence = confidence
   return candidate as unknown as LedgerCandidate
 }
 

@@ -432,6 +432,45 @@ async function extractScannedPdf(
   return { candidates, pagesProcessed: pageCount }
 }
 
+/**
+ * The image Gemini receives. NOT the OCR copy: normalizeImageToPng() makes a
+ * greyscale, contrast-stretched, up-to-2400px PNG for Tesseract (3.0 MB for a
+ * 126 KB phone JPEG), and uploading that 4 MB payload is what timed the call out.
+ * Vision models want the colour page at a modest size: EXIF-rotated, long edge
+ * <= 1600 px, JPEG q82 (typically 100-400 KB). Still decodes anything sharp can
+ * (HEIC/TIFF/WebP...), so unsupported-type handling is unchanged.
+ */
+const VISION_MAX_EDGE = 1600
+const VISION_JPEG_QUALITY = 82
+async function prepareImageForVision(buffer: Buffer): Promise<Buffer> {
+  try {
+    return await sharp(buffer, { limitInputPixels: MAX_IMAGE_PIXELS, animated: false, failOn: 'error' })
+      .rotate()
+      .flatten({ background: '#ffffff' })
+      .resize({ width: VISION_MAX_EDGE, height: VISION_MAX_EDGE, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: VISION_JPEG_QUALITY })
+      .toBuffer()
+  } catch (error) {
+    if (error instanceof InvoiceExtractionError) throw error
+    throw new InvoiceExtractionError(
+      'IMAGE_DECODE_FAILED: image format may be unsupported by this Sharp build',
+    )
+  }
+}
+
+/**
+ * Permanent AI failures that say "the model answered but its answer did not pass
+ * validation" (or the provider refused). They do NOT mean the invoice is
+ * unprocessable, so the invoice settles on the local result for human review
+ * instead of failing outright. Configuration / input faults (unsupported type,
+ * missing key, empty media) still fail the job so an operator sees them.
+ */
+const SETTLEABLE_VISION_FAILURE =
+  /^(VISION_SCHEMA_KEYS_INVALID|VISION_CONFIDENCE_KEYS_INVALID|VISION_CONFIDENCE_INVALID|VISION_FIELD_TYPE_INVALID|EMPTY_VISION_RESPONSE|UNPARSEABLE_VISION_JSON|provider_error)/
+export function isSettleableVisionFailure(message: string): boolean {
+  return SETTLEABLE_VISION_FAILURE.test(message)
+}
+
 async function extractLocal(
   buffer: Buffer,
   mimeType: string,
@@ -583,11 +622,11 @@ export async function extractInvoice(
       } else {
         // Gemini's existing transport supports JPEG/PNG/WebP.
         // Convert TIFF/BMP/GIF/HEIC/AVIF into a supported PNG first.
-        const normalized = await normalizeImageToPng(buffer)
+        const visionImage = await prepareImageForVision(buffer)
 
         aiCandidate = await extractInvoiceFields({
-          buffer: normalized,
-          mimeType: 'image/png',
+          buffer: visionImage,
+          mimeType: 'image/jpeg',
           apiKey,
           model,
         })
@@ -617,7 +656,7 @@ export async function extractInvoice(
           const retryCandidate = await extractInvoiceFields(
             mimeType === PDF_MIME
               ? { buffer, mimeType: PDF_MIME, apiKey, model, hint }
-              : { buffer: await normalizeImageToPng(buffer), mimeType: 'image/png', apiKey, model, hint },
+              : { buffer: await prepareImageForVision(buffer), mimeType: 'image/jpeg', apiKey, model, hint },
           )
           const retryAssisted = candidate
             ? mergeCandidates(candidate, retryCandidate)
@@ -688,15 +727,21 @@ export async function extractInvoice(
         })
       }
       else {
-        // Permanent / unexpected provider fault: a retry can never help. Rethrow
-        // the raw error so the handler classifies VisionPermanentError as a
-        // permanent failure (settle immediately) instead of spinning retries.
+        const failureCode = error instanceof Error ? error.message.split(':')[0] : 'VISION_PERMANENT'
+        const settleable = error instanceof Error && isSettleableVisionFailure(error.message)
         logger.warn('[Extract] AI fallback failed permanently', {
           model,
           durationMs: Date.now() - aiStartedAt,
-          failureCode: error instanceof Error ? error.message.split(':')[0] : 'VISION_PERMANENT',
+          failureCode,
+          settleOnLocal: settleable,
         })
-        throw error
+        // A validation/provider-answer failure must not destroy the invoice: keep
+        // the local candidate (or an empty row) as needs_review so the customer
+        // can still correct it. Config/input faults still fail the job loudly.
+        if (!settleable) throw error
+        logger.error('[Extract] AI result unusable; settling on local result for review', {
+          model, failureCode, localCandidatePreserved: candidate !== null,
+        })
       }
     }
   }
