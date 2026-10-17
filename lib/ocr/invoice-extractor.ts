@@ -13,6 +13,8 @@ import {
   retryHintFor,
   selectBestCandidate,
   detectCandidateConflicts,
+  presentFieldCount,
+  hardValidationFailureCount,
   type CandidateAssessment,
   type LedgerCandidate,
   type LedgerEvaluation,
@@ -682,9 +684,9 @@ export async function extractInvoice(
             reasonCodes: retryEvaluation.reasons.slice(0, 8),
           })
           // Adopt the re-read only when it is the BETTER merged result under the
-          // SAME ranking the final decision uses (approval, then fewer hard
-          // failures, then completeness, then measured confidence) — never on a
-          // bare "confidence went up", which threw away equally-safe, fuller reads.
+          // SAME ranking the final decision uses (approval, then completeness, then
+          // fewer hard failures, then measured confidence) — never on a bare
+          // "confidence went up", which threw away equally-safe, fuller reads.
           const passChoice = selectBestCandidate([
             { candidate: assisted, evaluation: aiEvaluation, source: 'ai' },
             { candidate: retryAssisted, evaluation: retryEvaluation, source: 'ai' },
@@ -732,10 +734,15 @@ export async function extractInvoice(
       logger.info('[Extract] candidate selected', {
         model,
         chosenSource: source,
+        selectionBasis: 'approved>completeness>hardFailures>confidence',
         localFieldCount: candidateFieldCount(localCandidate),
         localFieldNames: candidatePresentFields(localCandidate),
+        localRowCompleteness: localEvaluation ? presentFieldCount(localEvaluation.row) : 0,
+        localHardFailures: localEvaluation ? hardValidationFailureCount(localEvaluation.reasons) : 0,
         aiFieldCount: candidateFieldCount(aiCandidate),
         aiFieldNames: candidatePresentFields(aiCandidate),
+        aiRowCompleteness: presentFieldCount(evaluation.row),
+        aiHardFailures: hardValidationFailureCount(evaluation.reasons),
         selectedFieldCount: candidateFieldCount(candidate),
         conflictFields,
         review: evaluation.review,

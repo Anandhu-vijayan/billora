@@ -26,7 +26,13 @@ import { parseIndianAmountWords } from './validators/amount-words'
 const CONF_STRONG = 0.9 // value sat next to its own explicit label
 const CONF_WEAK = 0.6 // inferred positionally / contextually
 
-const DATE_TOKEN = '(\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{4}|\\d{4}-\\d{2}-\\d{2})'
+// One capturing group so downstream `sm[1] ?? sm[2] ?? sm[3]` indexing is stable.
+// Numeric day-first + ISO (as before), plus UNAMBIGUOUS month-name forms
+// ("5 Sep 2026", "Sep 5, 2026"); every form is anchored to a 4-digit year so an
+// ordinary word is never mistaken for a date. ledger.parseInvoiceDate normalizes
+// whatever this captures, and refuses any ambiguous / unknown-month reading.
+const DATE_TOKEN =
+  '(\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{4}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[ .-]+[A-Za-z]{3,9}[ .-]+\\d{4}|[A-Za-z]{3,9}[ .]+\\d{1,2},?[ .]+\\d{4})'
 
 /** Turn a captured money string into a finite number, or null when not clean. */
 function toAmount(raw: string | undefined): number | null {

@@ -88,6 +88,9 @@ const conv = await importTs('lib/whatsapp/conversation.ts')
 // ledger.ts is dependency-free (no aliases/provider imports), so the REAL
 // extraction-review decision logic is exercised in-process, not reimplemented.
 const ledger = await importTs('lib/ocr/ledger.ts')
+// validators/money.ts is dependency-free, so the REAL currency normalizer (the one
+// every amount in a candidate flows through) is exercised in-process, not copied.
+const money = await importTs('lib/ocr/validators/money.ts')
 const envValidation = await importTs('lib/env-validation.ts')
 // file-type.ts + statuses.ts are alias-free, so the REAL byte-sniffer, the REAL
 // size/pixel/page limits, and the REAL accepted-type set are tested in-process
@@ -2148,4 +2151,143 @@ test('P15 engine + handler wiring: ranking-based selection, conflict provenance,
   assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
   assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildComplianceExcelWorkbook'),
     'an all-review batch is a no-op that never reaches workbook generation/delivery')
+})
+
+// ---- Second-pass bug fix (17 Oct logs): selection precedence, money, dates ----
+
+const NOW_17 = new Date('2026-10-14T00:00:00Z')
+
+// A locale-formatted, internally consistent row: commas + ₹ + trailing /- must
+// parse, a legitimate 0 IGST must survive, and this row is genuinely APPROVABLE.
+test('P16 money: currency formats/commas/NBSP parse; zero preserved; NaN/Infinity/empty rejected', () => {
+  assert.equal(money.moneyToMinorUnits('1,18,200'), 11820000n)
+  assert.equal(money.moneyToMinorUnits('\u20b9 1,18,200/-'), 11820000n, 'rupee + trailing /- filler')
+  assert.equal(money.moneyToMinorUnits('Rs. 118200'), 11820000n)
+  assert.equal(money.moneyToMinorUnits('INR 1,18,200.50'), 11820050n)
+  assert.equal(money.moneyToMinorUnits('1\u00a018\u00a0200'), 11820000n, 'NBSP group separator')
+  assert.equal(money.moneyToMinorUnits('0'), 0n, 'legitimate zero is a real amount')
+  assert.equal(money.moneyToMinorUnits(0), 0n)
+  // Never a value: missing, non-finite, or not-a-number.
+  assert.equal(money.moneyToMinorUnits(''), null)
+  assert.equal(money.moneyToMinorUnits('N/A'), null)
+  assert.equal(money.moneyToMinorUnits('12abc'), null)
+  assert.equal(money.moneyToMinorUnits(Number.NaN), null)
+  assert.equal(money.moneyToMinorUnits(Number.POSITIVE_INFINITY), null)
+  assert.equal(money.moneyToMinorUnits(undefined), null)
+  // A comma/currency-formatted, consistent candidate is approvable end-to-end.
+  const ev = ledger.evaluateLedger({
+    invoice_date: '2026-09-05', invoice_number: 'INV-1', vendor_name: 'Acme Traders',
+    supplier_gstin: SUP_GSTIN, taxable_value: '1,000.00', cgst_amount: '90.00',
+    sgst_amount: '90.00', igst_amount: '0', total_amount: '\u20b91,180.00',
+  }, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(ev.review, 'approved', 'formatted money no longer collapses confidence to 0')
+  assert.equal(ev.row.total_amount, 1180)
+  assert.equal(ev.row.igst_amount, 0, 'explicit zero IGST is kept, not treated as missing')
+})
+
+test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge that stays in review', () => {
+  // Local found only 4 fields; the missing heads make amountsFinite false, so it
+  // reports non-finite-amount + confidence 0 (exactly the production log).
+  const local = {
+    invoice_number: 'INV-7', vendor_name: 'ACME PVT LTD', igst_amount: 23640, total_amount: 118200,
+    confidence: { invoice_number: 0.9, vendor_name: 0.9, igst_amount: 0.6, total_amount: 0.6 },
+  }
+  // The second pass carried 9 fields but its figures contradict each other (the
+  // logged 118200 != 116600 plus rate/amount-in-words mismatches).
+  const merged = {
+    invoice_number: 'INV-7', vendor_name: 'ACME PVT LTD', supplier_gstin: SUP_GSTIN,
+    invoice_date: '5 Sep 2026', taxable_value: 98400, cgst_amount: 9000, sgst_amount: 9200,
+    igst_amount: 23640, total_amount: 118200, cgst_rate_percent: 5, sgst_rate_percent: 5,
+    igst_rate_percent: 18, total_amount_in_words: 'One Lakh Sixteen Thousand Six Hundred Only',
+  }
+  const localEval = ledger.evaluateLedger(local, { minConfidence: 0.7, now: NOW_17 })
+  const mergedEval = ledger.evaluateLedger(merged, { minConfidence: 0.7, now: NOW_17 })
+  // The old ranking (hard-failure count ABOVE completeness) kept local: 1 code
+  // (`non-finite-amount`) beat the merge's several, discarding 5 useful fields.
+  assert.equal(localEval.review, 'needs_review')
+  assert.ok(localEval.reasons.includes('non-finite-amount'), 'missing heads read as non-finite, as in the log')
+  assert.equal(mergedEval.review, 'needs_review', 'the fuller merge is NOT auto-accepted')
+
+  const chosen = ledger.selectBestCandidate([
+    { candidate: local, evaluation: localEval, source: 'local' },
+    { candidate: merged, evaluation: mergedEval, source: 'ai' },
+  ])
+  assert.equal(chosen.source, 'ai', 'completeness is judged before failure count: the reviewer gets the fuller row')
+  assert.equal(chosen.evaluation.review, 'needs_review', 'the merge still requires review (nothing weakened)')
+  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('total-mismatch')), 'the real contradiction is still reported')
+  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('amount-words-total-mismatch')))
+  // And the resolved month-name date lets it batch into the right month.
+  assert.equal(chosen.evaluation.invoiceDateResolved, true)
+})
+
+test('P18 completeness-first is bounded: at equal completeness a contradiction loses to a clean row', () => {
+  // Both fully-populated and both needs_review; only self-report vs arithmetic.
+  const clean = { ...CLEAN_ROW, confidence: { ...CLEAN_ROW.confidence, total_amount: 0.2 } }
+  const bad = { ...CLEAN_ROW, total_amount: 1290 }
+  const cleanEval = ledger.evaluateLedger(clean, { minConfidence: 0.8, now: NOW_17 })
+  const badEval = ledger.evaluateLedger(bad, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(cleanEval.review, 'needs_review', 'a shaky self-report keeps it in review without a contradiction')
+  assert.ok(badEval.reasons.some((r) => r.startsWith('total-mismatch')))
+  // Contradictory candidate listed FIRST — it must still lose on the tie-break.
+  const chosen = ledger.selectBestCandidate([
+    { candidate: bad, evaluation: badEval, source: 'ai' },
+    { candidate: clean, evaluation: cleanEval, source: 'local' },
+  ])
+  assert.equal(chosen.source, 'local', 'a contradictory row never wins over an equally-full clean one')
+})
+
+test('P19 dates: unambiguous month-name + day-first numeric resolve; ambiguous/impossible stay unresolved', () => {
+  const full = (d) => ({ ...CLEAN_ROW, invoice_date: d })
+  const isoOf = (d) => ledger.evaluateLedger(full(d), { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(isoOf('5 Sep 2026').row.invoice_date, '2026-09-05')
+  assert.equal(isoOf('05-Sep-2026').row.invoice_date, '2026-09-05')
+  assert.equal(isoOf('5 September 2026').row.invoice_date, '2026-09-05')
+  assert.equal(isoOf('Sep 5, 2026').row.invoice_date, '2026-09-05')
+  assert.equal(isoOf('05/09/2026').row.invoice_date, '2026-09-05', 'numeric stays day-first (Indian convention)')
+  // Refused, never guessed:
+  for (const bad of ['5 J 2026', '5 Xyz 2026', '31 Feb 2026', '31/04/2026', 'not a date']) {
+    const ev = isoOf(bad)
+    assert.equal(ev.invoiceDateResolved, false, `${bad} must not be guessed`)
+    assert.ok(ev.reasons.includes('invoice-date-unresolved'))
+  }
+})
+
+test('P20 local text parser captures a month-name invoice date (not only the AI path)', () => {
+  const text = [
+    'ACME TRADERS PVT LTD', 'Tax Invoice', 'Invoice No: INV-9', 'Invoice Date: 05 Sep 2026',
+    `GSTIN: ${SUP_GSTIN}`, 'Taxable Value: 1,000.00', 'CGST 90.00', 'SGST 90.00', 'Grand Total: 1,180.00',
+  ].join('\n')
+  const cand = textParser.parseInvoiceText(text)
+  assert.ok(cand.invoice_date && /sep/i.test(cand.invoice_date), 'local regex finds the textual month date')
+  const ev = ledger.evaluateLedger({ ...CLEAN_ROW, invoice_date: cand.invoice_date }, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(ev.row.invoice_date, '2026-09-05')
+})
+
+test('P21 financial validation is NOT weakened to raise approvals', () => {
+  // Over the rounding tolerance -> flagged, not silently reconciled.
+  const over = ledger.evaluateLedger(
+    { ...CLEAN_ROW, total_amount: 1190 }, { minConfidence: 0.8, amountToleranceMinorUnits: 101, now: NOW_17 })
+  assert.equal(over.review, 'needs_review')
+  assert.ok(over.reasons.some((r) => r.startsWith('total-mismatch')))
+  // A printed rate that contradicts the amount -> flagged; we never derive a rate.
+  const rate = ledger.evaluateLedger(
+    { ...CLEAN_ROW, cgst_amount: 100, sgst_amount: 90, total_amount: 1190, cgst_rate_percent: 5 },
+    { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(rate.review, 'needs_review')
+  assert.ok(rate.reasons.some((r) => r.startsWith('tax-rate-mismatch')))
+})
+
+test('P22 source contract: ranking puts completeness before failure count; money + month-name support present', () => {
+  const ledSrc = readFileSync(new URL('../lib/ocr/ledger.ts', import.meta.url), 'utf8')
+  const iComplete = ledSrc.indexOf('if (aCount !== bCount) return aCount > bCount')
+  const iHard = ledSrc.indexOf('if (aHard !== bHard) return aHard < bHard')
+  assert.ok(iComplete >= 0 && iHard >= 0 && iComplete < iHard,
+    'completeness is compared BEFORE hard-failure count (the 17 Oct fix)')
+  assert.ok(ledSrc.includes('MONTH_NAMES') && ledSrc.includes('monthFromName'), 'month-name date support present')
+  const monSrc = readFileSync(new URL('../lib/ocr/validators/money.ts', import.meta.url), 'utf8')
+  assert.ok(monSrc.includes('Number.isFinite') && monSrc.includes('LEADING_CURRENCY'),
+    'money rejects non-finite numbers and tolerates currency tokens')
+  const eng = extractorSrc()
+  assert.ok(!eng.includes('aiEvaluation.confidence > evaluation.confidence'), 'the old confidence-gate stays gone')
+  assert.ok(eng.includes('selectionBasis'), 'the selection rationale is logged (no invoice contents leaked)')
 })

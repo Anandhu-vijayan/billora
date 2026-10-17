@@ -90,6 +90,23 @@ function isPlaceholderText(value: string): boolean {
   return PLACEHOLDER_TEXT.test(value.trim().replace(/[:._-]+/g, ' ').replace(/\s+/g, ' '))
 }
 
+/**
+ * Month names accepted for textual invoice dates. ONLY an exact 3-letter
+ * abbreviation, the common `sept`, or a full English name — never a fuzzy
+ * prefix, so ambiguous fragments ("J", "Ma", "Ju") are refused and the date
+ * stays unresolved instead of being guessed.
+ */
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+  may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11,
+  dec: 12, december: 12,
+}
+
+function monthFromName(token: string): number | null {
+  return MONTH_NAMES[token.toLowerCase()] ?? null
+}
+
 /** Parse the common Indian + ISO invoice date spellings to `YYYY-MM-DD`. */
 function parseInvoiceDate(raw: string | null | undefined): string | null {
   const s = (raw ?? '').trim();
@@ -101,12 +118,33 @@ function parseInvoiceDate(raw: string | null | undefined): string | null {
     return validateParts(Number(y), Number(m), Number(d)) ? `${y}-${m}-${d}` : null;
   }
   // Day-first: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy (Indian convention).
-  const dmy = /^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})$/.exec(s);
+  const dmy = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(s);
   if (dmy) {
     const [, dd, mm, yyyy] = dmy;
     const day = Number(dd), mon = Number(mm), year = Number(yyyy);
     if (validateParts(year, mon, day)) {
       return `${yyyy}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    return null;
+  }
+  // Month-name forms are UNAMBIGUOUS because the month is spelled out, so they
+  // are safe to accept: "5 Sep 2026", "05-Sep-2026", "5 September 2026".
+  const dMonthY = /^(\d{1,2})[ .\-]+([A-Za-z]{3,9})[ .\-]*(\d{4})$/.exec(s);
+  if (dMonthY) {
+    const mon = monthFromName(dMonthY[2]);
+    const day = Number(dMonthY[1]), year = Number(dMonthY[3]);
+    if (mon !== null && validateParts(year, mon, day)) {
+      return `${year}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    return null;
+  }
+  // Month-first with a spelled month: "Sep 5, 2026", "September 5 2026".
+  const monthDY = /^([A-Za-z]{3,9})[ .]+(\d{1,2}),?[ .]+(\d{4})$/.exec(s);
+  if (monthDY) {
+    const mon = monthFromName(monthDY[1]);
+    const day = Number(monthDY[2]), year = Number(monthDY[3]);
+    if (mon !== null && validateParts(year, mon, day)) {
+      return `${year}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     }
     return null;
   }
@@ -480,7 +518,7 @@ const HARD_VALIDATION_FAILURES = new Set([
   'candidate-conflict',
 ])
 
-function hardValidationFailureCount(reasons: readonly string[]): number {
+export function hardValidationFailureCount(reasons: readonly string[]): number {
   let n = 0
   for (const r of reasons) {
     if (HARD_VALIDATION_FAILURES.has(r.split(':')[0])) n += 1
@@ -489,7 +527,7 @@ function hardValidationFailureCount(reasons: readonly string[]): number {
 }
 
 /** How many canonical row fields actually carry a value (completeness). */
-function presentFieldCount(row: LedgerRow): number {
+export function presentFieldCount(row: LedgerRow): number {
   let n = 0
   if (row.invoice_date) n += 1
   if (row.invoice_number) n += 1
@@ -509,17 +547,26 @@ export interface CandidateAssessment {
 }
 
 /**
- * Pick the most trustworthy candidate from an ordered list. The rules are
- * lexicographic (each level is consulted only when all higher levels tie):
- *   1. an approved (all-checks-passed) row beats a needs_review row — strongest
- *      evidence is a row that actually PASSES validation, not one that merely
- *      looks fuller;
- *   2. fewer hard validation failures — a candidate that introduces a total/tax
- *     /date/GSTIN contradiction is discarded even if it carries more fields
- *      (so AI never wins "just because it has more fields");
- *   3. greater field completeness — a substantially more complete candidate is
- *      NOT thrown away because its confidence is equal or lower (this is the
- *      bug this function exists to fix);
+ * Pick the candidate that best REPRESENTS the document — i.e. the one a human
+ * reviewer can actually correct. This is a SELECTION rule, not an approval rule:
+ * whatever it returns is still re-validated, and any arithmetic contradiction
+ * (total/tax/amount-words mismatch) or cross-source conflict keeps the row in
+ * needs_review. Selection never auto-accepts anything.
+ *
+ * The rules are lexicographic (each level is consulted only when all higher
+ * levels tie):
+ *   1. an approved (all-checks-passed) row beats a needs_review row — a clean,
+ *      fully-valid candidate is never displaced by a richer but contradictory
+ *      merge (this is the "don't auto-accept conflicting AI" guard);
+ *   2. greater field completeness — between two rows that BOTH still need
+ *      review, prefer the one that carries more of the invoice. The 17 Oct bug
+ *      was a sparse local row (missing heads => one `non-finite-amount` code)
+ *      beating a far fuller merge simply because it happened to carry FEWER
+ *      reason codes; a partial row is not "safer", it is just less useful, so
+ *      completeness is judged BEFORE the failure count;
+ *   3. fewer hard validation failures — at EQUAL completeness, the less
+ *      self-contradictory candidate wins (so a fuller row can never bury an
+ *      equally-full clean one on field count alone);
  *   4. higher independently MEASURED confidence (never the model's self-report,
  *      which only ever lowers trust);
  *   5. full tie keeps the EARLIER candidate — stable, so a non-destructive merge
@@ -535,12 +582,12 @@ export function selectBestCandidate(
     const aApproved = a.evaluation.review === 'approved' ? 1 : 0
     const bApproved = b.evaluation.review === 'approved' ? 1 : 0
     if (aApproved !== bApproved) return aApproved > bApproved
-    const aHard = hardValidationFailureCount(a.evaluation.reasons)
-    const bHard = hardValidationFailureCount(b.evaluation.reasons)
-    if (aHard !== bHard) return aHard < bHard
     const aCount = presentFieldCount(a.evaluation.row)
     const bCount = presentFieldCount(b.evaluation.row)
     if (aCount !== bCount) return aCount > bCount
+    const aHard = hardValidationFailureCount(a.evaluation.reasons)
+    const bHard = hardValidationFailureCount(b.evaluation.reasons)
+    if (aHard !== bHard) return aHard < bHard
     if (a.evaluation.measuredConfidence !== b.evaluation.measuredConfidence) {
       return a.evaluation.measuredConfidence > b.evaluation.measuredConfidence
     }
