@@ -11,6 +11,9 @@ import {
   evaluateLedger,
   mergeCandidates,
   retryHintFor,
+  selectBestCandidate,
+  detectCandidateConflicts,
+  type CandidateAssessment,
   type LedgerCandidate,
   type LedgerEvaluation,
 } from '@/lib/ocr/ledger'
@@ -69,6 +72,12 @@ export interface InvoiceExtractionResult {
   confidence: number
   reasons: string[]
   pagesProcessed: number
+  /**
+   * Critical fields on which the LOCAL and AI readings both produced a valid but
+   * DIFFERENT value. Provenance for debugging; the handler refuses to auto-approve
+   * over an unreconciled conflict so these land in the human-review queue.
+   */
+  conflictFields: string[]
 }
 
 export class InvoiceExtractionError extends Error {
@@ -559,6 +568,7 @@ export async function extractInvoice(
   let source: ExtractionSource = 'human'
   let pagesProcessed = 0
   let localErrorCode: string | null = null
+  let conflictFields: string[] = []
 
   try {
     const local = await extractLocal(buffer, mimeType, maxPdfPages)
@@ -671,10 +681,15 @@ export async function extractInvoice(
             confidence: retryEvaluation.confidence,
             reasonCodes: retryEvaluation.reasons.slice(0, 8),
           })
-          // Adopt the re-read only when it strictly improves the outcome:
-          // an approval, or a higher measured confidence than the first read.
-          // Keep `assisted` in sync: the adoption block below persists it.
-          if (retryEvaluation.review === 'approved' || retryEvaluation.confidence > aiEvaluation.confidence) {
+          // Adopt the re-read only when it is the BETTER merged result under the
+          // SAME ranking the final decision uses (approval, then fewer hard
+          // failures, then completeness, then measured confidence) — never on a
+          // bare "confidence went up", which threw away equally-safe, fuller reads.
+          const passChoice = selectBestCandidate([
+            { candidate: assisted, evaluation: aiEvaluation, source: 'ai' },
+            { candidate: retryAssisted, evaluation: retryEvaluation, source: 'ai' },
+          ])! 
+          if (passChoice.candidate === retryAssisted) {
             aiCandidate = retryCandidate
             assisted = retryAssisted
             aiEvaluation = retryEvaluation
@@ -692,15 +707,41 @@ export async function extractInvoice(
         secondPass,
       })
 
-      if (
-        !evaluation ||
-        aiEvaluation.review === 'approved' ||
-        aiEvaluation.confidence > evaluation.confidence
-      ) {
-        candidate = assisted
-        evaluation = aiEvaluation
-        source = 'ai'
-      }
+      // Choose between the LOCAL-only result and the LOCAL+AI MERGE with one
+      // ranking rule (ledger.selectBestCandidate). The old gate kept the sparser
+      // local candidate whenever the merge was not approved AND its (self-report-
+      // capped) confidence did not strictly rise, so a far more complete AI read
+      // was silently thrown away. Confidence is now a tie-breaker, not a gate; a
+      // strictly more complete, equally-safe merge wins.
+      const localCandidate = candidate
+      const localEvaluation = evaluation
+      const localAssessment: CandidateAssessment | null =
+        localCandidate && localEvaluation
+          ? { candidate: localCandidate, evaluation: localEvaluation, source }
+          : null
+      const chosen = selectBestCandidate(
+        localAssessment
+          ? [localAssessment, { candidate: assisted, evaluation: aiEvaluation, source: 'ai' }]
+          : [{ candidate: assisted, evaluation: aiEvaluation, source: 'ai' }],
+      )!
+      conflictFields = localCandidate ? detectCandidateConflicts(localCandidate, aiCandidate) : []
+      candidate = chosen.candidate
+      evaluation = chosen.evaluation
+      if (chosen.source === 'ai') source = 'ai'
+
+      logger.info('[Extract] candidate selected', {
+        model,
+        chosenSource: source,
+        localFieldCount: candidateFieldCount(localCandidate),
+        localFieldNames: candidatePresentFields(localCandidate),
+        aiFieldCount: candidateFieldCount(aiCandidate),
+        aiFieldNames: candidatePresentFields(aiCandidate),
+        selectedFieldCount: candidateFieldCount(candidate),
+        conflictFields,
+        review: evaluation.review,
+        confidence: evaluation.confidence,
+        reasonCodes: evaluation.reasons.slice(0, 8),
+      })
     } catch (error) {
       if (error instanceof VisionTransientError) {
         // We only enter the AI block when the local result was ALREADY
@@ -754,12 +795,26 @@ export async function extractInvoice(
     source = 'human'
   }
 
+  // A critical-field conflict between the two sources is unreconciled
+  // disagreement: even a row that would otherwise auto-approve must NOT be
+  // silently blessed over it. Record it as an explicit, actionable reason and
+  // force human review (the handler enforces the same rule on its re-evaluation).
+  const finalReasons = [
+    ...evaluation.reasons,
+    ...conflictFields.map((field) => `candidate-conflict:${field}`),
+  ]
+  const finalReview: 'approved' | 'needs_review' =
+    evaluation.review === 'approved' && conflictFields.length > 0
+      ? 'needs_review'
+      : evaluation.review
+
   return {
     candidate: candidate ?? {},
     source,
-    review: evaluation.review,
+    review: finalReview,
     confidence: evaluation.confidence,
-    reasons: evaluation.reasons,
+    reasons: finalReasons,
     pagesProcessed,
-  } 
-}   
+    conflictFields,
+  }
+}

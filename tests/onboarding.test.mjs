@@ -2043,3 +2043,109 @@ test('P9 ledger: tax heads stay unknown unless explicit; explicit zeros approve 
   const noTotal = { ...CLEAN_ROW, total_amount: undefined }
   assert.ok(ledger.evaluateLedger(noTotal, { minConfidence: 0.8, now }).reasons.includes('non-finite-amount'))
 })
+
+test('P11 candidate ranking: a more complete, equally-safe merge wins over equal/lower confidence', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  // Local: everything valid EXCEPT the invoice number, self-reported high.
+  const local = {
+    ...CLEAN_ROW, invoice_number: undefined,
+    confidence: { invoice_date: 0.95, vendor_name: 0.95, supplier_gstin: 0.95, taxable_value: 0.95,
+      cgst_amount: 0.95, sgst_amount: 0.95, igst_amount: 0.95, total_amount: 0.95 },
+  }
+  // AI: complete, but unsure of the one field local lacks (invoice_number), which
+  // the merge must adopt as-is (local had nothing to override it with).
+  const ai = { ...CLEAN_ROW, confidence: { ...CLEAN_ROW.confidence, invoice_number: 0.2 } }
+  const localEval = ledger.evaluateLedger(local, { minConfidence: 0.8, now })
+  const merged = ledger.mergeCandidates(local, ai)
+  const mergedEval = ledger.evaluateLedger(merged, { minConfidence: 0.8, now })
+
+  assert.equal(localEval.review, 'needs_review')
+  assert.equal(mergedEval.review, 'needs_review', 'both are still needs_review (a low self-report, not a contradiction)')
+  assert.ok(!localEval.row.invoice_number && !!mergedEval.row.invoice_number, 'the merge is strictly more complete')
+  // This is exactly the case the OLD gate discarded: not approved AND confidence
+  // did NOT strictly improve, so it kept the sparser local row.
+  assert.ok(mergedEval.review !== 'approved' && !(mergedEval.confidence > localEval.confidence),
+    'old confidence-gate would have wrongly kept the local row')
+
+  const chosen = ledger.selectBestCandidate([
+    { candidate: local, evaluation: localEval, source: 'local' },
+    { candidate: merged, evaluation: mergedEval, source: 'ai' },
+  ])
+  assert.equal(chosen.source, 'ai', 'completeness (not a confidence gate) decides: the fuller merge wins')
+})
+
+test('P11b candidate ranking: more fields do NOT override a real contradiction', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  // Clean but sparse local row.
+  const local = { invoice_date: '2026-09-05', vendor_name: 'Acme', supplier_gstin: SUP_GSTIN,
+    invoice_number: 'INV-1', taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0, total_amount: 1180 }
+  const localEval = ledger.evaluateLedger(local, { minConfidence: 0.8, now })
+  // A fuller AI row that adds fields but breaks the arithmetic (a hard failure).
+  const aiFull = { ...CLEAN_ROW, total_amount: 1290 }
+  const aiEval = ledger.evaluateLedger(aiFull, { minConfidence: 0.8, now })
+  assert.ok(aiEval.reasons.some((r) => r.startsWith('total-mismatch')), 'the fuller row carries a real contradiction')
+  const chosen = ledger.selectBestCandidate([
+    { candidate: local, evaluation: localEval, source: 'local' },
+    { candidate: aiFull, evaluation: aiEval, source: 'ai' },
+  ])
+  assert.equal(chosen.source, 'local', 'a candidate that introduces a contradiction never wins on field count alone')
+})
+
+test('P12 detectCandidateConflicts: valid-but-different criticals are flagged; format diffs and repairs are not', () => {
+  assert.deepEqual(ledger.detectCandidateConflicts({ invoice_date: '05/09/2026' }, { invoice_date: '2026-09-05' }), [],
+    'the same date in two formats is not a conflict')
+  assert.deepEqual(ledger.detectCandidateConflicts({ invoice_date: '05/09/2026' }, { invoice_date: '06/09/2026' }), ['invoice_date'])
+  assert.deepEqual(ledger.detectCandidateConflicts({ supplier_gstin: SUP_GSTIN }, { supplier_gstin: BUY_GSTIN_MH }), ['supplier_gstin'])
+  assert.deepEqual(ledger.detectCandidateConflicts({ invoice_number: 'INV-77' }, { invoice_number: 'INV-99' }), ['invoice_number'])
+  assert.deepEqual(ledger.detectCandidateConflicts({ total_amount: 1180 }, { total_amount: 1181 }), ['total_amount'])
+  assert.deepEqual(ledger.detectCandidateConflicts({ total_amount: 1180 }, { total_amount: 1180.0 }), [], 'equal amount is not a conflict')
+  assert.deepEqual(ledger.detectCandidateConflicts({ invoice_date: 'not-a-date' }, { invoice_date: '2026-09-05' }), [],
+    'one invalid + one valid is a repair, not a conflict')
+  assert.deepEqual(ledger.detectCandidateConflicts({ invoice_date: '2026-09-05' }, {}), [], 'absence on one side is not a conflict')
+})
+
+test('P13 review classification: confidence never blesses missing criticals; optional gaps and reconciled zeros are fine', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  // (7) a high self-report cannot auto-approve over missing critical fields.
+  assert.equal(ledger.evaluateLedger({ invoice_date: '2026-09-05', confidence: { invoice_date: 0.99 } }, { minConfidence: 0.8, now }).review, 'needs_review')
+  // (8) absent OPTIONAL evidence (printed rates / amount-in-words) alone never forces review.
+  assert.equal(ledger.evaluateLedger({ ...CLEAN_ROW }, { minConfidence: 0.8, now }).review, 'approved')
+  // (9) explicit zero tax heads on an IGST-only invoice are legitimate, not "missing".
+  const ig = ledger.evaluateLedger({ ...CLEAN_ROW, cgst_amount: 0, sgst_amount: 0, igst_amount: 180, total_amount: 1180 }, { minConfidence: 0.8, now })
+  assert.equal(ig.review, 'approved')
+  assert.equal(ig.row.cgst_amount, 0)
+  // (10) a total beyond the rounding tolerance is flagged with an actionable code.
+  const oo = ledger.evaluateLedger({ ...CLEAN_ROW, total_amount: 1190 }, { minConfidence: 0.8, now })
+  assert.equal(oo.review, 'needs_review')
+  assert.ok(oo.reasons.some((r) => r.startsWith('total-mismatch')))
+})
+
+test('P14 empty extraction is an explicit review outcome, never a silent success', () => {
+  const now = new Date('2026-10-14T00:00:00Z')
+  const e = ledger.evaluateLedger({}, { minConfidence: Number.POSITIVE_INFINITY, now })
+  assert.equal(e.review, 'needs_review')
+  assert.equal(e.invoiceDateResolved, false, 'an undated row can never be batched')
+  assert.ok(e.reasons.length > 0)
+})
+
+test('P15 engine + handler wiring: ranking-based selection, conflict provenance, and export semantics', () => {
+  const eng = extractorSrc()
+  assert.ok(eng.includes('selectBestCandidate'), 'engine picks via the single ranking function, not per-branch confidence gates')
+  assert.ok(eng.includes('detectCandidateConflicts'), 'engine records local/AI critical-field conflicts')
+  assert.ok(eng.includes("'[Extract] candidate selected'"), 'selection (source + field counts + reason codes) is logged for debugging')
+  assert.ok(eng.includes('candidate-conflict:'), 'a conflict becomes an explicit, actionable reason code')
+  assert.ok(eng.includes('conflictFields'), 'conflict provenance rides on the result')
+  assert.ok(!eng.includes('aiEvaluation.confidence > evaluation.confidence'), 'the old confidence-gate that discarded the fuller merge is gone')
+  assert.ok(eng.includes("source = 'ai'"), 'AI provenance is still assigned')
+
+  const s = extractSrc()
+  assert.ok(s.includes('result.conflictFields'), 'handler consumes engine conflict provenance')
+  assert.ok(s.includes("evaluation.review = 'needs_review'"), 'a critical conflict forces the persisted review down')
+  assert.ok(s.includes('candidate-conflict:'), 'the persisted reasons name the conflict (they match the selected candidate)')
+
+  const reg = registerSrc()
+  assert.ok(reg.includes("eq('review_status', 'approved')"), 'the workbook exports ONLY approved rows')
+  assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
+  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildComplianceExcelWorkbook'),
+    'an all-review batch is a no-op that never reaches workbook generation/delivery')
+})

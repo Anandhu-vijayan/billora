@@ -405,6 +405,151 @@ export function evaluateLedger(
 }
 
 /**
+ * The fields on which two sources disagreeing is a RELIABILITY signal worth
+ * human review (not a mere optional-field gap). A difference is only a conflict
+ * when BOTH sources produced an independently VALID, materially different value —
+ * a repair of a value one source left missing/garbage is NOT a conflict.
+ */
+const CRITICAL_CONFLICT_FIELDS = ['invoice_date', 'invoice_number', 'supplier_gstin', 'total_amount'] as const
+
+const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v))
+
+function fieldIndependentlyValid(field: string, raw: unknown): boolean {
+  switch (field) {
+    case 'invoice_date': return parseInvoiceDate(asText(raw)) !== null
+    case 'supplier_gstin': return gstinFullyValid(asText(raw).trim().toUpperCase())
+    case 'invoice_number': { const s = asText(raw).trim(); return s !== '' && !isPlaceholderText(s) }
+    case 'total_amount': return moneyToMinorUnits(raw as number | string | null | undefined) !== null
+    default: return asText(raw).trim() !== ''
+  }
+}
+
+/** Canonicalise a value so a formatting difference is never read as a conflict. */
+function normalizeForCompare(field: string, raw: unknown): string {
+  switch (field) {
+    case 'invoice_date': return parseInvoiceDate(asText(raw)) ?? ''
+    case 'supplier_gstin': return asText(raw).trim().toUpperCase()
+    case 'invoice_number': return asText(raw).trim().toLowerCase().replace(/\s+/g, '')
+    case 'total_amount': {
+      const minor = moneyToMinorUnits(raw as number | string | null | undefined)
+      return minor === null ? '' : minor.toString()
+    }
+    default: return asText(raw).trim().toLowerCase()
+  }
+}
+
+/**
+ * Names of the critical fields on which two raw candidates both give a valid
+ * but different answer. Used to record provenance and to refuse a silent
+ * auto-approve over unreconciled disagreement (a machine must not pick a
+ * winner between two credible, contradictory human-visible readings).
+ */
+export function detectCandidateConflicts(
+  a: LedgerCandidate | null | undefined,
+  b: LedgerCandidate | null | undefined,
+): string[] {
+  if (!a || !b) return []
+  const out: string[] = []
+  for (const field of CRITICAL_CONFLICT_FIELDS) {
+    const va = (a as Record<string, unknown>)[field]
+    const vb = (b as Record<string, unknown>)[field]
+    if (
+      fieldIndependentlyValid(field, va)
+      && fieldIndependentlyValid(field, vb)
+      && normalizeForCompare(field, va) !== normalizeForCompare(field, vb)
+    ) {
+      out.push(field)
+    }
+  }
+  return out
+}
+
+/**
+ * Reason codes that mean "this row contains contradictory or outright invalid
+ * data" — as opposed to a field that is merely missing or softly low-confidence.
+ * A candidate that ADDS one of these is strictly less trustworthy, so it must
+ * not win a ranking purely for carrying more fields.
+ */
+const HARD_VALIDATION_FAILURES = new Set([
+  'invoice-date-future', 'invoice-date-before-gst', 'gstin-invalid', 'gstin-state-invalid',
+  'gstin-checksum-failed', 'invoice-number-placeholder', 'vendor-name-placeholder',
+  'non-finite-amount', 'negative-amount', 'total-mismatch', 'total-zero',
+  'igst-with-cgst-sgst', 'cgst-sgst-unequal', 'igst-on-intrastate', 'cgst-sgst-on-interstate',
+  'supplier-equals-recipient', 'tax-rate-mismatch', 'tax-rate-amount-missing', 'tax-rate-invalid',
+  'tax-rate-cgst-sgst-unequal', 'tax-rate-igst-with-cgst-sgst', 'amount-words-total-mismatch',
+  'candidate-conflict',
+])
+
+function hardValidationFailureCount(reasons: readonly string[]): number {
+  let n = 0
+  for (const r of reasons) {
+    if (HARD_VALIDATION_FAILURES.has(r.split(':')[0])) n += 1
+  }
+  return n
+}
+
+/** How many canonical row fields actually carry a value (completeness). */
+function presentFieldCount(row: LedgerRow): number {
+  let n = 0
+  if (row.invoice_date) n += 1
+  if (row.invoice_number) n += 1
+  if (row.vendor_name) n += 1
+  if (row.supplier_gstin) n += 1
+  for (const f of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) {
+    if (row[f] !== null && row[f] !== undefined) n += 1
+  }
+  return n
+}
+
+/** One fully-evaluated candidate + where it came from, ready to be ranked. */
+export interface CandidateAssessment {
+  candidate: LedgerCandidate
+  evaluation: LedgerEvaluation
+  source: string
+}
+
+/**
+ * Pick the most trustworthy candidate from an ordered list. The rules are
+ * lexicographic (each level is consulted only when all higher levels tie):
+ *   1. an approved (all-checks-passed) row beats a needs_review row — strongest
+ *      evidence is a row that actually PASSES validation, not one that merely
+ *      looks fuller;
+ *   2. fewer hard validation failures — a candidate that introduces a total/tax
+ *     /date/GSTIN contradiction is discarded even if it carries more fields
+ *      (so AI never wins "just because it has more fields");
+ *   3. greater field completeness — a substantially more complete candidate is
+ *      NOT thrown away because its confidence is equal or lower (this is the
+ *      bug this function exists to fix);
+ *   4. higher independently MEASURED confidence (never the model's self-report,
+ *      which only ever lowers trust);
+ *   5. full tie keeps the EARLIER candidate — stable, so a non-destructive merge
+ *      that adds nothing does not needlessly flip provenance.
+ * Confidence is a tie-breaker, never a gate, so a more-complete and equally-safe
+ * result always survives.
+ */
+export function selectBestCandidate(
+  assessments: readonly CandidateAssessment[],
+): CandidateAssessment | null {
+  if (assessments.length === 0) return null
+  const isBetter = (a: CandidateAssessment, b: CandidateAssessment): boolean => {
+    const aApproved = a.evaluation.review === 'approved' ? 1 : 0
+    const bApproved = b.evaluation.review === 'approved' ? 1 : 0
+    if (aApproved !== bApproved) return aApproved > bApproved
+    const aHard = hardValidationFailureCount(a.evaluation.reasons)
+    const bHard = hardValidationFailureCount(b.evaluation.reasons)
+    if (aHard !== bHard) return aHard < bHard
+    const aCount = presentFieldCount(a.evaluation.row)
+    const bCount = presentFieldCount(b.evaluation.row)
+    if (aCount !== bCount) return aCount > bCount
+    if (a.evaluation.measuredConfidence !== b.evaluation.measuredConfidence) {
+      return a.evaluation.measuredConfidence > b.evaluation.measuredConfidence
+    }
+    return false
+  }
+  return assessments.reduce((best, cur) => (isBetter(cur, best) ? cur : best))
+}
+
+/**
  * Turn the failed checks of a first read into one precise instruction for a
  * SECOND, targeted AI read. Only reasons a re-read can plausibly fix are
  * included (a misread digit, a swapped party, a wrong total); a field that is

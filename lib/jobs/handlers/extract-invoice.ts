@@ -148,6 +148,19 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     })
     const confidenceSource: ExtractionSource = result.source
 
+    // A critical-field conflict the engine detected is unreconciled disagreement
+    // between the local and AI readings. A machine must not silently pick a winner,
+    // so never auto-approve over it: downgrade to needs_review and make the reasons
+    // name the exact fields, so the persisted status describes the selected candidate.
+    const conflictFields = result.conflictFields ?? []
+    if (conflictFields.length > 0 && evaluation.review === 'approved') {
+      evaluation.review = 'needs_review'
+      evaluation.reasons = [...evaluation.reasons, ...conflictFields.map((f) => `candidate-conflict:${f}`)]
+      logger.info('[Extract] sources conflict on critical fields; forcing review', {
+        invoiceId, jobId: job.id, source: confidenceSource, conflictFields,
+      })
+    }
+
     // Say WHY nothing could read the file: a silent empty review row was previously
     // indistinguishable from a model failure in the logs.
     if (confidenceSource === 'human' && evaluation.review === 'needs_review') {
