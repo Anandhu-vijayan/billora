@@ -67,6 +67,54 @@ test('tax rates corroborate extracted amounts but never synthesize missing value
   assert.equal(missing[0].status, 'missing-amount')
 })
 
+test('an empty / not-applicable tax rate is skipped, never flagged invalid-rate', () => {
+  // Intra-state supply: vision returns "" for the IGST rate. Absence of a
+  // printed rate is not a financial error, so it must not route to review.
+  const withEmptyIgst = taxRates.checkPrintedTaxRates({
+    taxableValue: 253.41,
+    taxRates: { cgst: '5.00', sgst: '5.00', igst: '  ' },
+    taxAmounts: { cgst: 6.33, sgst: 6.33, igst: 0 },
+  })
+  assert.deepEqual(withEmptyIgst.map((item) => item.head), ['cgst', 'sgst'])
+  assert.deepEqual(withEmptyIgst.map((item) => item.status), ['match', 'match'])
+})
+
+test('combined item GST rate (5%) reconciles with per-component amounts (2.5% each)', () => {
+  // Real hospital invoice (Devamatha): the item line prints the TOTAL GST rate
+  // (5%) which splits equally into CGST + SGST (2.5% each). The model reads 5%
+  // into both per-component rate fields, but the AMOUNTS are correct. The
+  // amounts, GSTIN and total all reconcile, so this must auto-approve.
+  const result = ledger.evaluateLedger({
+    invoice_date: '15/10/2026',
+    invoice_number: '24425',
+    vendor_name: 'DEVAMATHA HOSPITAL',
+    supplier_gstin: '32AESPK2276E1ZI',
+    taxable_value: 253.41,
+    cgst_amount: 6.33,
+    sgst_amount: 6.33,
+    igst_amount: 0,
+    total_amount: 266,
+    cgst_rate_percent: '5.00',
+    sgst_rate_percent: '5.00',
+    igst_rate_percent: '',
+    total_amount_in_words: 'RUPEES TWO HUNDRED SIXTY SIX ONLY',
+  }, { minConfidence: 0.8, now: NOW })
+  assert.equal(result.review, 'approved')
+  assert.ok(!result.reasons.some((r) => r.startsWith('tax-rate-')))
+})
+
+test('a critical-field conflict only vetoes auto-approval between two CREDIBLE readings', () => {
+  const a = { invoice_number: '24425' }
+  const b = { invoice_number: '24426' }
+  // Both sources credible -> genuine contradiction -> conflict recorded (review).
+  assert.deepEqual(ledger.detectCandidateConflicts(a, b, { a: true, b: true }), ['invoice_number'])
+  // One side disqualified (zero-confidence OCR misread) -> noise, never a veto.
+  assert.deepEqual(ledger.detectCandidateConflicts(a, b, { a: false, b: true }), [])
+  assert.deepEqual(ledger.detectCandidateConflicts(a, b, { a: true, b: false }), [])
+  // No credibility info supplied -> legacy two-candidate comparison still flags.
+  assert.deepEqual(ledger.detectCandidateConflicts(a, b), ['invoice_number'])
+})
+
 test('local parser separates printed GST rates from their tax amounts and reads amount words', () => {
   const candidate = textParser.parseInvoiceText([
     'TAX INVOICE',

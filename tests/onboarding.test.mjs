@@ -2291,3 +2291,52 @@ test('P22 source contract: ranking puts completeness before failure count; money
   assert.ok(!eng.includes('aiEvaluation.confidence > evaluation.confidence'), 'the old confidence-gate stays gone')
   assert.ok(eng.includes('selectionBasis'), 'the selection rationale is logged (no invoice contents leaked)')
 })
+
+test('P23 dates: 2-digit-year month-name + numeric resolve via GST-era pivot; implausible still rejected', () => {
+  const iso = (d) => ledger.evaluateLedger({ ...CLEAN_ROW, invoice_date: d }, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(iso('22-Apr-23').row.invoice_date, '2023-04-22', 'the sample invoice\u2019s exact date')
+  assert.equal(iso('22/04/23').row.invoice_date, '2023-04-22', 'numeric day-first with 2-digit year')
+  assert.equal(iso('5 Sep 26').row.invoice_date, '2026-09-05')
+  // A 2-digit year can never smuggle an impossible date — the guards still apply.
+  assert.equal(iso('22-Apr-99').invoiceDateResolved, false, '1999 is pre-GST')
+  assert.equal(iso('22-Apr-30').invoiceDateResolved, false, '2030 is in the future')
+})
+
+test('P23b local parser captures a 2-digit-year month-name date (the sample invoice)', () => {
+  const text = ['ACME TRADERS PVT LTD', 'Tax Invoice', 'Invoice No: JPPH20212526', 'Invoice Date : 22-Apr-23',
+    `GSTIN: ${SUP_GSTIN}`, 'Taxable Value: 100000.00', 'CGST 10800.00', 'SGST 10800.00', 'Grand Total: 116800.00'].join('\n')
+  const cand = textParser.parseInvoiceText(text)
+  assert.ok(cand.invoice_date && /Apr/i.test(cand.invoice_date), 'local regex finds 22-Apr-23')
+  const ev = ledger.evaluateLedger({ ...CLEAN_ROW, invoice_date: cand.invoice_date }, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(ev.row.invoice_date, '2023-04-22')
+})
+
+test('P23c the sample invoice is a placeholder template: correctly stays in review even once the date parses', () => {
+  // MZUI sample template: fake GSTIN, "Add Company Name", and a tax breakdown that
+  // does not add up (CGST+SGST = 21600 != total). A correct engine MUST NOT approve it.
+  const ev = ledger.evaluateLedger({
+    invoice_date: '22-Apr-23', invoice_number: 'JPPH20212526', vendor_name: 'Add Company Name',
+    supplier_gstin: '29AAAAA1234F1Z4', taxable_value: 100000, cgst_amount: 10800,
+    sgst_amount: 10800, igst_amount: 0, total_amount: 116800,
+  }, { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(ev.invoiceDateResolved, true, 'the date fix works')
+  assert.equal(ev.review, 'needs_review', 'but the fake/inconsistent document is still (correctly) held')
+  assert.ok(ev.reasons.some((r) => r.startsWith('vendor-name-placeholder')))
+  assert.ok(ev.reasons.some((r) => r.startsWith('gstin-')))
+  assert.ok(ev.reasons.some((r) => r.startsWith('total-mismatch')))
+})
+
+test('P24 scanned-PDF fallback: pdf.js receives a COPY so the decrypted media buffer is never detached', () => {
+  // Regression: extractPdfTextLayer handed pdf.js a view over the caller's own
+  // ArrayBuffer (new Uint8Array(buffer.buffer, ...)). pdf.js detaches that
+  // backing store, so after reading a scanned PDF the handler's decrypted
+  // `plain` buffer became zero-length: the AI vision fallback then reported
+  // EMPTY_MEDIA and the plaintext wipe threw
+  // "Cannot perform %TypedArray%.prototype.fill on a detached ArrayBuffer".
+  // toUint8 must return a private copy instead.
+  const src = readFileSync(new URL('../lib/ocr/pdf.ts', import.meta.url), 'utf8')
+  assert.ok(!/new Uint8Array\(\s*buffer\.buffer\b/.test(src),
+    'toUint8 must NOT build a view over the caller ArrayBuffer')
+  assert.ok(/new Uint8Array\(buffer\.byteLength\)[\s\S]*copy\.set\(buffer\)/.test(src),
+    'toUint8 must allocate a private copy of the bytes')
+})

@@ -107,6 +107,20 @@ function monthFromName(token: string): number | null {
   return MONTH_NAMES[token.toLowerCase()] ?? null
 }
 
+/**
+ * Expand a printed year to a full 4-digit year. A 2-digit year ("23") uses a
+ * POSIX-style pivot (00..69 -> 2000s, 70..99 -> 1900s). This is safe for GST
+ * invoices because the GST-epoch and future-date guards in evaluateLedger still
+ * reject anything that cannot be a real invoice date, so a 2-digit year can
+ * never smuggle in an implausible date — it only lets a legible "22-Apr-23"
+ * resolve to 2023-04-22 instead of being dropped as unresolved.
+ */
+function expandYear(rawYear: string): number {
+  const y = Number(rawYear)
+  if (rawYear.length === 4) return y
+  return y <= 69 ? 2000 + y : 1900 + y
+}
+
 /** Parse the common Indian + ISO invoice date spellings to `YYYY-MM-DD`. */
 function parseInvoiceDate(raw: string | null | undefined): string | null {
   const s = (raw ?? '').trim();
@@ -117,32 +131,32 @@ function parseInvoiceDate(raw: string | null | undefined): string | null {
     const [, y, m, d] = iso;
     return validateParts(Number(y), Number(m), Number(d)) ? `${y}-${m}-${d}` : null;
   }
-  // Day-first: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy (Indian convention).
-  const dmy = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(s);
+  // Day-first: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy (Indian convention); a
+  // 2-digit year is expanded via expandYear.
+  const dmy = /^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2}|\d{4})$/.exec(s);
   if (dmy) {
-    const [, dd, mm, yyyy] = dmy;
-    const day = Number(dd), mon = Number(mm), year = Number(yyyy);
+    const day = Number(dmy[1]), mon = Number(dmy[2]), year = expandYear(dmy[3]);
     if (validateParts(year, mon, day)) {
-      return `${yyyy}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      return `${year}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     }
     return null;
   }
   // Month-name forms are UNAMBIGUOUS because the month is spelled out, so they
-  // are safe to accept: "5 Sep 2026", "05-Sep-2026", "5 September 2026".
-  const dMonthY = /^(\d{1,2})[ .\-]+([A-Za-z]{3,9})[ .\-]*(\d{4})$/.exec(s);
+  // are safe to accept: "5 Sep 2026", "05-Sep-2026", "22-Apr-23".
+  const dMonthY = /^(\d{1,2})[ .\-]+([A-Za-z]{3,9})[ .\-]*(\d{2}|\d{4})$/.exec(s);
   if (dMonthY) {
     const mon = monthFromName(dMonthY[2]);
-    const day = Number(dMonthY[1]), year = Number(dMonthY[3]);
+    const day = Number(dMonthY[1]), year = expandYear(dMonthY[3]);
     if (mon !== null && validateParts(year, mon, day)) {
       return `${year}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     }
     return null;
   }
   // Month-first with a spelled month: "Sep 5, 2026", "September 5 2026".
-  const monthDY = /^([A-Za-z]{3,9})[ .]+(\d{1,2}),?[ .]+(\d{4})$/.exec(s);
+  const monthDY = /^([A-Za-z]{3,9})[ .]+(\d{1,2}),?[ .]+(\d{2}|\d{4})$/.exec(s);
   if (monthDY) {
     const mon = monthFromName(monthDY[1]);
-    const day = Number(monthDY[2]), year = Number(monthDY[3]);
+    const day = Number(monthDY[2]), year = expandYear(monthDY[3]);
     if (mon !== null && validateParts(year, mon, day)) {
       return `${year}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     }
@@ -481,12 +495,24 @@ function normalizeForCompare(field: string, raw: unknown): string {
  * but different answer. Used to record provenance and to refuse a silent
  * auto-approve over unreconciled disagreement (a machine must not pick a
  * winner between two credible, contradictory human-visible readings).
+ *
+ * `credibility` gates WHICH pairings actually count. The safety intent is to
+ * stop a machine silently choosing between two TRUSTWORTHY but contradictory
+ * readings — so a conflict is only recorded when BOTH sides are credible. If
+ * one reading is itself disqualified (its evaluation was not approved, or it
+ * carries hard validation failures — e.g. a zero-confidence scanned-OCR mis
+ * read), its disagreement is noise, not a genuine contradiction, and must not
+ * veto the credible reading. The independent per-row validation still guards
+ * the selected candidate. When `credibility` is omitted we assume both sides
+ * are credible (a pure two-candidate comparison).
  */
 export function detectCandidateConflicts(
   a: LedgerCandidate | null | undefined,
   b: LedgerCandidate | null | undefined,
+  credibility?: { a: boolean; b: boolean },
 ): string[] {
   if (!a || !b) return []
+  if (credibility && (!credibility.a || !credibility.b)) return []
   const out: string[] = []
   for (const field of CRITICAL_CONFLICT_FIELDS) {
     const va = (a as Record<string, unknown>)[field]

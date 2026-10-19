@@ -67,7 +67,17 @@ async function loadPdfjs(): Promise<PdfModule | null> {
 }
 
 function toUint8(buffer: Buffer): Uint8Array {
-  return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  // Return a PRIVATE copy, never a view over the caller's ArrayBuffer.
+  // pdf.js treats `data` as transferable and DETACHES its backing ArrayBuffer
+  // (it posts it to the worker). The caller here is the decrypted media buffer,
+  // so sharing its backing store would leave the handler holding a detached,
+  // zero-length buffer: the AI vision fallback then sees EMPTY_MEDIA, and the
+  // plaintext wipe `plain.fill(0)` throws
+  // "Cannot perform %TypedArray%.prototype.fill on a detached ArrayBuffer".
+  // Copying keeps pdf.js's transfer separate from the caller's bytes.
+  const copy = new Uint8Array(buffer.byteLength)
+  copy.set(buffer)
+  return copy
 }
 
 async function openDoc(pdfjs: PdfModule, buffer: Buffer): Promise<PdfDoc> {

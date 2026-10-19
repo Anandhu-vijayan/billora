@@ -73,6 +73,11 @@ const serverSchema = z.object({
   // 'none' disables local extraction entirely; the other ids are operator-
   // wired adapters (see lib/ocr/local.ts + lib/ocr/engines/*).
   LOCAL_OCR_ENGINE: z.enum(['none', 'pdfjs-text', 'pdftotext', 'tesseract']).default('pdfjs-text'),
+  // LOCAL DEBUG ONLY. When true, the extraction handler logs the full field ->
+  // value map of the selected candidate at DEBUG level. logger.debug is dropped
+  // entirely when NODE_ENV=production, so real invoice values can never reach a
+  // production log sink even if this flag is left on. Leave unset in prod.
+  EXTRACTION_DEBUG_VALUES: boolFromEnv(false),
   // Public origin used to build authenticated workbook download links. When
   // unset the register is still generated but no link is delivered (fail-safe).
   PUBLIC_APP_URL: z.string().url().optional(),

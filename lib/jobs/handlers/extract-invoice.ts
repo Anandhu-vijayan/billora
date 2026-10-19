@@ -199,6 +199,27 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       reasonCodes: evaluation.reasons.slice(0, 8),
     })
 
+    // Opt-in local debugging: print the complete field -> value map that was
+    // extracted. Emitted at DEBUG level, which lib/logger drops when
+    // NODE_ENV=production, so this can never leak invoice values to a prod log
+    // sink even if the flag is left enabled. Enable locally with
+    // EXTRACTION_DEBUG_VALUES=true in .env and restart `next dev`.
+    if (getEnv().EXTRACTION_DEBUG_VALUES) {
+      const present = (o: Record<string, unknown>) => Object.fromEntries(
+        Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== ''),
+      )
+      logger.debug('[Extract.debug] full extraction values (LOCAL ONLY)', {
+        invoiceId,
+        jobId: job.id,
+        source: confidenceSource,
+        review: evaluation.review,
+        confidence: evaluation.confidence,
+        rawCandidate: present(result.candidate as unknown as Record<string, unknown>),
+        normalizedRow: present(evaluation.row as unknown as Record<string, unknown>),
+        reasonCodes: evaluation.reasons,
+      })
+    }
+
     // Route the invoice status. The invoices.status CHECK allows 'completed' but
     // NOT 'approved' ('approved' is an extracted_records.review_status value, not
     // an invoice lifecycle state), so a clean extraction lands as 'completed' and

@@ -726,7 +726,19 @@ export async function extractInvoice(
           ? [localAssessment, { candidate: assisted, evaluation: aiEvaluation, source: 'ai' }]
           : [{ candidate: assisted, evaluation: aiEvaluation, source: 'ai' }],
       )!
-      conflictFields = localCandidate ? detectCandidateConflicts(localCandidate, aiCandidate) : []
+      conflictFields = localCandidate
+        ? detectCandidateConflicts(localCandidate, aiCandidate, {
+            // A reading is credible only if ITSELF passed validation: approved
+            // with no hard failures. A disqualified source (e.g. a zero-
+            // confidence scanned-OCR misread that failed amount/GSTIN checks)
+            // cannot veto the clean reading it disagrees with.
+            a: !!localEvaluation
+              && localEvaluation.review === 'approved'
+              && hardValidationFailureCount(localEvaluation.reasons) === 0,
+            b: aiEvaluation.review === 'approved'
+              && hardValidationFailureCount(aiEvaluation.reasons) === 0,
+          })
+        : []
       candidate = chosen.candidate
       evaluation = chosen.evaluation
       if (chosen.source === 'ai') source = 'ai'
