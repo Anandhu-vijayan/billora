@@ -44,6 +44,14 @@ function pickCorrections(body: unknown): LedgerCandidate {
     const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : Number.NaN
     if (Number.isFinite(n) && n >= 0) out[f] = n
   }
+  // Optional reconciliation components a reviewer may correct; round_off (and a
+  // netting discount/deduction) can legitimately be negative, so no >= 0 gate.
+  const optFields = ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const
+  for (const f of optFields) {
+    const v = src[f]
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : Number.NaN
+    if (Number.isFinite(n)) out[f] = n
+  }
   return out
 }
 

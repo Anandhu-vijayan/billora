@@ -11,7 +11,7 @@ import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
 import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState } from '@/lib/whatsapp/sessions';
-import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, type SendOutcome } from '@/lib/whatsapp/send';
+import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, type SendOutcome } from '@/lib/whatsapp/send';
 import {
   ensureIndividualWorkspace, ensureOrganizationWorkspace,
   listClients, createClient, verifyClientInWorkspace,
@@ -22,7 +22,9 @@ import {
 } from '@/lib/whatsapp/intake';
 import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
+  composeConfirmResultMessage, type ConfirmOutcome,
 } from '@/lib/whatsapp/finalize';
+import { listPendingReview, confirmInvoice } from '@/lib/whatsapp/review-confirm';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -75,6 +77,8 @@ async function handleOnboardingSideEffects(
   let clientId: string | null = snapshot.clientId;
   let pendingClientId: string | null = snapshot.pendingClientId;
   let assignedNow = 0;
+  // Result of a WhatsApp-native review confirmation, delivered as the reply.
+  let confirmOutcome: ConfirmOutcome | null = null;
 
   // ---- provisioning + pending resolution (may rewrite nextState) ----
   if (result.note === 'individual-selected') {
@@ -115,6 +119,23 @@ async function handleOnboardingSideEffects(
   } else if (result.note === 'pending-confirm-no') {
     // Client stays active for FUTURE uploads; held files are NOT reassigned.
     pendingClientId = null;
+  } else if (result.note === 'review-confirm' && result.invoiceId) {
+    // A tapped Confirm row on the Review list: approve that invoice through the
+    // SHARED review path, scoped to the sender's own workspace. The action runs
+    // before the reply is sent; it is idempotent, so a redelivered webhook that
+    // re-confirms never duplicates a batch or a workbook job.
+    if (!workspaceId) {
+      confirmOutcome = { ok: false, error: 'NO_WORKSPACE' };
+    } else {
+      try {
+        confirmOutcome = await confirmInvoice(db, { workspaceId, invoiceId: result.invoiceId });
+      } catch (e) {
+        logger.warn('[WhatsApp] review confirm failed', {
+          sender: label, error: e instanceof Error ? e.message : String(e),
+        });
+        confirmOutcome = { ok: false, error: 'FAULT' };
+      }
+    }
   }
 
   // "Remember context, never guess a client": when a client just became
@@ -259,6 +280,31 @@ async function handleOnboardingSideEffects(
       }
       const held = waiting > 0 ? ` Also: ${waiting} file(s) are held for a client — send Change client to assign them.` : '';
       await deliverText(body + held);
+      // Offer tappable confirmations for pending invoices that can be approved
+      // as-is. Best-effort: missing keys or a read failure leaves the truthful
+      // text guidance above as the only reply (never a broken interactive send).
+      if (workspaceId) {
+        try {
+          const pending = await listPendingReview(db, workspaceId);
+          if (pending.length > 0) {
+            const outcome = await sendReviewList(to, pending);
+            if (outcome !== 'ok') {
+              logger.warn('[WhatsApp] review confirm list send failed', { sender: label, outcome });
+            }
+            track(outcome);
+          }
+        } catch (e) {
+          // Interactive confirm unavailable; the truthful text guidance above was
+          // already sent. Log so a query/decrypt regression is never silent.
+          logger.warn('[WhatsApp] review confirm list unavailable', {
+            sender: label, error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    } else if (result.note === 'review-confirm') {
+      await deliverText(composeConfirmResultMessage(confirmOutcome ?? { ok: false, error: 'FAULT' }));
+    } else if (result.note === 'review-confirm-invalid') {
+      await deliverText('That confirmation is no longer valid — send Review to see the current list.');
     } else if (result.outbound.kind === 'menu_list') {
       await deliverMenu(result.outbound.workspace);
     } else if (result.outbound.kind === 'text') {

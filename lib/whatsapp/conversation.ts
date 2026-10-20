@@ -25,6 +25,9 @@ export const REPLY_IDS = {
   MENU_DONE: 'billora:menu:done',
   MENU_HELP: 'billora:menu:help',
   MENU_CANCEL: 'billora:menu:cancel',
+  // WhatsApp-native review approval. The invoice id is embedded in the row id
+  // and validated below; the display label is never the authorization.
+  REVIEW_CONFIRM_PREFIX: 'billora:review:confirm:',
 } as const
 
 export const COMMANDS = {
@@ -63,6 +66,8 @@ export interface TransitionResult {
   workspaceId?: string | null
   clientId?: string | null
   batchId?: string | null
+  /** Present only for `review-confirm`: the invoice the reviewer tapped. */
+  invoiceId?: string
   note: string
 }
 
@@ -120,6 +125,16 @@ export function transition(input: TransitionInput): TransitionResult {
   // machine. A display label never authorizes an action; only the id routes.
   if (replyId && replyId.startsWith(REPLY_IDS.MENU_PREFIX)) {
     return menuTransition(session, replyId)
+  }
+  // A tapped "Confirm" row on the Review list: same state, but carry the
+  // validated invoice id so the route runs the approval. A malformed/stale id
+  // degrades to a re-prompt and never triggers a business action.
+  if (replyId && replyId.startsWith(REPLY_IDS.REVIEW_CONFIRM_PREFIX)) {
+    const invoiceId = replyId.slice(REPLY_IDS.REVIEW_CONFIRM_PREFIX.length)
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(invoiceId)) {
+      return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-confirm', invoiceId }
+    }
+    return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-confirm-invalid' }
   }
   switch (session.state) {
     case 'new':

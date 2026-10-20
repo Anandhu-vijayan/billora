@@ -187,3 +187,37 @@ export function sendMenu(to: string, opts: { workspace: boolean }): Promise<Send
     },
   })
 }
+
+/**
+ * Review confirmation list: one row per batchable needs_review invoice, labeled
+ * with the EXACT extracted invoice number / vendor / total the reviewer must
+ * affirm. Row ids are `billora:review:confirm:<invoiceId>` (validated by the
+ * conversation layer); the display title is never the authorization. Tapping a
+ * row confirms the values shown on it — it is not a blind "approve" button.
+ */
+export function sendReviewList(
+  to: string,
+  invoices: Array<{ invoiceId: string; invoiceNumber: string; vendorName: string | null; total: string | null }>,
+): Promise<SendOutcome> {
+  const rows = invoices.slice(0, 10).map((inv) => {
+    // Cloud API caps a list row TITLE at 24 chars; the longer detail goes in the
+    // optional DESCRIPTION (max 72). Exceeding the title limit makes Meta reject
+    // the entire list (error 100), so keep the title to the number + total.
+    const title = `#${inv.invoiceNumber.slice(0, 14)}${inv.total ? ` \u20b9${inv.total}` : ''}`.slice(0, 24)
+    const description = `${(inv.vendorName || 'Invoice').slice(0, 40)}${inv.total ? ` \u00b7 \u20b9${inv.total}` : ''} \u00b7 tap to confirm`.slice(0, 72)
+    return { id: `billora:review:confirm:${inv.invoiceId}`, title, description }
+  })
+  return postMessage({
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Confirm for review' },
+      body: {
+        text: 'Tap an invoice to confirm its number and approve it for the register. It is filed only under the month on its own invoice date.',
+      },
+      action: { button: 'Confirm', sections: [{ title: 'Needs review', rows }] },
+    },
+  })
+}

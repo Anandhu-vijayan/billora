@@ -104,6 +104,23 @@ export async function applyInvoiceReview(
     amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
   })
 
+  // A human approval must MEAN the reviewer confirmed the invoice's identity —
+  // not that they clicked approve to slip past the confidence gate. The stored
+  // row carries no AI self-confidence, so once origin is 'human' the low-
+  // confidence flag disappears on its own; without this guard a bare/empty
+  // submit would silently approve a value the reader was unsure about. We
+  // therefore honor an 'approved' outcome ONLY when the reviewer's own
+  // submitted corrections affirmatively carry the invoice number. The
+  // deterministic re-score above still guards the numbers either way.
+  const reviewerConfirmedInvoiceNumber =
+    typeof args.corrections.invoice_number === 'string' && args.corrections.invoice_number.trim() !== ''
+  let review = evaluation.review
+  const reasons = [...evaluation.reasons]
+  if (review === 'approved' && !reviewerConfirmedInvoiceNumber) {
+    review = 'needs_review'
+    reasons.push('review-confirmation-required')
+  }
+
   const keyVersion = deriveKeyVersion(masterKeyHex)
   const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
   const { error: recWriteErr } = await db.from('extracted_records').upsert({
@@ -111,7 +128,7 @@ export async function applyInvoiceReview(
     invoice_id: invoiceId,
     encrypted_payload: `\\x${payload.toString('hex')}`,
     encryption_key_version: keyVersion,
-    review_status: evaluation.review,
+    review_status: review,
     confidence_source: 'human',
     updated_at: new Date().toISOString(),
   }, { onConflict: 'invoice_id' })
@@ -119,13 +136,13 @@ export async function applyInvoiceReview(
 
   // 'approved' is an extracted_records value, never an invoices lifecycle status:
   // a clean confirmed invoice becomes 'completed', an incomplete one 'needs_review'.
-  const invoiceStatus = evaluation.review === 'approved' ? 'completed' : 'needs_review'
+  const invoiceStatus = review === 'approved' ? 'completed' : 'needs_review'
   const { error: stErr } = await db.from('invoices').update({ status: invoiceStatus })
     .eq('workspace_id', workspaceId).eq('id', invoiceId)
   if (stErr) throw new Error(`REVIEW_INVOICE_STATUS_ERROR: ${stErr.message}`)
 
   let batchId: string | null = invoice.batch_id
-  if (evaluation.review === 'approved' && evaluation.invoiceDateResolved) {
+  if (review === 'approved' && evaluation.invoiceDateResolved) {
     // Correct client + month from the CONFIRMED date; idempotent register enqueue.
     batchId = await resolveInvoiceBatch(db, {
       workspaceId, invoiceId, row: evaluation.row, invoice,
@@ -133,8 +150,8 @@ export async function applyInvoiceReview(
   }
 
   return {
-    review: evaluation.review,
-    reasons: evaluation.reasons,
+    review,
+    reasons,
     confidence: evaluation.confidence,
     batchId,
     row: evaluation.row,

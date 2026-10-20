@@ -101,6 +101,68 @@ export function composeReviewMessage(
   return 'Nothing needs your attention right now — keep sending invoices. Send Done to finalize a batch.'
 }
 
+/**
+ * Outcome of a WhatsApp-native review confirmation. `ok:false` means the action
+ * could not run (a fault / wrong tenant / already processed); `ok:true` carries
+ * the re-evaluated review result from the shared engine.
+ */
+export interface ConfirmOutcome {
+  ok: boolean
+  review?: 'approved' | 'needs_review'
+  reasons?: string[]
+  invoiceNumber?: string | null
+  vendorName?: string | null
+  batchId?: string | null
+  error?: 'NO_WORKSPACE' | 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT'
+}
+
+// Map internal reason codes to a plain-English clause so the reviewer sees WHY
+// an invoice is still held, never a raw code. Unknown codes are omitted rather
+// than dumped verbatim.
+const HUMAN_REASON: Record<string, string> = {
+  'review-confirmation-required': 'the invoice number was not confirmed',
+  'gstin-invalid': 'the GSTIN looks invalid',
+  'gstin-missing': 'the GSTIN is missing',
+  'total-mismatch': 'the amounts do not add up to the printed total',
+  'taxable-base-missing': 'the taxable value is missing',
+  'total-missing': 'the grand total is missing',
+  'vendor-name-missing': 'the vendor name is missing',
+  'invoice-number-missing': 'the invoice number is missing',
+  'non-finite-amount': 'an amount is unreadable',
+  'date-missing': 'there is no clear invoice date',
+  'low-confidence': 'a field is still low-confidence',
+}
+
+function humanizeReasons(reasons: string[]): string {
+  const seen = new Set<string>()
+  for (const r of reasons) {
+    const label = HUMAN_REASON[r.split(':')[0] ?? '']
+    if (label) seen.add(label)
+  }
+  return [...seen].join('; ')
+}
+
+/**
+ * Pure: turn a confirmation outcome into a truthful WhatsApp reply. An approval
+ * promises the register only as a later, automatic delivery (never a link here,
+ * since no workbook exists yet); a still-held invoice states the human reason.
+ */
+export function composeConfirmResultMessage(res: ConfirmOutcome): string {
+  if (!res.ok) {
+    if (res.error === 'NOT_FOUND') return "I couldn't find that invoice to confirm \u2014 send Review to see the current list."
+    if (res.error === 'NOT_PENDING') return `#${res.invoiceNumber ?? 'That invoice'} is already processed \u2014 no confirmation needed. Send Review for the current list.`
+    return 'Something went wrong confirming that invoice. Please try again, or send Review.'
+  }
+  const who = res.invoiceNumber
+    ? `#${res.invoiceNumber}${res.vendorName ? ` (${res.vendorName})` : ''}`
+    : 'That invoice'
+  if (res.review === 'approved') {
+    return `Confirmed ${who} \u2014 it's approved and filed under its own invoice month. Your Excel register will be sent here automatically once it's ready.`
+  }
+  const why = res.reasons && res.reasons.length > 0 ? humanizeReasons(res.reasons) : 'some required details are still incomplete'
+  return `I recorded your confirmation for ${who}, but it still needs attention \u2014 ${why}. It stays flagged until that's corrected. Send Review anytime.`
+}
+
 async function countJobs(db: Db, workspaceId: string, jobType: string, statuses: string[]): Promise<number> {
   const { count, error } = await db
     .from('processing_jobs').select('id', { count: 'exact', head: true })

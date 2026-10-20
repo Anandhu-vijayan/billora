@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { importTs } from '../scripts/_ts-import.mjs'
 
 const money = await importTs('lib/ocr/validators/money.ts')
@@ -7,6 +8,8 @@ const reconcile = await importTs('lib/ocr/calc/reconcile.ts')
 const gstin = await importTs('lib/ocr/gstin.ts')
 const ledger = await importTs('lib/ocr/ledger.ts')
 const textParser = await importTs('lib/ocr/text-parser.ts')
+const conversation = await importTs('lib/whatsapp/conversation.ts')
+const finalize = await importTs('lib/whatsapp/finalize.ts')
 
 const NOW = new Date('2026-10-19T00:00:00Z')
 const OPTS = { minConfidence: 0.8, now: NOW }
@@ -247,4 +250,62 @@ test('text-parser: captures a discount and freight component when printed', () =
   // 1,000 + 90 + 90 + 0 - 200 + 100 = 1,080 ties the printed grand total exactly.
   const result = ledger.evaluateLedger(candidate, OPTS)
   assert.equal(result.review, 'approved')
+})
+
+// ---------------------------------------------------------------------------
+// 6. WhatsApp-native review confirmation (routing + truthful messaging + guard)
+// ---------------------------------------------------------------------------
+const snap = (over = {}) => ({
+  senderHmac: 'h', state: 'collecting', workspaceId: 'ws', clientId: null,
+  batchId: null, pendingClientId: null, lastProviderMessageId: 'prev', expired: false, ...over,
+})
+
+test('conversation: a review-confirm row id routes to the confirm handler (state unchanged)', () => {
+  const id = '50430a9a-2e40-45b0-bcd0-9e23baab2339'
+  const r = conversation.transition({ session: snap(), replyId: `billora:review:confirm:${id}`, text: null, providerMessageId: 'm2' })
+  assert.equal(r.note, 'review-confirm')
+  assert.equal(r.invoiceId, id)
+  assert.equal(r.nextState, 'collecting')
+})
+
+test('conversation: a malformed review-confirm id degrades with no action', () => {
+  const r = conversation.transition({ session: snap(), replyId: 'billora:review:confirm:not-a-uuid', text: null, providerMessageId: 'm2' })
+  assert.equal(r.note, 'review-confirm-invalid')
+  assert.equal(r.invoiceId, undefined)
+})
+
+test('confirm message: approval promises a later register, never a fake link', () => {
+  const m = finalize.composeConfirmResultMessage({ ok: true, review: 'approved', invoiceNumber: '24425', vendorName: 'DEVAMATHA HOSPITAL' })
+  assert.match(m, /Confirmed #24425/)
+  assert.match(m, /register will be sent here automatically/)
+  assert.ok(!/\/api\/exports/.test(m), 'no download link is offered before a workbook exists')
+})
+
+test('confirm message: a still-held invoice states the human reason, not a raw code', () => {
+  const m = finalize.composeConfirmResultMessage({ ok: true, review: 'needs_review', invoiceNumber: '24425', reasons: ['gstin-invalid'] })
+  assert.match(m, /still needs attention/)
+  assert.match(m, /GSTIN looks invalid/)
+  assert.ok(!/gstin-invalid/.test(m), 'the raw reason code is never shown to the user')
+})
+
+test('confirm message: a stale tap on an already-processed invoice is reported honestly', () => {
+  const m = finalize.composeConfirmResultMessage({ ok: false, error: 'NOT_PENDING', invoiceNumber: '24425' })
+  assert.match(m, /already processed/)
+})
+
+const readSrc = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8')
+
+test('review guard: an approval requires the reviewer to confirm the invoice number', () => {
+  const s = readSrc('lib/invoices/review.ts')
+  assert.match(s, /reviewerConfirmedInvoiceNumber/)
+  assert.match(s, /review-confirmation-required/)
+  assert.match(s, /approved' && !reviewerConfirmedInvoiceNumber/)
+})
+
+test('route wiring: WhatsApp confirm list + confirm handler are connected', () => {
+  const s = readSrc('app/api/whatsapp/route.ts')
+  assert.match(s, /confirmInvoice\(/)
+  assert.match(s, /listPendingReview\(/)
+  assert.match(s, /sendReviewList\(/)
+  assert.match(s, /composeConfirmResultMessage\(/)
 })
