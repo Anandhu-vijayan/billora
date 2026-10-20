@@ -116,11 +116,39 @@ function findDate(text: string): { value: string; confidence: number } | null {
 }
 
 function findInvoiceNumber(text: string): { value: string; confidence: number } | null {
-  const re = /(?:invoice|inv|bill|document|doc)[\s.#/-]*(?:no|number|#)[^\w]{0,3}([A-Za-z0-9][A-Za-z0-9\-/]{2,30})/i
-  const m = re.exec(text)
-  if (m) return { value: m[1], confidence: CONF_STRONG }
+  // A number that sits on a purchase-order / e-way-bill / delivery / vehicle /
+  // consignment / challan line belongs to a DIFFERENT document and must never
+  // become the register's invoice key. Those are matched only on their own line
+  // so an unrelated "Invoice No" line elsewhere still wins.
+  for (const line of text.split('\n')) {
+    const m = INVOICE_NO_STRONG.exec(line) ?? DOC_NO.exec(line)
+    if (m) return { value: m[1], confidence: CONF_STRONG }
+  }
+  // An "INV-xxxx" style token needs no label at all (very common in Indian GST).
+  const bare = BARE_INV_TOKEN.exec(text)
+  if (bare) return { value: bare[1], confidence: CONF_STRONG }
+  // A bare "Bill No" is only the invoice number when its own line carries none
+  // of the disqualifying prefixes; scored WEAK so it cannot auto-approve alone.
+  for (const line of text.split('\n')) {
+    if (NOT_INVOICE_NUMBER.test(line)) continue
+    const m = BILL_NO.exec(line)
+    if (m) return { value: m[1], confidence: CONF_WEAK }
+  }
   return null
 }
+
+/**
+ * Invoice-number patterns. `INVOICE_NO_STRONG` / `DOC_NO` sit next to their own
+ * label; `BARE_INV_TOKEN` catches an unlabelled "INV-000125"; `BILL_NO` is the
+ * ambiguous plain "Bill No" accepted only on a line free of the disqualifying
+ * `NOT_INVOICE_NUMBER` context (PO / purchase order / e-way / delivery / vehicle
+ * / consignment / LR / challan), because those are other documents' numbers.
+ */
+const INVOICE_NO_STRONG = /(?:tax\s+invoice|invoice|inv)[\s.#/-]*(?:no\.?|number|#)[^\w]{0,3}([A-Za-z0-9][A-Za-z0-9\-/]{2,30})/i
+const DOC_NO = /(?:document|doc)[\s.#/-]*(?:no\.?|number|#)[^\w]{0,3}([A-Za-z0-9][A-Za-z0-9\-/]{2,30})/i
+const BARE_INV_TOKEN = /\b(INV[-_/][A-Za-z0-9][A-Za-z0-9\-/]{2,28})\b/i
+const NOT_INVOICE_NUMBER = /\b(po|p\.o\.|purchase\s+order|e-?way|way\s*bill|delivery|consign|vehicle|\blr\b|\bdo\b|\bgrn\b|challan)\b/i
+const BILL_NO = /(?:^|[\s(;])bill[\s.#/-]*(?:no\.?|number|#)[^\w]{0,3}([A-Za-z0-9][A-Za-z0-9\-/]{2,30})/i
 
 function findGstin(
   text: string,
@@ -221,6 +249,20 @@ export function parseInvoiceText(
     candidate.igst_amount = igst.value
     candidate.confidence.igst_amount = igst.confidence
   }
+  // Optional structural components the fixed total equation could not carry.
+  // Only folded into reconciliation when actually printed AND needed to tie the
+  // total (the shared engine tries the canonical reading first), so an imperfect
+  // local label match here can never, on its own, approve or falsely fail a row.
+  const cess = findLabeledAmount(normalized, /\bcess\b/i)
+  if (cess) candidate.cess_amount = cess.value
+  const discount = findLabeledAmount(normalized, /(?:total\s+)?discount(?:\s+(?:amount|value|amt))?/i)
+  if (discount) candidate.discount_amount = discount.value
+  const shipping = findLabeledAmount(normalized, /shipping|freight|carriage|packaging|handling|forwarding|other\s+charges?/i)
+  if (shipping) candidate.shipping_amount = shipping.value
+  const deduction = findLabeledAmount(normalized, /deduction(?:s)?|tds\s+on\s+payment|advance\s+(?:received|adjusted)/i)
+  if (deduction) candidate.deduction_amount = deduction.value
+  const roundOff = findLabeledAmount(normalized, /round\s*off|rounding(?:\s+off)?/i)
+  if (roundOff) candidate.round_off = roundOff.value
   const cgstRate = findLabeledRate(normalized, /cgst|central\s+tax/i)
   const sgstRate = findLabeledRate(normalized, /sgst|state\s+tax/i)
   const igstRate = findLabeledRate(normalized, /igst|integrated\s+tax/i)

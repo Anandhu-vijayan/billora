@@ -15,7 +15,8 @@
 //     (structural typing keeps the two in sync without a runtime import).
 import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
 import { validateInvoiceCrossChecks } from './validators'
-import { minorUnitsToNumber, minorUnitsToString, moneyToMinorUnits } from './validators/money'
+import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
+import { reconcileInvoiceTotal } from './calc/reconcile'
 
 export interface LedgerRow {
   invoice_date: string;
@@ -46,6 +47,19 @@ export interface LedgerCandidate {
   sgst_amount?: number | string | null;
   igst_amount?: number | string | null;
   total_amount?: number | string | null;
+  /**
+   * Optional structural components a fixed `taxable+tax=total` equation cannot
+   * represent. Absent (undefined/null) means "not printed on the document", NOT
+   * zero — the shared reconciliation engine in ./calc/reconcile only folds them
+   * in when actually present, so a plain invoice behaves exactly as before while
+   * a discounted / freighted / cess / round-off invoice can finally tie out.
+   * They are validation inputs only; they never overwrite a canonical field.
+   */
+  cess_amount?: number | string | null;
+  shipping_amount?: number | string | null;
+  discount_amount?: number | string | null;
+  deduction_amount?: number | string | null;
+  round_off?: number | string | null;
   cgst_rate_percent?: number | string | null;
   sgst_rate_percent?: number | string | null;
   igst_rate_percent?: number | string | null;
@@ -276,6 +290,17 @@ export function mergeCandidates(
       if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
     }
   }
+  // Optional structural components: keep whichever source printed a parseable
+  // value (primary/local preferred), preserving provenance. Unlike the canonical
+  // heads these are legitimately absent, and `round_off` may be negative, so the
+  // bar here is simply "carries a finite amount", not the >= 0 amount-validity.
+  const carriesAmount = (raw: number | string | null | undefined): boolean =>
+    moneyToMinorUnits(raw) !== null
+  for (const field of ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const) {
+    if (carriesAmount(primary[field])) {
+      ;(merged as Record<string, unknown>)[field] = primary[field]
+    }
+  }
   if (!(merged.recipient_gstin ?? '').trim() && (primary.recipient_gstin ?? '').trim()) {
     merged.recipient_gstin = primary.recipient_gstin
   }
@@ -362,12 +387,27 @@ export function evaluateLedger(
   if (amounts.some((n) => Number.isFinite(n) && n < 0)) reasons.push('negative-amount');
   if (amountsFinite) {
     const [taxableMinor, cgstMinor, sgstMinor, igstMinor, totalMinor] = amountMinorUnits as bigint[];
-    const taxSumMinor = taxableMinor + cgstMinor + sgstMinor + igstMinor;
-    const differenceMinor = taxSumMinor > totalMinor ? taxSumMinor - totalMinor : totalMinor - taxSumMinor;
+    // Single, shared calculation engine (see ./calc/reconcile). The old code
+    // hard-coded `taxable + cgst + sgst + igst === total`, which wrongly flagged
+    // every invoice that prints a discount, freight, cess, deduction or round-off
+    // (the Zetran sample false `total-mismatch`). We now reconcile the printed
+    // total against all components the source actually carried.
     const toleranceMinorUnits = BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101)))
-    if (differenceMinor > toleranceMinorUnits) {
+    const reconciliation = reconcileInvoiceTotal({
+      taxable: taxableMinor,
+      cgst: cgstMinor,
+      sgst: sgstMinor,
+      igst: igstMinor,
+      cess: moneyToMinorUnits(candidate.cess_amount),
+      shipping: moneyToMinorUnits(candidate.shipping_amount),
+      discount: moneyToMinorUnits(candidate.discount_amount),
+      deduction: moneyToMinorUnits(candidate.deduction_amount),
+      roundOff: moneyToMinorUnits(candidate.round_off),
+      printedTotal: totalMinor,
+    }, toleranceMinorUnits)
+    if (reconciliation.status !== 'reconciles') {
       arithmeticConsistent = false;
-      reasons.push(`total-mismatch:${minorUnitsToString(taxSumMinor)}!=${minorUnitsToString(totalMinor)}`);
+      reasons.push(...reconciliation.reasons);
     }
     // Structure checks. Extractors return 0 for "not found", so an all-zero
     // total is a miss, not an invoice; and the tax heads must be coherent.

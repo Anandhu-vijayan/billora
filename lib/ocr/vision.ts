@@ -40,6 +40,14 @@ const OPTIONAL_EVIDENCE_FIELDS = [
 const AMOUNT_FIELDS = [
   'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
 ] as const
+// Optional structural components a plain `taxable + tax = total` cannot carry
+// (discount, freight, cess, deduction, round-off). NEVER required and NEVER
+// given a confidence key: a model that omits them, or returns a malformed value
+// for them, must still be accepted — they only assist the shared reconciliation
+// engine and can never, on their own, approve or fail an invoice.
+const OPTIONAL_AMOUNT_FIELDS = [
+  'cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off',
+] as const
 // The confidence object the model is ASKED for (see confidenceSchema below) has
 // exactly these nine keys. The four optional evidence fields carry no confidence
 // of their own. The validator below must accept what the schema asks for: the
@@ -81,6 +89,12 @@ const VISION_PROMPT = [
   'return them as strings without the percent sign; otherwise return an empty',
   'string. Copy the printed total amount-in-words exactly, or return an empty',
   'string when it is absent. Never infer a rate or amount-in-words.',
+  'OPTIONAL COMPONENTS: when the invoice EXPLICITLY prints any of these amounts,',
+  'return them (plain numbers); otherwise return null for each. discount_amount',
+  'is a line or invoice-level discount; shipping_amount is freight / packaging /',
+  'handling / other charges; cess_amount is a GST cess; deduction_amount is an',
+  'explicit deduction (e.g. advance or TDS on payment); round_off is the final',
+  'rounding (may be negative). Never compute or guess one that is not printed.',
   'DATES: invoice_date is the INVOICE date, never the due, order, delivery or PO',
   'date. Return it as printed (prefer DD/MM/YYYY or YYYY-MM-DD).',
   'GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1',
@@ -124,6 +138,11 @@ const LEDGER_SCHEMA = {
     sgst_amount: { type: Type.NUMBER },
     igst_amount: { type: Type.NUMBER },
     total_amount: { type: Type.NUMBER },
+    cess_amount: { type: Type.NUMBER, nullable: true },
+    shipping_amount: { type: Type.NUMBER, nullable: true },
+    discount_amount: { type: Type.NUMBER, nullable: true },
+    deduction_amount: { type: Type.NUMBER, nullable: true },
+    round_off: { type: Type.NUMBER, nullable: true },
     cgst_rate_percent: { type: Type.STRING, nullable: true },
     sgst_rate_percent: { type: Type.STRING, nullable: true },
     igst_rate_percent: { type: Type.STRING, nullable: true },
@@ -138,6 +157,7 @@ const LEDGER_SCHEMA = {
   propertyOrdering: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+    'cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off',
     'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
   ],
 }
@@ -222,6 +242,13 @@ export function parseVisionJson(text: string): LedgerCandidate {
     if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) {
       throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     }
+  }
+  // Optional structural components: absent or malformed is tolerated as null,
+  // never a permanent failure — they only assist reconciliation.
+  for (const field of OPTIONAL_AMOUNT_FIELDS) {
+    const value = candidate[field]
+    if (value === undefined) { candidate[field] = null; continue }
+    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) candidate[field] = null
   }
   if (!candidate.confidence || typeof candidate.confidence !== 'object' || Array.isArray(candidate.confidence)) {
     throw new VisionPermanentError('VISION_CONFIDENCE_INVALID')

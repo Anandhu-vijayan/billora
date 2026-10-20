@@ -1,5 +1,7 @@
 // lib/ocr/quality.ts — Checks for structure anomalies and data corruption.
 import { logger } from '@/lib/logger'
+import { moneyToMinorUnits } from './validators/money'
+import { reconcileInvoiceTotal } from './calc/reconcile'
 
 export interface QualityVerdict {
   ok: boolean
@@ -25,7 +27,13 @@ export function isValidGstin(value: string): boolean {
   return GSTIN_RE.test(value.trim().toUpperCase())
 }
 
-/** Row-level anomaly scan for extracted ledger rows (NaN, negatives, totals mismatch). */
+/**
+ * Row-level anomaly scan for extracted ledger rows (NaN, negatives, totals
+ * mismatch). Delegates the total arithmetic to the SINGLE shared calculation
+ * engine (./calc/reconcile) so this path can never diverge from the extraction
+ * / review / export decision — the previous inline `taxable+tax` sum with a
+ * magic `1.01` float tolerance is removed.
+ */
 export function checkLedgerRowAnomalies(row: {
   taxable_value: number
   cgst_amount: number
@@ -37,9 +45,14 @@ export function checkLedgerRowAnomalies(row: {
   const nums = [row.taxable_value, row.cgst_amount, row.sgst_amount, row.igst_amount, row.total_amount]
   if (nums.some((n) => !Number.isFinite(n))) reasons.push('non-finite amount detected')
   if (nums.some((n) => n < 0)) reasons.push('negative amount detected')
-  const taxSum = row.taxable_value + row.cgst_amount + row.sgst_amount + row.igst_amount
-  if (Math.abs(taxSum - row.total_amount) > 1.01) {
-    reasons.push(`total mismatch: taxable+tax=${taxSum.toFixed(2)} vs total=${row.total_amount.toFixed(2)}`)
+  if (nums.every((n) => Number.isFinite(n))) {
+    const [taxable, cgst, sgst, igst, total] = nums.map((n) => moneyToMinorUnits(n))
+    const reconciliation = reconcileInvoiceTotal({ taxable, cgst, sgst, igst, printedTotal: total }, BigInt(101))
+    if (reconciliation.status === 'mismatch') {
+      reasons.push(`total mismatch: components sum to ${reconciliation.expectedMinor}, printed total is ${reconciliation.printedMinor}`)
+    } else if (reconciliation.status === 'unverifiable') {
+      reasons.push('total could not be reconciled from the available components')
+    }
   }
   if (reasons.length > 0) logger.warn('ledger row anomaly', { reasons })
   return { ok: reasons.length === 0, reasons, score: reasons.length === 0 ? 1 : 0 }
