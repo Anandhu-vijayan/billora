@@ -122,17 +122,44 @@ export async function resolveInvoiceBatch(
   if (!invoice) return null
 
   let batchId: string
+  // Resolve the period ONLY from a reliably parsed invoice date; never fall back
+  // to the upload month — a guessed period silently files the invoice wrong.
+  const iso = args.row && typeof args.row.invoice_date === 'string'
+    && /^\d{4}-\d{2}-\d{2}$/.test(args.row.invoice_date)
+    ? args.row.invoice_date
+    : null
   if (invoice.batch_id) {
-    // Already associated (a prior finalize or the original approval): reuse it.
     batchId = invoice.batch_id
+    // A reviewer may correct the date into a DIFFERENT month AFTER the invoice was
+    // already batched. Detect that and re-file it into the correct period, then
+    // rebuild BOTH registers (the destination gains the row, the abandoned month
+    // must drop it) so an invoice never sits in the wrong accounting period.
+    if (iso) {
+      const { start, end } = monthBounds(iso)
+      const { data: cur } = await db.from('invoice_batches')
+        .select('period_start,period_end').eq('workspace_id', workspaceId).eq('id', batchId).maybeSingle()
+      const curRow = cur as { period_start?: string | null; period_end?: string | null } | null
+      const curStart = curRow?.period_start ? String(curRow.period_start).slice(0, 10) : ''
+      const curEnd = curRow?.period_end ? String(curRow.period_end).slice(0, 10) : ''
+      if (curRow && (curStart !== start || curEnd !== end)) {
+        const oldBatchId = batchId
+        await args.assertLease?.()
+        const { data: moved, error: moveErr } = await db.rpc('ensure_invoice_batch', {
+          p_workspace: workspaceId, p_client: invoice.client_id ?? null, p_start: start, p_end: end,
+        })
+        if (moveErr || !moved) throw new Error(`BATCH_ENSURE_ERROR: ${moveErr?.message ?? 'no batch id'}`)
+        batchId = String(moved)
+        await args.assertLease?.()
+        const { error: relinkErr } = await db.from('invoices').update({ batch_id: batchId })
+          .eq('workspace_id', workspaceId).eq('id', invoiceId)
+        if (relinkErr) throw new Error(`BATCH_LINK_ERROR: ${relinkErr.message}`)
+        // Rebuild the destination period AND the abandoned one — both changed.
+        await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)
+        await enqueueRegisterGeneration(db, workspaceId, oldBatchId, args.assertLease)
+        return batchId
+      }
+    }
   } else {
-    // Resolve the period ONLY from a reliably parsed invoice date. We never fall
-    // back to the upload month: a guessed period would silently file the invoice
-    // into the wrong register.
-    const iso = args.row && typeof args.row.invoice_date === 'string'
-      && /^\d{4}-\d{2}-\d{2}$/.test(args.row.invoice_date)
-      ? args.row.invoice_date
-      : null
     if (!iso) return null
     const { start, end } = monthBounds(iso)
     await args.assertLease?.()

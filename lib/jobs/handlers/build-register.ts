@@ -1,9 +1,10 @@
 // lib/jobs/handlers/build-register.ts — register_generation job handler.
 //
 // Builds one batch's GSTR-2B purchase register from its APPROVED extracted
-// rows, stores the workbook privately, and hands the download link to the
-// sender's next inbound reply (best-effort). It never claims delivery it did
-// not achieve (rule 6) and a failed send never fails the job (rule 5).
+// rows, stores the workbook privately, and records a handoff so the register is
+// delivered to the owner's chat as an Excel document on their next inbound reply
+// (best-effort). It never claims delivery it did not achieve (rule 6) and a
+// failed send never fails the job (rule 5).
 //
 // Invariants:
 //   * Tenant isolation: every read is scoped by the job's workspace_id; the
@@ -39,6 +40,25 @@ function byteaToBuffer(value: unknown): Buffer {
   if (Buffer.isBuffer(value)) return value
   if (typeof value === 'string') return Buffer.from(value.replace(/^\\x/i, ''), 'hex')
   throw new Error('BYTEA_DECODE_ERROR: unexpected encrypted_payload encoding')
+}
+
+/**
+ * Retire this batch's live (ready/sent) workbooks by marking them expired, so a
+ * register that no longer reflects the batch's current membership can never be
+ * served. The authenticated download route returns 410 for an expired row. Used
+ * when a rebuild finds nothing to render — e.g. a reviewer re-dated the batch's
+ * only invoice into a different accounting month, stranding a mis-dated workbook.
+ */
+async function retireLiveWorkbooks(
+  db: Db, workspaceId: string, batchId: string, assertLease: () => Promise<void>,
+): Promise<void> {
+  await assertLease()
+  const { error } = await db.from('generated_workbooks')
+    .update({ status: 'expired' })
+    .eq('workspace_id', workspaceId).eq('batch_id', batchId).in('status', ['ready', 'sent'])
+  // A failed retire must requeue (transient throw) rather than leave a stale,
+  // still-downloadable register behind.
+  if (error) throw new Error(`WORKBOOK_RETIRE_ERROR: ${error.message}`)
 }
 
 /** The WhatsApp sender identity that owns a workspace (for reply linkage). */
@@ -104,7 +124,13 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     logger.info('[Register] batch has invoices awaiting review', { batchId, jobId: job.id, needsReview: flagged })
   }
 
-  if (invoiceIds.length === 0) return // nothing to do; completes as a no-op
+  if (invoiceIds.length === 0) {
+    // The batch has no live invoices left (its only invoice was re-dated into a
+    // different period, or all were deleted). Retire any prior workbook so a
+    // mis-dated register is never left downloadable, then complete as a no-op.
+    await retireLiveWorkbooks(db, workspaceId, batchId, assertLease)
+    return
+  }
 
   const { masterKeyHex, pathKeyHex } = resolveFileKeyConfig()
   const { data: records, error: recErr } = await db
@@ -128,6 +154,9 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 
   if (rows.length === 0) {
     logger.info('[Register] no approved rows to render; completing as no-op', { batchId, jobId: job.id, needsReview: flagged ?? 0 })
+    // Nothing approved to render: retire the prior workbook so a stale register
+    // (from before these rows lost approval / moved period) is not still served.
+    await retireLiveWorkbooks(db, workspaceId, batchId, assertLease)
     return // a "no approved rows" batch is a successful no-op, not a failure
   }
 
@@ -178,12 +207,19 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 }
 
 /**
- * Best-effort delivery: hand the AUTHENTICATED download link to the sender's
- * NEXT inbound reply (the phone number is only known at webhook time, so we
- * never claim a spontaneous push). The workbook is encrypted at rest, so we
- * link our own login-required route rather than a raw bucket URL. Storing the
- * pending reply is send-only bookkeeping — a failure here cannot fail the
- * generation job (rule 5), and the workbook row persists for a later retry.
+ * Best-effort delivery: hand the register to the owner's NEXT inbound reply.
+ * The workbook is encrypted at rest and the web download route needs a signed-in
+ * session a WhatsApp-only user does not have, so the reliable channel is to send
+ * the decrypted .xlsx back into the owner's chat as a document (see
+ * lib/exports/deliver.ts). A spontaneous push is impossible off-webhook — the
+ * raw phone number is never stored, only its HMAC — so we record a handoff that
+ * the sender's next inbound flush turns into the attached file. The leading
+ * [[deliver:<uuid>]] token carries the workbook id for the flush and is stripped
+ * before any text fallback, so it is never shown. When a public origin IS
+ * configured we also include the authenticated download link as a fallback, but
+ * delivery is recorded regardless of it. Storing the handoff is send-only
+ * bookkeeping — a failure here cannot fail the generation job (rule 5), and the
+ * workbook row persists for a later retry.
  */
 async function scheduleDelivery(
   db: Db,
@@ -196,23 +232,21 @@ async function scheduleDelivery(
   assertLease: () => Promise<void>,
 ): Promise<void> {
   try {
-    const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
-    if (!base) {
-      // No public origin configured: the register is stored + ready, but we have
-      // no safe way to hand out a link, so delivery is honestly deferred.
-      logger.info('[Register] public URL unset; workbook ready, delivery deferred', { workbookId, jobId })
-      return
-    }
     const senderHmac = await findOwnerSenderHmac(db, workspaceId)
     if (!senderHmac) {
       logger.info('[Register] no linked WhatsApp sender; workbook ready for later delivery', { workbookId, jobId })
       return
     }
-    const link = `${base}/api/exports/${workbookId}/download`
     const reviewNote = needsReview > 0
       ? ` ${needsReview} invoice(s) need review and are not included. Reply Review or choose Menu > Review.`
       : ''
-    const body = `Your invoice register is ready — ${rowCount} invoice(s). Secure download (sign in required): ${link} (valid until ${expiresAt}).${reviewNote}`
+    const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
+    // Document delivery needs no public origin, so we never defer just because
+    // the web link can't be built; the link is an EXTRA fallback when configured.
+    const linkNote = base
+      ? ` Secure download (sign in required): ${base}/api/exports/${workbookId}/download (valid until ${expiresAt}).`
+      : ''
+    const body = `[[deliver:${workbookId}]]\nYour invoice register is ready — ${rowCount} invoice(s). I'll send the Excel file here in this chat.${linkNote}${reviewNote}`
     await assertLease()
     const queued = await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
     logger.info(queued

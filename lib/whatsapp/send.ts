@@ -88,6 +88,23 @@ export function sendText(to: string, body: string, correlation?: { workbookId?: 
   return postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }, correlation)
 }
 
+/**
+ * Send a previously-uploaded media id back to the recipient as a document
+ * message. Used to deliver the owner's own encrypted register (decrypted in
+ * memory, uploaded via uploadWhatsAppMedia) directly into their chat — no public
+ * URL, no raw bucket link. The caption is optional and clamped to Meta's 1024
+ * limit; the media id/filename never carry invoice contents.
+ */
+export function sendDocument(
+  to: string,
+  args: { mediaId: string; filename: string; mimeType: string; caption?: string },
+  correlation?: { workbookId?: string },
+): Promise<SendOutcome> {
+  const document: Record<string, unknown> = { id: args.mediaId, filename: args.filename, mime_type: args.mimeType }
+  if (args.caption) document.caption = args.caption.slice(0, 1024)
+  return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation)
+}
+
 export function sendAccountTypeButtons(to: string): Promise<SendOutcome> {
   return postMessage({
     messaging_product: 'whatsapp',

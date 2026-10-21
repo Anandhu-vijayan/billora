@@ -50,7 +50,7 @@ const attentionNote = (c: FinalizeCounts): string => {
 
 export function composeDoneMessage(
   c: FinalizeCounts,
-  opts?: { link?: string | null },
+  opts?: { link?: string | null; delivered?: boolean },
 ): string {
   const attention = c.needsReview + c.missingDate
   if (c.outstanding > 0 || c.compiling > 0) {
@@ -61,9 +61,11 @@ export function composeDoneMessage(
     return `Still working — ${parts}. I'll send your Excel register here as soon as it's ready.${attentionNote(c)}`
   }
   if (c.readyWorkbooks > 0) {
-    const link = opts?.link ? ` Secure download (sign in required): ${opts.link}` : ''
     const n = c.readyWorkbooks
-    return `Done — your register is ready (${n} workbook${n === 1 ? '' : 's'}).${link}${attentionNote(c)}`
+    const suffix = opts?.delivered
+      ? ' I have attached the Excel file(s) here in this chat.'
+      : (opts?.link ? ` Secure download (sign in required): ${opts.link}` : '')
+    return `Done — your register is ready (${n} workbook${n === 1 ? '' : 's'}).${suffix}${attentionNote(c)}`
   }
   if (attention > 0) {
     return `Done — but nothing is ready to export yet: ${attentionNote(c).trim()}. I won't guess a month, so they're held for you to correct.`
@@ -81,15 +83,18 @@ export function composeDoneMessage(
  */
 export function composeReviewMessage(
   c: FinalizeCounts,
-  opts?: { link?: string | null },
+  opts?: { link?: string | null; delivered?: boolean },
 ): string {
   const attention = c.needsReview + c.missingDate
   if (c.readyWorkbooks > 0) {
-    const link = opts?.link ? opts.link : 'your signed-in workspace'
     const parts: string[] = []
     if (c.needsReview > 0) parts.push(`${c.needsReview} invoice(s) still need review`)
     if (c.missingDate > 0) parts.push(`${c.missingDate} have no clear date`)
     const note = parts.length > 0 ? ` ${parts.join(' and ')} and are NOT in it yet.` : ''
+    if (opts?.delivered) {
+      return `Your register is ready — I have attached the Excel file here in this chat.${note}`
+    }
+    const link = opts?.link ? opts.link : 'your signed-in workspace'
     return `Your register is ready — download (sign in required): ${link}.${note}`
   }
   if (c.outstanding > 0) {

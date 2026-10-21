@@ -25,6 +25,7 @@ import {
   composeConfirmResultMessage, type ConfirmOutcome,
 } from '@/lib/whatsapp/finalize';
 import { listPendingReview, confirmInvoice } from '@/lib/whatsapp/review-confirm';
+import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -179,6 +180,20 @@ async function handleOnboardingSideEffects(
     else await updateSessionDeliveryState(db, hmac, { pending_reply_body: body, last_reply_error_code: o });
     track(o);
   };
+  // Deliver the owner's completed register(s) into THIS chat as documents. The
+  // web link path is unreachable for a WhatsApp-only user (no login exists), so
+  // the promised "sent here" means the file itself. Idempotent: a workbook is
+  // only pushed while status='ready' and flips to 'sent' after a confirmed send,
+  // so repeated Done/Review never re-sends. Returns how many are in the chat.
+  const deliverRegisterDocuments = async (workbookIds: string[]): Promise<number> => {
+    let delivered = 0;
+    for (const id of workbookIds.slice(0, 5)) {
+      const r = await deliverWorkbookToWhatsApp(db, { workbookId: id, to });
+      if (r.delivered) delivered += 1;
+      if (r.outcome === 'blocked' || r.outcome === 'transient') track(r.outcome);
+    }
+    return delivered;
+  };
   // Menu/list/button sends are re-derivable, so a failed one records only the
   // error code (no body resend); a failed interactive list degrades to text.
   const deliverMenu = async (workspace: boolean): Promise<void> => {
@@ -206,11 +221,12 @@ async function handleOnboardingSideEffects(
     try {
       await ensureBatchRegisters(db, workspaceId);
       const counts = await collectFinalizeState(db, workspaceId);
+      const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
       const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
       const link = base && counts.readyWorkbookIds.length > 0
         ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
         : null;
-      await deliverText(composeDoneMessage(counts, { link }));
+      await deliverText(composeDoneMessage(counts, { link, delivered: delivered > 0 }));
     } catch (e) {
       // Finalization is read/schedule only; a failure here must never lose work or
       // rewind intake. Fall back to an honest "queued" message (no ready claim).
@@ -266,11 +282,12 @@ async function handleOnboardingSideEffects(
       } else {
         try {
           const counts = await collectFinalizeState(db, workspaceId);
+          const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
           const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
           const link = base && counts.readyWorkbookIds.length > 0
             ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
             : null;
-          body = composeReviewMessage(counts, { link });
+          body = composeReviewMessage(counts, { link, delivered: delivered > 0 });
         } catch {
           const flagged = await countNeedsReview().catch(() => 0);
           body = flagged > 0
@@ -500,9 +517,26 @@ async function resendPendingReply(db: Db, hmac: string, to: string): Promise<voi
   try {
     const { data } = await db.from('whatsapp_sessions').select('pending_reply_body')
       .eq('sender_hmac', hmac).maybeSingle();
-    const body = (data?.pending_reply_body as string | null) ?? null;
-    if (!body) return;
-    const workbookId = /\/api\/exports\/([0-9a-f-]{36})\/download/i.exec(body)?.[1];
+    const rawBody = (data?.pending_reply_body as string | null) ?? null;
+    if (!rawBody) return;
+    // A register handoff carries its workbook id in a leading [[deliver:<uuid>]]
+    // token (or, for a body written before that marker, an embedded download
+    // link). Deliver the decrypted file itself into the chat — the web link is
+    // unreachable for a WhatsApp-only owner (no login exists). Strip the internal
+    // token so any text fallback shows only human copy, and fall back to the text
+    // link only if document delivery is not possible.
+    const token = /^\[\[deliver:([0-9a-f-]{36})\]\]\s*/i.exec(rawBody);
+    const workbookId = token?.[1]
+      ?? /\/api\/exports\/([0-9a-f-]{36})\/download/i.exec(rawBody)?.[1];
+    const body = token ? rawBody.slice(token[0].length) : rawBody;
+    if (workbookId) {
+      const r = await deliverWorkbookToWhatsApp(db, { workbookId, to });
+      if (r.delivered) {
+        await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
+        logger.info('[WhatsApp] deferred register delivered as document', { workbookId });
+        return;
+      }
+    }
     const o = await sendText(to, body, workbookId ? { workbookId } : undefined);
     if (o === 'ok') {
       await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });

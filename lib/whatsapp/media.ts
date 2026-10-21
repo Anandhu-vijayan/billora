@@ -4,6 +4,9 @@ import { MAX_FILE_BYTES, OversizeMediaError } from '@/lib/media/file-type'
 
 const GRAPH_VERSION = process.env.WHATSAPP_GRAPH_VERSION || 'v21.0'
 const FETCH_TIMEOUT_MS = 15_000
+// Media upload carries a whole file body, so it gets a longer budget than a
+// metadata/download GET. A timeout here is transient (retryable) by contract.
+const UPLOAD_TIMEOUT_MS = 30_000
 
 /** MIME → safe file extension for invoice media (images + pdf). */
 export function extensionForMime(mime: string | undefined): string {
@@ -134,4 +137,62 @@ export async function downloadWhatsAppMedia(args: {
     declaredSize: meta.file_size ?? null,
   })
   return downloaded
+}
+
+/**
+ * Upload a small file (the decrypted register) to the WhatsApp Media API and
+ * return its media id, so it can be sent back to the OWNER as a document. This
+ * is the delivery counterpart to downloadWhatsAppMedia: the workbook is
+ * encrypted at rest, so it can only ever be handed to an authenticated
+ * recipient — here, the workspace owner's own chat. Never logs the bytes, the
+ * mime-specific contents, or the resulting media id.
+ *
+ * Credential-level rejections throw MediaPermanentError (retry is futile); any
+ * other failure throws a plain Error the caller treats as transient.
+ */
+export async function uploadWhatsAppMedia(args: {
+  buffer: Buffer
+  mimeType: string
+  filename?: string
+}): Promise<string> {
+  const token = process.env.WHATSAPP_ACCESS_TOKEN || ''
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || ''
+  if (!token || !phoneNumberId) {
+    throw new MediaPermanentError('META_UPLOAD_CONFIG_MISSING: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID unset')
+  }
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS)
+  try {
+    const form = new FormData()
+    form.append('messaging_product', 'whatsapp')
+    form.append('type', args.mimeType)
+    // Copy into a plain ArrayBuffer: Blob's part type is ArrayBufferView<ArrayBuffer>
+    // and a Node Buffer is ArrayBufferLike, which TS rejects.
+    const ab = new ArrayBuffer(args.buffer.byteLength)
+    new Uint8Array(ab).set(args.buffer)
+    form.append('file', new Blob([ab], { type: args.mimeType }), args.filename ?? 'file')
+    const res = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${phoneNumberId}/media`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+      signal: ctrl.signal,
+    })
+    const body = (await res.json().catch(() => null)) as
+      { id?: string; error?: { message?: string; code?: number } } | null
+    if (!res.ok || !body?.id) {
+      const detail = `${body?.error?.message || `Graph API ${res.status} with no media id`}`
+        + (body?.error?.code !== undefined ? ` (graph code ${body.error.code})` : '')
+      if (body?.error?.code !== undefined && PERMANENT_GRAPH_CODES.has(body.error.code)) {
+        throw new MediaPermanentError(`META_UPLOAD_UNRECOVERABLE: ${detail}`)
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new MediaPermanentError(`META_UPLOAD_UNRECOVERABLE: ${detail} (http ${res.status})`)
+      }
+      throw new Error(`META_UPLOAD_ERROR: ${detail}`)
+    }
+    logger.info('[WhatsApp] media uploaded for delivery', { size: args.buffer.byteLength })
+    return body.id
+  } finally {
+    clearTimeout(t)
+  }
 }

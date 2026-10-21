@@ -19,6 +19,7 @@ import { getAuthenticatedUserId } from '@/lib/supabase/server-session'
 import { resolveFileKeyConfig, isEncryptionConfigFailure } from '@/lib/encryption/files'
 import { applyInvoiceReview } from '@/lib/invoices/review'
 import type { LedgerCandidate } from '@/lib/ocr/ledger'
+import { moneyToMinorUnits, minorUnitsToNumber } from '@/lib/ocr/validators/money'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -29,30 +30,67 @@ function deny(status: number, code: string): NextResponse {
   return NextResponse.json({ ok: false, error: { code } }, { status, headers: { 'Cache-Control': 'no-store' } })
 }
 
-/** Keep only whitelisted fields with the right primitive type; drop everything else. */
-function pickCorrections(body: unknown): LedgerCandidate {
+/**
+ * Parse a reviewer-supplied amount with the SAME decimal-safe, Indian-grouping
+ * and currency-symbol-aware engine the extractor uses (moneyToMinorUnits). A
+ * bare `Number('1,23,456.78')` is NaN and would silently discard a legitimate
+ * correction, so formatted strings like "₹1,23,456.78" or "1,18,200/-" must
+ * parse here too. Returns null for empty/invalid/non-finite input — never zero.
+ */
+function parseMoney(v: unknown): number | null {
+  if (typeof v !== 'number' && typeof v !== 'string') return null
+  const minor = moneyToMinorUnits(v)
+  return minor === null ? null : minorUnitsToNumber(minor)
+}
+
+/** Upper bounds for reviewer-supplied text; over-length is a field error, not a silent truncate. */
+const MAX_LEN: Record<string, number> = {
+  invoice_date: 40, invoice_number: 64, vendor_name: 200, supplier_gstin: 15,
+}
+
+interface FieldError { field: string; code: string }
+
+/**
+ * Validate a reviewer's submitted corrections.
+ *   * Absent or blank (empty/whitespace) fields mean "no change" — the UI does
+ *     NOT have to resubmit already-correct values, and blanks never wipe a field.
+ *   * A field that IS present but malformed (wrong type, over length, an amount
+ *     the money engine cannot parse, or a negative required amount) is returned
+ *     as a field-specific error instead of being silently discarded — never
+ *     coerced to zero and never lost without an actionable signal (§7.2 / §5).
+ * Date VALUE correctness is intentionally NOT re-implemented here; the shared
+ * date service in evaluateLedger re-scores it and keeps the row in review with a
+ * reason code if it is unresolved (§4 single source of truth).
+ */
+function parseCorrections(body: unknown): { corrections: LedgerCandidate; errors: FieldError[] } {
   const src = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
-  const out: LedgerCandidate = {}
+  const corrections: LedgerCandidate = {}
+  const errors: FieldError[] = []
+  const present = (v: unknown) => v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')
+
   const strFields = ['invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin'] as const
-  const numFields = ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const
   for (const f of strFields) {
     const v = src[f]
-    if (typeof v === 'string' && v.trim() !== '') out[f] = v.trim()
+    if (!present(v)) continue
+    if (typeof v !== 'string') { errors.push({ field: f, code: 'INVALID_TYPE' }); continue }
+    const t = v.trim()
+    if (t.length > MAX_LEN[f]) { errors.push({ field: f, code: 'TOO_LONG' }); continue }
+    corrections[f] = t
   }
-  for (const f of numFields) {
-    const v = src[f]
-    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : Number.NaN
-    if (Number.isFinite(n) && n >= 0) out[f] = n
+
+  // Required amounts must be non-negative; optional reconciliation components
+  // (round_off, netting discount/deduction) may legitimately be negative.
+  const readAmount = (f: string, v: unknown, allowNegative: boolean) => {
+    if (!present(v)) return
+    const n = parseMoney(v)
+    if (n === null) { errors.push({ field: f, code: 'INVALID_AMOUNT' }); return }
+    if (!allowNegative && n < 0) { errors.push({ field: f, code: 'NEGATIVE_NOT_ALLOWED' }); return }
+    ;(corrections as Record<string, unknown>)[f] = n
   }
-  // Optional reconciliation components a reviewer may correct; round_off (and a
-  // netting discount/deduction) can legitimately be negative, so no >= 0 gate.
-  const optFields = ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const
-  for (const f of optFields) {
-    const v = src[f]
-    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : Number.NaN
-    if (Number.isFinite(n)) out[f] = n
-  }
-  return out
+  for (const f of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) readAmount(f, src[f], false)
+  for (const f of ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const) readAmount(f, src[f], true)
+
+  return { corrections, errors }
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
@@ -97,12 +135,29 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return deny(400, 'INVALID_BODY')
   }
 
+  const { corrections, errors } = parseCorrections(body)
+  if (errors.length > 0) {
+    // Never silently drop a malformed correction: tell the caller exactly which
+    // fields were rejected and why, so the UI can surface field-level feedback.
+    return NextResponse.json(
+      { ok: false, error: { code: 'INVALID_FIELDS', fields: errors } },
+      { status: 400, headers: { 'Cache-Control': 'no-store' } },
+    )
+  }
+
   try {
     const result = await applyInvoiceReview(db, {
-      workspaceId, invoiceId: id, corrections: pickCorrections(body), masterKeyHex,
+      workspaceId, invoiceId: id, corrections, masterKeyHex,
+    })
+    // Audit metadata: WHO corrected WHICH fields on WHICH invoice, and the
+    // resulting state. Only field NAMES are logged — never their values, GSTINs,
+    // vendor names or amounts (§7.2 / §11 no-sensitive-content logging).
+    logger.info('[Review] correction applied', {
+      actor: userId, invoice: id, workspace: workspaceId,
+      fields: Object.keys(corrections), review: result.review,
     })
     return NextResponse.json(
-      { ok: true, review: result.review, reasons: result.reasons, confidence: result.confidence, batchId: result.batchId },
+      { ok: true, review: result.review, reasons: result.reasons, confidence: result.confidence, batchId: result.batchId, row: result.row },
       { headers: { 'Cache-Control': 'no-store' } },
     )
   } catch (e) {

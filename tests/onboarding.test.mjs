@@ -707,6 +707,10 @@ test('G4e route renders menu/status/review and decouples resend (never re-runs i
   assert.match(src, /note === 'review-requested'/)
   assert.match(src, /async function resendPendingReply/)
   assert.match(src, /updateSessionDeliveryState/)
+  // The register handoff token is parsed for delivery and stripped from any
+  // text fallback so internal markup is never shown to the sender.
+  assert.match(src, /deliver:/)
+  assert.match(src, /rawBody\.slice\(token\[0\]\.length\)/)
   // The resend path only sends — it must not re-run business operations.
   const rpr = src.slice(src.indexOf('async function resendPendingReply'), src.indexOf('Onboarding + upload decision engine'))
   assert.ok(!/recordMediaIntake|assignPendingUploads|transition\(/.test(rpr), 'resend must not re-run business ops')
@@ -845,10 +849,14 @@ test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, ver
   assert.match(s, /need review and are not included/)
   assert.match(s, /await assertLease\(\)/)
   assert.match(s, /version, generated_at: new Date\(\)/)
-  // Delivery links to OUR authenticated route, gated on PUBLIC_APP_URL.
-  assert.ok(s.includes('/api/exports/${workbookId}/download'), 'delivery via authenticated route')
+  // Delivery records an in-chat document handoff on EVERY generation, not just
+  // when a public origin is configured; the authenticated link is an extra
+  // fallback included only when PUBLIC_APP_URL is set.
+  assert.ok(s.includes('/api/exports/${workbookId}/download'), 'authenticated link included as a fallback')
   assert.ok(s.includes('PUBLIC_APP_URL'), 'link only built when a public origin is configured')
+  assert.ok(s.includes('[[deliver:${workbookId}]]'), 'records an in-chat document handoff token')
   assert.ok(s.includes('updateSessionDeliveryState(db, senderHmac'), 'delivery via next inbound reply')
+  assert.ok(!/public URL unset; workbook ready, delivery deferred/.test(s), 'must NOT skip delivery when PUBLIC_APP_URL is unset')
   // Batch readiness gate lives HERE: never build a premature workbook.
   assert.ok(s.includes("eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])"))
   assert.ok(s.includes('REGISTER_NOT_READY'), 'requeues while siblings are in flight')
@@ -900,7 +908,7 @@ test('G6d vision is provider-gated with a strict schema and transient/permanent 
   assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
   assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
   assert.ok(s.includes('cgst_rate_percent') && s.includes('total_amount_in_words'), 'Gemini schema returns optional printed corroboration evidence')
-  assert.ok(s.includes('const CALL_TIMEOUT_MS = 15_000'), 'each provider request has a bounded timeout')
+  assert.ok(s.includes('function callTimeoutMs') && s.includes('VISION_TIMEOUT_MS'), 'each provider request has a bounded, operator-configurable timeout')
   assert.ok(s.includes("new VisionTransientError('GEMINI_TIMEOUT')"), 'timeout classification does not include raw provider response text')
   assert.ok(s.includes("logger.warn('[Vision] Gemini request failed'"), 'provider failures log structured timing and classification')
   assert.ok(s.includes('failureReason: providerFailureReason(error)'), 'provider failure reason is logged without raw response content')
@@ -1674,7 +1682,8 @@ test('M5b route.ts Done runs real finalization, not a bare ack', () => {
   const r = routeSrc()
   assert.ok(r.includes('ensureBatchRegisters(db, workspaceId)'), 'Done re-affirms register jobs')
   assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Done reads current state')
-  assert.ok(r.includes('composeDoneMessage(counts, { link })'), 'Done sends a truthful result')
+  assert.ok(r.includes('composeDoneMessage(counts, { link, delivered: delivered > 0 })'), 'Done sends a truthful result')
+  assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Done attaches the register as an in-chat document')
   assert.ok(!r.includes('your uploads are queued for processing. Send more invoices anytime'), 'the old ack-only Done text is gone')
 })
 
@@ -1738,6 +1747,64 @@ test('M8 no approved rows yields a review/no-export result, never a false succes
   assert.ok(s.indexOf('rows.length === 0') < s.indexOf('await scheduleDelivery('), 'no-op return precedes any delivery scheduling')
 })
 
+test('M8b a no-op rebuild retires the stale workbook instead of leaving a mis-dated register downloadable', () => {
+  const s = registerSrc()
+  assert.match(s, /async function retireLiveWorkbooks/, 'shared retire helper exists')
+  assert.match(s, /\.update\(\{ status: 'expired' \}\)[\s\S]*?\.in\('status', \['ready', 'sent'\]\)/, 'retire marks live workbooks expired (workspace+batch scoped)')
+  const calls = (s.match(/await retireLiveWorkbooks\(/g) || []).length
+  assert.equal(calls, 2, 'BOTH the empty-batch and no-approved-rows no-op paths retire the stale register')
+  assert.match(s, /WORKBOOK_RETIRE_ERROR/, 'a failed retire requeues (transient) rather than stranding a stale workbook')
+})
+
+test('M8c WhatsApp media upload posts the file to the Graph media endpoint and never logs the media id', () => {
+  const m = mediaSrc()
+  const up = m.slice(m.indexOf('export async function uploadWhatsAppMedia'))
+  assert.ok(up.length > 120, 'uploadWhatsAppMedia exists')
+  assert.match(up, /\/media/, 'posts to the phone-number /media upload endpoint')
+  assert.match(up, /method: 'POST'/)
+  assert.match(up, /new FormData\(\)/, 'multipart body')
+  assert.match(up, /messaging_product/, 'declares the whatsapp product')
+  assert.match(up, /META_UPLOAD_CONFIG_MISSING/, 'missing creds fail fast (never a silent no-op)')
+  assert.match(up, /MediaPermanentError/, 'credential-blocked Graph codes are permanent, not retried')
+  assert.ok(!/logger\.[a-z]+\([^)]*body\.id/.test(up), 'never logs the returned media id')
+})
+
+test('M8d sendDocument emits a Cloud API document message with a clamped caption', () => {
+  const s = sendSrc()
+  const d = s.slice(s.indexOf('export function sendDocument'))
+  assert.ok(d.length > 80, 'sendDocument exists')
+  assert.match(d, /type: 'document'/)
+  assert.match(d, /id: args\.mediaId/)
+  assert.match(d, /filename: args\.filename/)
+  assert.match(d, /mime_type: args\.mimeType/)
+  assert.match(d, /\.slice\(0, 1024\)/, 'caption clamped to Meta limit')
+})
+
+test('M8e register delivery reuses the download-route decrypt and is owner-chat idempotent', () => {
+  const s = readFileSync(new URL('../lib/exports/deliver.ts', import.meta.url), 'utf8')
+  assert.match(s, /export async function deliverWorkbookToWhatsApp/)
+  assert.match(s, /bucketFor\('exports'\)/, 'reads the SAME exports bucket as the download route')
+  assert.match(s, /decryptFile\(/, 'decrypts in memory (never a raw/signed bucket URL)')
+  assert.match(s, /expectedKeyVersion:/, 'enforces the stored key version on decrypt')
+  assert.match(s, /uploadWhatsAppMedia\(/, 'uploads the file, then sends it as a document')
+  assert.match(s, /sendDocument\(/)
+  assert.match(s, /status: 'sent'[\s\S]*?\.eq\('status', 'ready'\)/, 'flips ready→sent only on a confirmed send')
+  assert.match(s, /if \(wb\.status === 'sent'\) return \{ delivered: true/, 'already-sent workbook reports delivered without a re-send (idempotent)')
+  assert.ok(!/logger\.[a-z]+\([^)]*\b(plain|masterKeyHex|file_object_path|mediaId)\b/.test(s), 'no secret/PII logging in the delivery path')
+})
+
+test('M8f composeDone/Review truthfully reflect an in-chat attachment when delivered', () => {
+  const done = finalize.composeDoneMessage(FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'] }), { delivered: true })
+  assert.match(done, /register is ready \(1 workbook\)/)
+  assert.match(done, /attached the Excel file\(s\) here in this chat/)
+  assert.ok(!/sign in required/.test(done), 'no login-wall text when the file is attached')
+  const rev = finalize.composeReviewMessage(FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'] }), { delivered: true })
+  assert.match(rev, /attached the Excel file here in this chat/)
+  assert.ok(!/signed-in workspace/.test(rev), 'the useless placeholder is gone once delivered')
+  const linkOnly = finalize.composeReviewMessage(FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'] }), { link: 'https://x/api/exports/w1/download' })
+  assert.ok(linkOnly.includes('https://x/api/exports/w1/download'), 'link still offered for authenticated web users (unchanged fallback)')
+})
+
 test('M9 a workbook is reported ready only after its row + stored file exist', async () => {
   const future = new Date(Date.now() + 3600_000).toISOString()
   const past = new Date(Date.now() - 3600_000).toISOString()
@@ -1758,10 +1825,13 @@ test('M9 a workbook is reported ready only after its row + stored file exist', a
 
 // ---- N: shared batching + the human-review -> approve -> register -> workbook chain ----
 
-function batchHarness({ liveRegister = false, rpcId = 'BATCH-1' } = {}) {
+function batchHarness({ liveRegister = false, rpcId = 'BATCH-1', batchPeriod = null } = {}) {
   const ops = { rpc: [], invoiceUpdate: [], jobUpdate: [], jobDelete: 0, liveSelect: 0, inserts: [] }
   const db = fakeDb(({ table, verb, args, filters }) => {
     if (table === '__rpc__') { ops.rpc.push(args); return { data: rpcId, error: null } }
+    if (table === 'invoice_batches') {
+      return { data: batchPeriod ? { period_start: batchPeriod.start, period_end: batchPeriod.end } : null, error: null }
+    }
     if (table === 'invoices') {
       const u = filters.find((f) => f.update)?.update
       if (u) ops.invoiceUpdate.push(u)
@@ -1822,6 +1892,32 @@ test('N3 already-batched + live register -> reuse and dedup, never a duplicate b
   assert.equal(ops.rpc.length, 0, 'no second batch created')
   assert.equal(ops.invoiceUpdate.length, 0, 'invoice link untouched')
   assert.equal(ops.inserts.length, 0, 'a live register job already exists -> no duplicate enqueue')
+})
+
+test('N3b a corrected date in the SAME month keeps the batch (no needless re-file or rebuild)', async () => {
+  const { db, ops } = batchHarness({ liveRegister: true, batchPeriod: { start: '2026-05-01', end: '2026-05-31' } })
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', jobId: 'JOB',
+    row: { invoice_date: '2026-05-17' }, invoice: { client_id: 'C1', batch_id: 'BATCH-0' },
+  })
+  assert.equal(batchId, 'BATCH-0', 'same-month date change does not move the invoice')
+  assert.equal(ops.rpc.length, 0, 'no new batch resolved')
+  assert.equal(ops.invoiceUpdate.length, 0, 'invoice link untouched')
+})
+
+test('N7 a corrected date that moves a batched invoice to another month re-files it and rebuilds BOTH registers', async () => {
+  const { db, ops } = batchHarness({ rpcId: 'BATCH-JUN', batchPeriod: { start: '2026-05-01', end: '2026-05-31' } })
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV',
+    row: { invoice_date: '2026-06-15' }, invoice: { client_id: 'C1', batch_id: 'BATCH-MAY' },
+  })
+  assert.equal(batchId, 'BATCH-JUN', 'moved into the correct (June) batch')
+  assert.equal(ops.rpc.length, 1, 'resolved/created the destination batch from the corrected date')
+  assert.equal(ops.rpc[0].p_start, '2026-06-01')
+  assert.equal(ops.rpc[0].p_end, '2026-06-30')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-JUN' }], 'invoice re-linked to the new period')
+  const enqueued = ops.inserts.map((i) => i.batch_id).sort()
+  assert.deepEqual(enqueued, ['BATCH-JUN', 'BATCH-MAY'], 'BOTH the destination and abandoned registers are rebuilt')
 })
 
 test('N4 a concurrent duplicate register enqueue (23505) is a benign no-op, not an error', async () => {
@@ -1890,7 +1986,8 @@ test('N8 WhatsApp Review is truthful: delivers a ready workbook now, or states w
   const clear = finalize.composeReviewMessage(FC({}))
   assert.match(clear, /Nothing needs your attention/)
   const r = routeSrc()
-  assert.ok(r.includes('composeReviewMessage(counts, { link })'), 'the Review command renders the truthful body')
+  assert.ok(r.includes('composeReviewMessage(counts, { link, delivered: delivered > 0 })'), 'the Review command renders the truthful body')
+  assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Review attaches the register as an in-chat document')
   assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Review reads current verified state')
 })
 

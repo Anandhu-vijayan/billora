@@ -21,7 +21,21 @@ import { logger } from '@/lib/logger'
 import type { LedgerCandidate } from '@/lib/ocr/ledger'
 import { buildGeminiInvoiceRequest } from '@/lib/ocr/gemini-request'
 
-const CALL_TIMEOUT_MS = 15_000
+// Per-call Gemini ceiling. A throttled/free-tier key can take 25s+ for a single
+// read, so this is operator-configurable (VISION_TIMEOUT_MS) instead of pinned
+// to 15s — a pinned 15s aborted every real call as GEMINI_TIMEOUT before the
+// answer arrived. Default 40s clears the observed worst case while staying under
+// the worker's 60s function limit; the extractor bounds the SECOND pass
+// separately (VISION_MAX_TOTAL_MS) so two slow reads cannot exceed maxDuration.
+function callTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env.VISION_TIMEOUT_MS ?? '', 10)
+  return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 40_000
+}
+
+/** The active per-call Gemini ceiling, exported so callers can budget retries. */
+export function visionCallTimeoutMs(): number {
+  return callTimeoutMs()
+}
 
 export class VisionTransientError extends Error {
   override name = 'VisionTransientError'
@@ -324,7 +338,7 @@ export async function extractInvoiceFields(args: {
   try {
     const response = await withTimeout(
       ai.models.generateContent(request),
-      CALL_TIMEOUT_MS,
+      callTimeoutMs(),
     )
     const text = (response as { text?: string }).text ?? ''
     const candidate = parseVisionJson(text)

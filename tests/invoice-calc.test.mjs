@@ -309,3 +309,36 @@ test('route wiring: WhatsApp confirm list + confirm handler are connected', () =
   assert.match(s, /sendReviewList\(/)
   assert.match(s, /composeConfirmResultMessage\(/)
 })
+
+test('vision resilience: Gemini timeout is configurable and the second pass is budget-guarded', () => {
+  const v = readSrc('lib/ocr/vision.ts')
+  assert.match(v, /VISION_TIMEOUT_MS/, 'the per-call ceiling reads env')
+  assert.match(v, /export function visionCallTimeoutMs/, 'the ceiling is exported for callers')
+  assert.ok(!/const CALL_TIMEOUT_MS = 15_000/.test(v), 'the pinned 15s timeout that aborted every real call is gone')
+  const e = readSrc('lib/ocr/invoice-extractor.ts')
+  assert.match(e, /VISION_MAX_TOTAL_MS/, 'total AI work for one job is bounded')
+  assert.match(e, /second pass skipped: insufficient time budget/, 'a slow key skips the 2nd read instead of blowing maxDuration')
+  assert.match(e, /visionCallTimeoutMs\(\)/, 'the guard uses the active per-call ceiling')
+})
+
+test('review corrections parse money with the shared decimal-safe engine, not raw Number()', () => {
+  const s = readSrc('app/api/invoices/[id]/review/route.ts')
+  assert.match(s, /moneyToMinorUnits/, 'uses the shared Indian-grouping/currency-aware parser')
+  assert.match(s, /function parseMoney/, 'routes every amount through parseMoney')
+  assert.ok(!/typeof v === 'string' \? Number\(v\)/.test(s), 'no raw Number() on reviewer money strings')
+})
+
+test('review API hardening: malformed corrections get field errors, canonical row returned, actor audited', () => {
+  const s = readSrc('app/api/invoices/[id]/review/route.ts')
+  assert.match(s, /INVALID_FIELDS/, 'present-but-malformed corrections are rejected, never silently dropped')
+  assert.match(s, /INVALID_AMOUNT/, 'an amount the money engine cannot parse yields a field error')
+  assert.match(s, /NEGATIVE_NOT_ALLOWED/, 'a negative required amount is rejected explicitly')
+  assert.match(s, /code: 'INVALID_TYPE'/, 'a wrong-typed text field is rejected')
+  assert.match(s, /code: 'TOO_LONG'/, 'an over-length field is rejected, not truncated')
+  assert.match(s, /row: result\.row/, 'the canonical saved record is returned to the authorized reviewer')
+  assert.match(s, /\[Review\] correction applied/, 'a correction is audited')
+  assert.match(s, /actor: userId/, 'the audit records the acting user id')
+  assert.match(s, /fields: Object\.keys\(corrections\)/, 'the audit logs corrected field NAMES only')
+  // Values (GSTIN/vendor/amount) must never be logged; only the field-name projection is.
+  assert.ok(!s.includes('JSON.stringify(corrections)'), 'correction VALUES are never serialized into a log')
+})

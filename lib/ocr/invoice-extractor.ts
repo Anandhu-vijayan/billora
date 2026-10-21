@@ -23,6 +23,7 @@ import { parseInvoiceText, hasMeaningfulText } from '@/lib/ocr/text-parser'
 import { extractPdfTextLayer } from '@/lib/ocr/pdf'
 import {
   extractInvoiceFields,
+  visionCallTimeoutMs,
   VisionTransientError,
 } from '@/lib/ocr/vision'
 
@@ -658,7 +659,22 @@ export async function extractInvoice(
       // validated local approval.
       if (aiEvaluation.review === 'needs_review') {
         const hint = retryHintFor(aiEvaluation.reasons)
-        if (hint) {
+        // Bound ALL AI work for this job: a slow (throttled) key must not spend
+        // two full per-call ceilings and get the worker killed at maxDuration.
+        // The second read runs only if elapsed AI time plus one more ceiling fits
+        // inside VISION_MAX_TOTAL_MS; otherwise we keep the first (best) candidate
+        // and let the durable queue retry the whole job later.
+        const aiTotalBudgetMs = (() => {
+          const parsed = Number.parseInt(process.env.VISION_MAX_TOTAL_MS ?? '', 10)
+          return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 50_000
+        })()
+        const budgetLeftForRetry = aiTotalBudgetMs - (Date.now() - aiStartedAt)
+        if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
+          logger.info('[Extract] AI second pass skipped: insufficient time budget', {
+            model, elapsedMs: Date.now() - aiStartedAt,
+            budgetLeftMs: budgetLeftForRetry, neededMs: visionCallTimeoutMs(),
+          })
+        } else if (hint) {
           secondPass = true
           logger.info('[Extract] AI second pass started', {
             model,
