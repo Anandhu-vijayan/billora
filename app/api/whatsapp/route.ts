@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getSupabaseAdmin, bucketFor } from '@/lib/supabase/server';
+import { getEnv } from '@/lib/env';
 import { logger } from '@/lib/logger';
 import { encryptFile, deriveObjectKey, resolveFileKeyConfig, isEncryptionConfigFailure } from '@/lib/encryption/files';
 import { validateInvoiceMedia, isPermanentMediaFormatFailure, type ValidatedMedia } from '@/lib/media/file-type';
@@ -19,6 +20,7 @@ import {
 import {
   claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed,
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
+  isDailyIntakeLimitReached,
 } from '@/lib/whatsapp/intake';
 import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
@@ -536,6 +538,18 @@ async function resendPendingReply(db: Db, hmac: string, to: string): Promise<voi
         logger.info('[WhatsApp] deferred register delivered as document', { workbookId });
         return;
       }
+      // The file is NOT yet in the chat. A transient/blocked send must KEEP the
+      // handoff so the next inbound retries the document. Falling through here
+      // would send the reassuring "I'll send the Excel" text, and a successful
+      // text send clears the slot — stranding a 'ready' workbook forever with
+      // the file never arriving. Stay silent on this inbound; the current message
+      // is still handled normally below, and the register retries next time.
+      if (r.outcome === 'transient' || r.outcome === 'blocked') {
+        logger.warn('[WhatsApp] deferred register still pending; retrying next inbound', { workbookId, outcome: r.outcome });
+        return;
+      }
+      // 'skipped': the workbook is gone/expired/not-ready — nothing left to retry,
+      // so fall through and send the text once, then clear the handoff.
     }
     const o = await sendText(to, body, workbookId ? { workbookId } : undefined);
     if (o === 'ok') {
@@ -706,6 +720,17 @@ async function processMessage(
   // the invoices.file_object_path unique constraint, a redelivery can never
   // store or queue the same file twice, whatever the retry timing.
   const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
+  // Abuse / provider-quota guard, enforced here — before the extraction job is
+  // created — because that job is what spends (gated) Gemini quota plus OCR and
+  // storage. The daily cap is workspace-scoped and env-configurable; a redelivery
+  // of an already-stored file is excluded from the count so Meta retries stay
+  // idempotent. Limit <= 0 disables the guard.
+  const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();
+  if (await isDailyIntakeLimitReached(db, { workspaceId, limit: WHATSAPP_MAX_INVOICES_PER_DAY, objectPath })) {
+    logger.info('[WhatsApp] media intake blocked: daily invoice limit reached', { shortId, limit: WHATSAPP_MAX_INVOICES_PER_DAY });
+    await sendText(message.from, `You've reached today's limit of ${WHATSAPP_MAX_INVOICES_PER_DAY} invoices. Please try again tomorrow — anything you already sent is safe and still processing.`);
+    return;
+  }
   const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath });
   const { error: uploadError } = await db.storage.from(invoiceBucket)
     .upload(objectPath, enc.container, {

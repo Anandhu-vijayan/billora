@@ -52,29 +52,61 @@ function parseNumberWords(words: string[]): bigint | null {
   return sawNumber ? total + group : null
 }
 
-/** Parse common Indian invoice amount-in-words spellings to paise. */
+/**
+ * Parse common Indian invoice amount-in-words spellings to paise.
+ *
+ * Handles: "INR One Thousand Only", "Rupees Five Lakh ... Fifty One Only",
+ * "Five Lakh ... Fifty One Indian Rupee only." (the country adjective used to
+ * make the whole parse return null, silently disabling the words cross-check),
+ * "One Thousand Rupees and Fifty Paise Only" (paise BEFORE the word "paise" —
+ * the old code folded those words into the rupee figure), and the legacy
+ * "One Thousand and Paise Fifty" order.
+ */
 export function parseIndianAmountWords(input: string): bigint | null {
-  const normalized = input.toLowerCase()
-    .replace(/\b(inr|rs\.?|rupees?)\b/g, ' ')
-    .replace(/\bonly\b/g, ' ')
+  const NOISE = new Set(['indian', 'inr', 'rs', 'only', 'ruppee', 'ruppees'])
+  const tokens = input.toLowerCase()
     .replace(/[^a-z]+/g, ' ')
     .trim()
-  if (!normalized) return null
+    .split(/\s+/)
+    .filter((t) => t && !NOISE.has(t))
+  if (tokens.length === 0) return null
 
-  const tokens = normalized.split(/\s+/).filter(Boolean)
-  const paiseIndex = tokens.indexOf('paise')
-  const integerTokens = tokens.slice(0, paiseIndex >= 0 ? paiseIndex : undefined)
-  const integerValue = parseNumberWords(integerTokens)
+  const isRupee = (t: string) => t === 'rupee' || t === 'rupees'
+  const isPaise = (t: string) => t === 'paise' || t === 'paisa'
+  const paiseIndex = tokens.findIndex(isPaise)
+  // A rupee word at index 0 is the PREFIX form ("Rupees Fifty One ..."), not a
+  // separator between rupees and paise.
+  const suffixRupeeIndex = tokens.findIndex((t, i) => i > 0 && isRupee(t))
+
+  let rupeeTokens: string[]
+  let paiseTokens: string[] = []
+  if (paiseIndex >= 0 && suffixRupeeIndex >= 0 && suffixRupeeIndex < paiseIndex) {
+    // "<rupees> Rupees [and] <paise> Paise"
+    rupeeTokens = tokens.slice(0, suffixRupeeIndex)
+    paiseTokens = tokens.slice(suffixRupeeIndex + 1, paiseIndex)
+  } else if (paiseIndex >= 0 && paiseIndex < tokens.length - 1) {
+    // legacy "<rupees> [and] Paise <paise>"
+    rupeeTokens = tokens.slice(0, paiseIndex).filter((t) => !isRupee(t))
+    paiseTokens = tokens.slice(paiseIndex + 1)
+  } else if (paiseIndex >= 0) {
+    // prefix form "Rupees <rupees> and <paise> Paise": split on the last "and"
+    const before = tokens.slice(0, paiseIndex).filter((t) => !isRupee(t))
+    const andAt = before.lastIndexOf('and')
+    if (andAt < 0) return null
+    rupeeTokens = before.slice(0, andAt)
+    paiseTokens = before.slice(andAt + 1)
+  } else {
+    rupeeTokens = tokens.filter((t) => !isRupee(t))
+  }
+
+  const integerValue = parseNumberWords(rupeeTokens)
   if (integerValue === null) return null
-
   let paise = BigInt(0)
-  if (paiseIndex >= 0) {
-    const paiseTokens = tokens.slice(paiseIndex + 1)
+  if (paiseTokens.length > 0) {
     const parsedPaise = parseNumberWords(paiseTokens)
     if (parsedPaise === null || parsedPaise > BigInt(99)) return null
     paise = parsedPaise
   }
-
   return integerValue * BigInt(100) + paise
 }
 

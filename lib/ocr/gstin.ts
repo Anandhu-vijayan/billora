@@ -65,13 +65,17 @@ export interface GstinHit {
 /** Every GSTIN-shaped token in the text, in reading order, de-duplicated. */
 export function findAllGstins(text: string): GstinHit[] {
   const upper = String(text ?? '').toUpperCase()
-  const re = /\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b/g
+  // Printed GSTINs often carry a space after the 2-digit state code
+  // ("GSTIN: 32 ADRPJ8730C1ZN"); without tolerating it the letterhead GSTIN is
+  // invisible and the buyer's GSTIN becomes the only ("clean") survivor.
+  const re = /\b([0-9]{2})[ \t]?([A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b/g
   const seen = new Set<string>()
   const hits: GstinHit[] = []
   for (let m = re.exec(upper); m; m = re.exec(upper)) {
-    if (seen.has(m[1])) continue
-    seen.add(m[1])
-    hits.push({ value: m[1], index: m.index, valid: gstinFullyValid(m[1]) })
+    const value = `${m[1]}${m[2]}`
+    if (seen.has(value)) continue
+    seen.add(value)
+    hits.push({ value, index: m.index, valid: gstinFullyValid(value) })
   }
   return hits
 }

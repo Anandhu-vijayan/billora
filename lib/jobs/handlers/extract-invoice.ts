@@ -189,6 +189,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     logger.info('[Extract] result saved', {
       invoiceId, jobId: job.id, review: evaluation.review,
       source: confidenceSource, confidence: evaluation.confidence,
+      repairs: evaluation.repairs ?? [],
       presentFieldNames: [
         'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
         'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
@@ -274,6 +275,17 @@ async function queueReviewNotice(
   const senderHmac = (data?.[0]?.sender_hmac as string | undefined) ?? null
   if (!senderHmac) {
     logger.info('[Extract] review notice unavailable: no WhatsApp sender linked', { invoiceId, jobId })
+    return
+  }
+  // whatsapp_sessions has ONE pending_reply_body slot. If a register delivery
+  // ([[deliver:<id>]]) is already waiting there, overwriting it with this notice
+  // would silently drop the Excel hand-off; the register message already carries
+  // the "N invoice(s) need review" note, so leave it untouched.
+  const { data: slot } = await db.from('whatsapp_sessions').select('pending_reply_body')
+    .eq('sender_hmac', senderHmac).maybeSingle()
+  const pending = (slot?.pending_reply_body as string | null | undefined) ?? ''
+  if (pending.startsWith('[[deliver:')) {
+    logger.info('[Extract] review notice skipped: register delivery already queued', { invoiceId, jobId })
     return
   }
   await assertLease()

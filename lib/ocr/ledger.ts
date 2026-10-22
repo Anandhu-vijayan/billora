@@ -14,7 +14,7 @@
 //   * The shape matches lib/excel/generator.ts `IndianLedgerRowInput` exactly
 //     (structural typing keeps the two in sync without a runtime import).
 import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
-import { validateInvoiceCrossChecks } from './validators'
+import { parseIndianAmountWords, validateInvoiceCrossChecks } from './validators'
 import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
 import { reconcileInvoiceTotal } from './calc/reconcile'
 
@@ -83,6 +83,11 @@ export interface LedgerEvaluation {
   measuredConfidence: number;
   /** True only when a real invoice date was parsed (never fabricated). */
   invoiceDateResolved: boolean;
+  /**
+   * Deterministic repairs applied to the candidate before scoring (e.g.
+   * `total-from-words`). Empty when the candidate was scored exactly as given.
+   */
+  repairs?: string[];
 }
 
 // Mirrors lib/ocr/quality.ts GSTIN_RE exactly (kept in sync by a test).
@@ -317,13 +322,62 @@ export function mergeCandidates(
   return merged
 }
 
+
+/**
+ * A vision model can misread the numeric grand total while the amount-in-words
+ * line (a second, independently printed rendering of the same figure) is read
+ * correctly. If the words disagree with the numeric total AND the words figure
+ * reconciles against the printed taxable value + tax heads (+ any printed
+ * round-off / discount / freight), the numeric total is the misread one: two
+ * independent printed values agree against one. We then take the printed words
+ * figure. Nothing is invented — if the words do not tie out either, the
+ * candidate is returned untouched and the mismatch routes to review as before.
+ */
+function repairTotalFromWords(
+  candidate: LedgerCandidate,
+  toleranceMinor: bigint,
+  repairs: string[],
+): LedgerCandidate {
+  const words = (candidate.total_amount_in_words ?? '').trim()
+  if (!words) return candidate
+  const wordsMinor = parseIndianAmountWords(words)
+  if (wordsMinor === null) return candidate
+  const printedMinor = moneyToMinorUnits(candidate.total_amount)
+  const absDiff = (a: bigint, b: bigint): bigint => (a > b ? a - b : b - a)
+  if (printedMinor !== null && absDiff(printedMinor, wordsMinor) <= toleranceMinor) return candidate
+
+  const taxable = moneyToMinorUnits(candidate.taxable_value)
+  if (taxable === null) return candidate
+  const components = {
+    taxable,
+    cgst: moneyToMinorUnits(candidate.cgst_amount),
+    sgst: moneyToMinorUnits(candidate.sgst_amount),
+    igst: moneyToMinorUnits(candidate.igst_amount),
+    cess: moneyToMinorUnits(candidate.cess_amount),
+    shipping: moneyToMinorUnits(candidate.shipping_amount),
+    discount: moneyToMinorUnits(candidate.discount_amount),
+    deduction: moneyToMinorUnits(candidate.deduction_amount),
+    roundOff: moneyToMinorUnits(candidate.round_off),
+  }
+  // The numeric total must itself FAIL to tie (otherwise the words are the odd
+  // one out and the existing amount-words-total-mismatch review flag applies).
+  if (printedMinor !== null
+    && reconcileInvoiceTotal({ ...components, printedTotal: printedMinor }, toleranceMinor).status === 'reconciles') {
+    return candidate
+  }
+  const viaWords = reconcileInvoiceTotal({ ...components, printedTotal: wordsMinor }, toleranceMinor)
+  if (viaWords.status !== 'reconciles') return candidate
+  repairs.push('total-from-words')
+  return { ...candidate, total_amount: minorUnitsToNumber(wordsMinor) }
+}
+
 /**
  * Evaluate a raw extraction candidate into a safe, review-routed ledger row.
  * `minConfidence` (0..1) is the auto-approve bar; below it the row is stored but
  * always flagged for human review.
  */
 export function evaluateLedger(
-  candidate: LedgerCandidate,
+  rawCandidate: LedgerCandidate,
   opts: {
     minConfidence: number
     amountToleranceMinorUnits?: number
@@ -331,6 +385,12 @@ export function evaluateLedger(
   },
 ): LedgerEvaluation {
   const reasons: string[] = [];
+  const repairs: string[] = [];
+  const candidate = repairTotalFromWords(
+    rawCandidate,
+    BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101))),
+    repairs,
+  );
 
   const parsedDate = parseInvoiceDate(candidate.invoice_date);
   if (!parsedDate) reasons.push('invoice-date-unresolved');
@@ -493,6 +553,7 @@ export function evaluateLedger(
     confidence,
     measuredConfidence,
     invoiceDateResolved: iso !== null,
+    repairs,
   };
 }
 

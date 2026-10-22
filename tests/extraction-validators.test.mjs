@@ -152,3 +152,60 @@ test('rate or amount-words contradictions route to review and never auto-correct
   assert.match(ledger.retryHintFor(result.reasons), /printed tax percentage/)
   assert.match(ledger.retryHintFor(result.reasons), /total in words disagrees/)
 })
+
+test('amount-in-words tolerates "Indian Rupee only" and paise-before-word format', () => {
+  assert.equal(
+    words.parseIndianAmountWords('Five Lakh Seventy Five Thousand Three Hundred and Fifty One Indian Rupee only.'),
+    57535100n,
+  )
+  assert.equal(words.parseIndianAmountWords('One Thousand Rupees and Fifty Paise Only'), 100050n)
+  assert.equal(words.parseIndianAmountWords('Rupees Fifty One and Twenty Nine Paise Only'), 5129n)
+  assert.equal(words.parseIndianAmountWords('INR One Thousand and Paise Fifty Only'), 100050n)
+})
+
+test('misread numeric total is repaired from the amount-in-words when the words tie to the components', () => {
+  // Real case from the 21 Oct 2026 log: Akkara Gold, total misread as 558502.93.
+  const cand = {
+    ...BASE,
+    invoice_number: 'AG/1839/26-27',
+    vendor_name: 'Akkara gold',
+    supplier_gstin: '27AAPFU0939F1ZV',
+    taxable_value: 558592.93,
+    cgst_amount: 8378.89,
+    sgst_amount: 8378.89,
+    igst_amount: 0,
+    total_amount: 558502.93,
+    round_off: 0.29,
+    total_amount_in_words: 'Five Lakh Seventy Five Thousand Three Hundred and Fifty One Indian Rupee only.',
+  }
+  const out = ledger.evaluateLedger(cand, { minConfidence: 0.8, now: NOW })
+  assert.equal(out.row.total_amount, 575351)
+  assert.deepEqual(out.repairs, ['total-from-words'])
+  assert.ok(!out.reasons.some((r) => r.startsWith('total-mismatch')))
+})
+
+test('total is NOT repaired when the words do not tie to the components either', () => {
+  const cand = { ...BASE, total_amount: 9999, total_amount_in_words: 'Rupees Five Thousand Only' }
+  const out = ledger.evaluateLedger(cand, { minConfidence: 0.8, now: NOW })
+  assert.equal(out.row.total_amount, 9999)
+  assert.ok(out.reasons.some((r) => r.startsWith('total-mismatch')))
+})
+
+test('buyer GSTIN taken as supplier is never auto-approved; correct supplier is', () => {
+  const base = {
+    invoice_date: '25-09-2026', invoice_number: 'AG/1839/26-27', vendor_name: 'Akkara gold',
+    recipient_gstin: '32ACXPV2326B1ZL', taxable_value: 558592.93, cgst_amount: 8378.89,
+    sgst_amount: 8378.89, igst_amount: 0, total_amount: 575351, round_off: 0.29,
+  }
+  const bad = ledger.evaluateLedger({ ...base, supplier_gstin: '32ACXPV2326B1ZL' }, { minConfidence: 0.8, now: NOW })
+  assert.equal(bad.review, 'needs_review')
+  assert.ok(bad.reasons.includes('supplier-equals-recipient'))
+  const good = ledger.evaluateLedger({ ...base, supplier_gstin: '32ADRPJ8730C1ZN' }, { minConfidence: 0.8, now: NOW })
+  assert.equal(good.review, 'approved')
+})
+
+test('GSTIN printed with a space after the state code is still found', async () => {
+  const gstin = await importTs('lib/ocr/gstin.ts')
+  const hits = gstin.findAllGstins('GSTIN: 32 ADRPJ8730C1ZN\nGSTIN 32ACXPV2326B1ZL')
+  assert.deepEqual(hits.map((h) => h.value), ['32ADRPJ8730C1ZN', '32ACXPV2326B1ZL'])
+})

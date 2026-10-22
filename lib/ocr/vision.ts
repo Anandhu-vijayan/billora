@@ -45,8 +45,12 @@ export class VisionPermanentError extends Error {
   override name = 'VisionPermanentError'
 }
 
+// recipient_gstin is optional: a retail bill may print no buyer GSTIN, and forcing
+// the field invites the model to invent one. A supplier GSTIN equal to the
+// recipient's is NEVER silently repaired here — it means the model took the
+// buyer's GSTIN as the seller's, and ledger.ts must route it to review.
 const TEXT_FIELDS = [
-  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
 ] as const
 const OPTIONAL_EVIDENCE_FIELDS = [
   'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words',
@@ -94,15 +98,25 @@ const VISION_PROMPT = [
   'PARTIES: the SUPPLIER is the seller who ISSUED the invoice (letterhead, "Sold',
   'by", "Seller", "From"). The RECIPIENT is the buyer ("Bill to", "Ship to",',
   '"Buyer", "Customer"). supplier_gstin and vendor_name belong to the SUPPLIER',
-  'only; put the buyer\'s GSTIN in recipient_gstin. Never swap them.',
+  'only; put the buyer\'s GSTIN in recipient_gstin. Never swap them. The',
+  'supplier GSTIN is printed under the company logo / letterhead at the top and',
+  'again in the invoice-details box beside Invoice No and Date; the GSTIN inside',
+  'the "Bill To" / "Ship To" box is the BUYER\'s. A GSTIN may be printed with a',
+  'space after the 2-digit state code; return it without spaces. If the buyer',
+  'has no GSTIN printed return an empty string for recipient_gstin; NEVER repeat',
+  'the supplier\'s GSTIN there.',
   'AMOUNTS: taxable_value is the total taxable value before tax; cgst_amount,',
   'sgst_amount and igst_amount are the invoice-level tax amounts per head (not',
   'rates, not percentages); total_amount is the final payable invoice total',
-  'including tax and round-off. Use plain numbers (no currency symbol, no',
+  'including tax and round-off (labelled Total Invoice Value / Grand Total /',
+  'Net Payable). A row labelled just "Total Amount" or "Sales Amount" is often the',
+  'PRE-TAX subtotal, not the invoice total. Use plain numbers (no currency symbol, no',
   'thousands separators). If the tax-rate percentages are explicitly printed,',
   'return them as strings without the percent sign; otherwise return an empty',
   'string. Copy the printed total amount-in-words exactly, or return an empty',
   'string when it is absent. Never infer a rate or amount-in-words.',
+  'TOTAL CHECK: the printed total in words and the numeric grand total are the',
+  'same figure; read both and make sure total_amount matches the words line.',
   'OPTIONAL COMPONENTS: when the invoice EXPLICITLY prints any of these amounts,',
   'return them (plain numbers); otherwise return null for each. discount_amount',
   'is a line or invoice-level discount; shipping_amount is freight / packaging /',
@@ -146,7 +160,7 @@ const LEDGER_SCHEMA = {
     invoice_number: { type: Type.STRING },
     vendor_name: { type: Type.STRING },
     supplier_gstin: { type: Type.STRING },
-    recipient_gstin: { type: Type.STRING },
+    recipient_gstin: { type: Type.STRING, nullable: true },
     taxable_value: { type: Type.NUMBER },
     cgst_amount: { type: Type.NUMBER },
     sgst_amount: { type: Type.NUMBER },
@@ -164,7 +178,7 @@ const LEDGER_SCHEMA = {
     confidence: confidenceSchema,
   },
   required: [
-    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
     'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
   ],
@@ -245,6 +259,10 @@ export function parseVisionJson(text: string): LedgerCandidate {
       throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     }
   }
+  // Buyer GSTIN: optional; normalised only (no spaces, upper-case). Kept even
+  // when identical to the supplier's so `supplier-equals-recipient` still fires.
+  candidate.recipient_gstin = typeof candidate.recipient_gstin === 'string'
+    ? candidate.recipient_gstin.replace(/\s+/g, '').toUpperCase() : ''
   for (const field of OPTIONAL_EVIDENCE_FIELDS) {
     if (candidate[field] === undefined) candidate[field] = null
     if (candidate[field] !== null && typeof candidate[field] !== 'string') {

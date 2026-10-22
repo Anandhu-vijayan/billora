@@ -180,6 +180,33 @@ export async function recordMediaIntake(
   return { invoiceId, jobId, invoicePreexisting, jobPreexisting }
 }
 
+/**
+ * Abuse / provider-quota guard: has this workspace already filed `limit` NEW
+ * invoices in the current UTC day? Enforced at intake, BEFORE any extraction
+ * job is created, because the job is what actually spends (gated) Gemini quota
+ * and OCR/storage. `limit <= 0` disables the guard. A webhook redelivery of
+ * THIS objectPath is excluded from the count, so a Meta retry of a file that
+ * already took its slot is never falsely rejected (recordMediaIntake dedups it
+ * downstream anyway). Throws on a count failure — a silent pass would defeat
+ * the whole point of the guard.
+ */
+export async function isDailyIntakeLimitReached(
+  db: Db,
+  args: { workspaceId: string; limit: number; objectPath: string },
+): Promise<boolean> {
+  if (!Number.isFinite(args.limit) || args.limit <= 0) return false
+  const dayStart = new Date()
+  dayStart.setUTCHours(0, 0, 0, 0)
+  const { count, error } = await db
+    .from('invoices')
+    .select('id', { count: 'exact', head: true })
+    .eq('workspace_id', args.workspaceId)
+    .gte('received_at', dayStart.toISOString())
+    .neq('file_object_path', args.objectPath)
+  if (error) throw new Error(`INTAKE_LIMIT_COUNT_ERROR: ${error.message}`)
+  return (count ?? 0) >= args.limit
+}
+
 // ---- Pending uploads ("receive first, ask later") -------------------------
 // Media that arrives before the sender has a workspace — or before an
 // organization client is explicitly confirmed — is stored privately and held

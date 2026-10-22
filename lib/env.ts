@@ -30,6 +30,10 @@ const serverSchema = z.object({
   WHATSAPP_ACCESS_TOKEN: z.string().min(1).optional(),
   WHATSAPP_PHONE_NUMBER_ID: z.string().min(1).optional(),
   WHATSAPP_GRAPH_VERSION: z.string().min(1).default('v21.0'),
+  // ABUSE / PROVIDER-QUOTA GUARD. Max NEW invoices one workspace may file per
+  // UTC day at the WhatsApp intake. Bounds runaway Gemini/storage/OCR cost from
+  // a spamming sender. Set 0 to disable the cap entirely.
+  WHATSAPP_MAX_INVOICES_PER_DAY: z.coerce.number().int().min(0).default(200),
   // Keyed HMAC for WhatsApp sender identities. Generate with:
   // node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   // NEVER commit the real value; rotate by re-keying whatsapp_identities.

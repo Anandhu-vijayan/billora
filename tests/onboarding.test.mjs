@@ -114,6 +114,7 @@ const finalize = await importTs('lib/whatsapp/finalize.ts')
 // idempotent register scheduling (used by BOTH extraction and human review) is
 // exercised in-process against a fake query builder, not reimplemented.
 const batch = await importTs('lib/invoices/batch.ts')
+const intakeMod = await importTs('lib/whatsapp/intake.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -716,6 +717,23 @@ test('G4e route renders menu/status/review and decouples resend (never re-runs i
   assert.ok(!/recordMediaIntake|assignPendingUploads|transition\(/.test(rpr), 'resend must not re-run business ops')
   // Ack fires once per session; later clean uploads stay silent (no nag).
   assert.match(src, /upload_ack_sent_at: new Date\(\)/)
+})
+
+test('G4e2 deferred register keeps its handoff on a transient/blocked send (never strands a ready workbook)', () => {
+  const src = routeSrc()
+  const rpr = src.slice(src.indexOf('async function resendPendingReply'), src.indexOf('Onboarding + upload decision engine'))
+  // A document that is NOT yet delivered but could succeed later must return
+  // BEFORE the text fallback that clears pending_reply_body — otherwise the
+  // reassuring "I'll send the Excel" text retires the handoff and the file never
+  // arrives (exactly the reported "can't get it in WhatsApp" failure).
+  const guard = /if \(r\.outcome === 'transient' \|\| r\.outcome === 'blocked'\) \{[\s\S]*?return;\s*\}/.exec(rpr)
+  assert.ok(guard, 'transient/blocked outcome must early-return to keep the handoff')
+  const sendTextIdx = rpr.indexOf('const o = await sendText(to, body')
+  assert.ok(sendTextIdx > -1 && guard.index < sendTextIdx, 'retry guard must run before the text-clear fallback')
+  // The successful-delivery path likewise returns before the text fallback.
+  assert.match(rpr, /if \(r\.delivered\) \{[\s\S]*?return;\s*\}/)
+  // Only a 'skipped' (gone/expired) workbook is allowed to fall through to text+clear.
+  assert.match(rpr, /'skipped'[\s\S]*?fall through/i)
 })
 
 test('G4f Stage-2 session columns are additive; inbound idempotency is untouched', () => {
@@ -1584,6 +1602,7 @@ function fakeDb(resolve) {
       delete() { return mk(table, 'delete', filters) },
       eq(c, v) { return mk(table, verb, [...filters, { eq: [c, v] }]) },
       neq(c, v) { return mk(table, verb, [...filters, { neq: [c, v] }]) },
+      gte(c, v) { return mk(table, verb, [...filters, { gte: [c, v] }]) },
       in(c, v) { return mk(table, verb, [...filters, { in: [c, v] }]) },
       not(c, o, v) { return mk(table, verb, [...filters, { not: [c, o, v] }]) },
       is(c, v) { return mk(table, verb, [...filters, { is: [c, v] }]) },
@@ -2437,4 +2456,45 @@ test('P24 scanned-PDF fallback: pdf.js receives a COPY so the decrypted media bu
     'toUint8 must NOT build a view over the caller ArrayBuffer')
   assert.ok(/new Uint8Array\(buffer\.byteLength\)[\s\S]*copy\.set\(buffer\)/.test(src),
     'toUint8 must allocate a private copy of the bytes')
+})
+
+// ---- Daily intake rate limit (abuse / provider-quota guard) --------------
+test('RL1 daily intake guard counts workspace invoices, excludes this file, honors the cap', async () => {
+  const seen = []
+  const db = fakeDb(({ table, verb, filters }) => {
+    if (table === 'invoices' && verb === 'count') {
+      seen.push(filters)
+      const isTarget = filters.find((f) => f.eq && f.eq[0] === 'workspace_id')?.eq[1] === 'ws'
+      return { count: isTarget ? 5 : 0, error: null }
+    }
+    return { data: [], count: 0, error: null }
+  })
+  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 10, objectPath: 'p' }), false, 'under the cap -> allowed')
+  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 5, objectPath: 'p' }), true, 'at the cap -> blocked')
+  const f = seen[0]
+  assert.ok(f.some((x) => x.neq && x.neq[0] === 'file_object_path'), 'excludes this file so a Meta retry is not double-counted')
+  assert.ok(f.some((x) => x.gte && x.gte[0] === 'received_at'), 'bounds the count to the current UTC day')
+})
+
+test('RL2 limit <= 0 disables the guard without a query; a count error throws (never a silent pass)', async () => {
+  let queried = false
+  const db = fakeDb(() => { queried = true; return { count: 9999, error: null } })
+  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 0, objectPath: 'p' }), false)
+  assert.equal(queried, false, 'a disabled guard must not even read the table')
+  const errDb = fakeDb(() => ({ count: null, error: { message: 'boom' } }))
+  await assert.rejects(
+    () => intakeMod.isDailyIntakeLimitReached(errDb, { workspaceId: 'ws', limit: 10, objectPath: 'p' }),
+    /INTAKE_LIMIT_COUNT_ERROR/,
+  )
+})
+
+test('RL3 route.ts enforces the cap before storing/enqueueing, and env + example document it', () => {
+  const r = routeSrc()
+  const call = r.indexOf('await isDailyIntakeLimitReached(db,')
+  const enc = r.indexOf('const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath })')
+  assert.ok(call > 0, 'route.ts calls the guard')
+  assert.ok(enc > call, 'the cap is enforced BEFORE the container is encrypted/stored and the job enqueued')
+  assert.ok(r.includes('const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();'), 'cap read from validated env')
+  assert.match(envSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY: z\.coerce\.number\(\)\.int\(\)\.min\(0\)\.default\(200\)/)
+  assert.match(envExampleSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY=200/)
 })
