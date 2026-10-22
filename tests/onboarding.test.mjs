@@ -115,6 +115,7 @@ const finalize = await importTs('lib/whatsapp/finalize.ts')
 // exercised in-process against a fake query builder, not reimplemented.
 const batch = await importTs('lib/invoices/batch.ts')
 const intakeMod = await importTs('lib/whatsapp/intake.ts')
+const excelGen = await importTs('lib/excel/generator.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -1788,15 +1789,23 @@ test('M8c WhatsApp media upload posts the file to the Graph media endpoint and n
   assert.ok(!/logger\.[a-z]+\([^)]*body\.id/.test(up), 'never logs the returned media id')
 })
 
-test('M8d sendDocument emits a Cloud API document message with a clamped caption', () => {
+test('M8d sendDocument sends by media id WITHOUT a mime_type (avoids Meta error 100 mismatch)', () => {
   const s = sendSrc()
-  const d = s.slice(s.indexOf('export function sendDocument'))
+  const d = s.slice(s.indexOf('export function sendDocument'), s.indexOf('export function sendAccountTypeButtons'))
   assert.ok(d.length > 80, 'sendDocument exists')
   assert.match(d, /type: 'document'/)
   assert.match(d, /id: args\.mediaId/)
   assert.match(d, /filename: args\.filename/)
-  assert.match(d, /mime_type: args\.mimeType/)
+  // Declaring mime_type on a by-id document makes Meta reject the whole send with
+  // code 100 when its stored/normalized type differs — the exact production bug.
+  assert.ok(!/mime_type\s*:/.test(d), 'document-by-id must NOT set a mime_type key')
   assert.match(d, /\.slice\(0, 1024\)/, 'caption clamped to Meta limit')
+})
+
+test('M8g Meta send failures log the provider error message (bounded) so a code 100 is diagnosable', () => {
+  const s = sendSrc()
+  assert.match(s, /providerErrorMessage:/, 'the send response log carries Meta\'s message')
+  assert.match(s, /body\?\.error\?\.message\?\.slice\(0, \d+\)/, 'message is truncated, not dumped raw')
 })
 
 test('M8e register delivery reuses the download-route decrypt and is owner-chat idempotent', () => {
@@ -2268,6 +2277,46 @@ test('P15 engine + handler wiring: ranking-based selection, conflict provenance,
   assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
   assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildComplianceExcelWorkbook'),
     'an all-review batch is a no-op that never reaches workbook generation/delivery')
+})
+
+// ---- Workbook integrity gate: never persist/deliver a non-openable .xlsx ----
+
+const LEDGER_ROW = {
+  invoice_date: '2026-09-05', invoice_number: 'INV-1', vendor_name: 'Acme Traders',
+  supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 90,
+  sgst_amount: 90, igst_amount: 0, total_amount: 1180,
+}
+
+test('WB1 a freshly generated register reopens as a valid, structured workbook (real generator)', async () => {
+  const buf = await excelGen.buildComplianceExcelWorkbook([LEDGER_ROW])
+  assert.equal(buf.subarray(0, 2).toString('latin1'), 'PK', 'a real .xlsx is a ZIP/OOXML archive')
+  await excelGen.validateComplianceWorkbook(buf) // must NOT throw
+})
+
+test('WB2 the gate rejects truncated / non-archive / unparseable buffers (fails closed)', async () => {
+  const good = await excelGen.buildComplianceExcelWorkbook([LEDGER_ROW])
+  const bad = {
+    empty: Buffer.alloc(0),
+    truncated: good.subarray(0, 10),
+    wrongMagic: Buffer.concat([Buffer.from('XX', 'latin1'), good.subarray(2)]),
+    notAnArchive: Buffer.from('this is definitely not a zip archive at all', 'latin1'),
+    // Right signature but a garbage body -> must fail the ExcelJS reopen, not
+    // the magic check (proves we validate structure, not just the extension).
+    fakeZipHeader: Buffer.concat([Buffer.from('PK\u0003\u0004', 'latin1'), Buffer.alloc(64, 0x41)]),
+  }
+  for (const [name, buf] of Object.entries(bad)) {
+    await assert.rejects(() => excelGen.validateComplianceWorkbook(buf), /WORKBOOK_INVALID/, `${name} must be rejected`)
+  }
+})
+
+test('WB3 the register validates the workbook BEFORE it is encrypted or uploaded', () => {
+  const reg = registerSrc()
+  assert.ok(reg.includes('validateComplianceWorkbook(workbook)'), 'the integrity gate is wired into the handler')
+  const gen = reg.indexOf('await buildComplianceExcelWorkbook')
+  const validate = reg.indexOf('await validateComplianceWorkbook(workbook)')
+  const encrypt = reg.indexOf('encryptFile(workbook')
+  assert.ok(gen > -1 && gen < validate && validate < encrypt,
+    'generate -> validate -> encrypt: a malformed buffer can never be stored or delivered')
 })
 
 // ---- Second-pass bug fix (17 Oct logs): selection precedence, money, dates ----

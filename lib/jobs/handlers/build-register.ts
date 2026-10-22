@@ -22,7 +22,7 @@ import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
 import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
-import { buildComplianceExcelWorkbook } from '@/lib/excel/generator'
+import { buildComplianceExcelWorkbook, validateComplianceWorkbook } from '@/lib/excel/generator'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
 import type { LedgerRow } from '@/lib/ocr/ledger'
 
@@ -162,6 +162,12 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 
   logger.info('[Register] workbook generation started', { batchId, jobId: job.id, rowCount: rows.length })
   const workbook = await buildComplianceExcelWorkbook(rows)
+  // Integrity gate BEFORE anything is persisted: reopen the buffer and prove it
+  // is a genuine, openable .xlsx. A truncated/partial write or an ExcelJS
+  // regression throws here (the job requeues) instead of encrypting, storing,
+  // and later "delivering" a register the customer cannot open — we never claim
+  // success for a file we have not verified. No row data is logged.
+  await validateComplianceWorkbook(workbook)
   logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')

@@ -15,6 +15,9 @@ import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, existsSync } from 
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { createRequire } from 'node:module'
+
+const req = createRequire(join(process.cwd(), '_resolver-anchor.js'))
 
 let cacheDir
 const compiled = new Map() // absolute .ts path -> emitted .mjs path
@@ -49,6 +52,20 @@ function compile(abs) {
     (_m, lead, quote, spec) => {
       const dep = compile(resolveRelative(abs, spec))
       return `${lead}${quote}${pathToFileURL(dep).href}${quote}`
+    },
+  )
+  // Bridge BARE third-party specifiers (e.g. 'exceljs') to their resolved file
+  // URL. The emitted module lives in a temp dir, so Node's own node_modules
+  // walk-up would not find the package; resolving from the project root lets a
+  // dependency-light module exercise the REAL package (never a copy). Builtins
+  // (node:*), the unsupported '@/' alias, and anything unresolvable are left
+  // untouched so existing behaviour is preserved.
+  outputText = outputText.replace(
+    /(\bfrom\s*|\bimport\s*\(\s*)(['"])(?!node:|\/|\.{1,2}\/|file:)([A-Za-z@][^'"]*)\2/g,
+    (m, lead, quote, spec) => {
+      if (spec.startsWith('@/')) return m // alias stays unsupported by design
+      try { return `${lead}${quote}${pathToFileURL(req.resolve(spec)).href}${quote}` }
+      catch { return m }
     },
   )
   mkdirSync(dirname(outFile), { recursive: true })

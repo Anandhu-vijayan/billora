@@ -57,6 +57,10 @@ async function postMessage(
       providerErrorCode: body?.error?.code ?? null,
       providerErrorSubcode: body?.error?.error_subcode ?? null,
       providerErrorType: body?.error?.type ?? null,
+      // Meta's own description of WHICH parameter it rejected. This names request
+      // fields, never recipient data, and is bounded so a verbose message cannot
+      // bloat the log — without it a code 100 is undiagnosable in production.
+      providerErrorMessage: body?.error?.message?.slice(0, 200) ?? null,
       providerTraceId: body?.error?.fbtrace_id ?? null,
       ...correlation,
     }
@@ -97,10 +101,14 @@ export function sendText(to: string, body: string, correlation?: { workbookId?: 
  */
 export function sendDocument(
   to: string,
-  args: { mediaId: string; filename: string; mimeType: string; caption?: string },
+  args: { mediaId: string; filename: string; caption?: string },
   correlation?: { workbookId?: string },
 ): Promise<SendOutcome> {
-  const document: Record<string, unknown> = { id: args.mediaId, filename: args.filename, mime_type: args.mimeType }
+  // Send by media id: Meta derives the type from the stored upload. Declaring a
+  // mime_type that differs from the type Meta normalized on upload makes it
+  // reject the ENTIRE document with error 100 (Invalid parameter) — so we omit
+  // it here. The upload (uploadWhatsAppMedia) still carries the real type.
+  const document: Record<string, unknown> = { id: args.mediaId, filename: args.filename }
   if (args.caption) document.caption = args.caption.slice(0, 1024)
   return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation)
 }

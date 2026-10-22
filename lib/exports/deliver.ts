@@ -105,7 +105,6 @@ export async function deliverWorkbookToWhatsApp(
       {
         mediaId,
         filename: FILENAME,
-        mimeType: SPREADSHEET_MIME,
         caption: args.caption ?? 'Your Billora invoice register. Each invoice is filed under its own invoice month.',
       },
       { workbookId },

@@ -70,3 +70,38 @@ export async function buildComplianceExcelWorkbook(records: IndianLedgerRowInput
   const buf = await workbook.xlsx.writeBuffer();
   return Buffer.from(buf as ArrayBuffer);
 }
+
+/**
+ * Reopen a freshly generated workbook and prove it is a genuine, readable
+ * .xlsx before it is ever encrypted, stored, or delivered. A "successful"
+ * writeBuffer() that returns a nonzero size is NOT proof the bytes are a valid
+ * OOXML archive — a truncated/partial write or an ExcelJS regression would
+ * otherwise ship a register the customer cannot open (and, once stored, we
+ * would claim delivery of a file that does not work). This gate fails CLOSED:
+ * any structural problem throws so the caller requeues instead of persisting a
+ * bad workbook. It never logs row data — only the failure reason.
+ */
+export const WORKBOOK_SHEET_NAME = 'GSTR-2B Purchase Register';
+export async function validateComplianceWorkbook(buf: Buffer): Promise<void> {
+  // A ZIP/OOXML file must start with the local-file-header magic "PK\u{03}\u{04}".
+  if (!Buffer.isBuffer(buf) || buf.length < 22 || buf.subarray(0, 2).toString('latin1') !== 'PK') {
+    throw new Error('WORKBOOK_INVALID: missing ZIP/OOXML signature');
+  }
+  const check = new ExcelJS.Workbook();
+  try {
+    // ExcelJS types its own `Buffer` (extends ArrayBuffer); a Node Buffer is
+    // accepted at runtime, so bridge the nominal type the same way the writer
+    // side bridges `writeBuffer()`'s return.
+    await check.xlsx.load(buf as unknown as Parameters<typeof check.xlsx.load>[0]);
+  } catch {
+    throw new Error('WORKBOOK_INVALID: buffer is not a parseable workbook');
+  }
+  const ws = check.worksheets[0];
+  if (!ws || ws.name !== WORKBOOK_SHEET_NAME) {
+    throw new Error('WORKBOOK_INVALID: expected worksheet is missing');
+  }
+  // The register always renders its 9 headed columns and at least the header row.
+  if (ws.columnCount < 9 || ws.rowCount < 1) {
+    throw new Error('WORKBOOK_INVALID: header row did not render');
+  }
+}
