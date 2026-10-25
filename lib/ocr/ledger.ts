@@ -28,6 +28,17 @@ export interface LedgerRow {
   sgst_amount: number | null;
   igst_amount: number | null;
   total_amount: number | null;
+  // --- Added for the Tally purchase-import profile -------------------------
+  // All OPTIONAL so previously-stored 9-field payloads stay readable (an absent
+  // field is `undefined`, which the readers below treat as UNKNOWN, never 0).
+  // Printed round-off when the source carried it; null means NOT printed.
+  round_off?: number | null;
+  // Printed per-head GST rate percentages exactly as extracted (never derived
+  // from the amounts): we keep the source rate separate from any computed total
+  // so the export never overwrites a printed rate with a calculated one.
+  cgst_rate_percent?: number | null;
+  sgst_rate_percent?: number | null;
+  igst_rate_percent?: number | null;
 }
 
 /** A raw extraction candidate: values plus an optional per-field confidence. */
@@ -102,6 +113,22 @@ const REQUIRED_FIELDS = [
 const GST_EPOCH = '2017-07-01';
 
 const money = (n: number): number | null => Number.isFinite(n) ? n : null
+
+/**
+ * Parse a printed tax-rate PERCENTAGE (0..100) to a finite number, or null when
+ * the source never printed one. This is deliberately separate from money(): a
+ * rate is a percentage, not a currency amount, and an absent rate must stay
+ * UNKNOWN (null) — it is never inferred from the amounts, per the rule that a
+ * printed rate is preserved and an unprinted one is not calculated in.
+ */
+function ratePercent(v: number | string | null | undefined): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null
+  if (typeof v === 'string') {
+    const n = Number(v.replace(/%/g, '').trim())
+    return Number.isFinite(n) ? n : null
+  }
+  return null
+}
 
 const PLACEHOLDER_TEXT = /^(?:n\/?a|na|tbd|unknown|placeholder|sample|test|(?:add|enter|insert|your|company|vendor|supplier|invoice)\s+(?:company\s+)?(?:name|number|no\.?|details|here)|(?:company|vendor|supplier|invoice)\s+(?:name|number|no\.?))$/i
 
@@ -544,6 +571,14 @@ export function evaluateLedger(
     sgst_amount: money(sgst),
     igst_amount: money(igst),
     total_amount: money(total),
+    // Carry-forward the printed structural fields the Tally import needs. These
+    // are taken ONLY from what the source printed (via mergeCandidates they
+    // survive local/AI blending); an absent value stays null, never a zero and
+    // never back-computed from the amounts. round_off may legitimately be < 0.
+    round_off: money(toNumber(candidate.round_off)),
+    cgst_rate_percent: ratePercent(candidate.cgst_rate_percent),
+    sgst_rate_percent: ratePercent(candidate.sgst_rate_percent),
+    igst_rate_percent: ratePercent(candidate.igst_rate_percent),
   };
 
   return {

@@ -116,6 +116,9 @@ const finalize = await importTs('lib/whatsapp/finalize.ts')
 const batch = await importTs('lib/invoices/batch.ts')
 const intakeMod = await importTs('lib/whatsapp/intake.ts')
 const excelGen = await importTs('lib/excel/generator.ts')
+// tally/ledger-mapping.ts has only an erased `import type`, so the REAL
+// never-fabricate ledger resolution is exercised in-process, not reimplemented.
+const tallyMap = await importTs('lib/tally/ledger-mapping.ts')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -2275,48 +2278,178 @@ test('P15 engine + handler wiring: ranking-based selection, conflict provenance,
   const reg = registerSrc()
   assert.ok(reg.includes("eq('review_status', 'approved')"), 'the workbook exports ONLY approved rows')
   assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
-  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildComplianceExcelWorkbook'),
+  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildTallyImportWorkbook'),
     'an all-review batch is a no-op that never reaches workbook generation/delivery')
 })
 
 // ---- Workbook integrity gate: never persist/deliver a non-openable .xlsx ----
 
-const LEDGER_ROW = {
+// ---- Tally purchase-import workbook: structure, integrity, and cells ----
+
+// A fully-resolved import line (post ledger-mapping): amounts numeric, ledger named.
+const TALLY_ROW = {
   invoice_date: '2026-09-05', invoice_number: 'INV-1', vendor_name: 'Acme Traders',
-  supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 90,
-  sgst_amount: 90, igst_amount: 0, total_amount: 1180,
+  supplier_gstin: '27AAPFU0939F1ZV', ledger_name: 'Purchase @ 18%',
+  taxable_value: 1000, gst_rate_percent: 18, cgst_amount: 90, sgst_amount: 90,
+  igst_amount: 0, round_off: 0, gross_total: 1180,
 }
 
-test('WB1 a freshly generated register reopens as a valid, structured workbook (real generator)', async () => {
-  const buf = await excelGen.buildComplianceExcelWorkbook([LEDGER_ROW])
+const EXPECTED_HEADERS = ['Date', 'Invoice No', 'Supplier Name', 'GSTIN', 'Ledger Name',
+  'Taxable Amount', 'Tax Rate', 'CGST Amount', 'SGST Amount', 'IGST Amount', 'Round Off', 'Gross Total']
+
+// Reopen a produced buffer with the REAL ExcelJS to inspect cell types/values.
+async function loadSheet(buf) {
+  const ExcelJS = (await import('exceljs')).default
+  const wb = new ExcelJS.Workbook()
+  await wb.xlsx.load(buf)
+  return wb.getWorksheet('Purchase Import')
+}
+
+test('T1 the generated workbook has the exact 12 headers, in order, on a "Purchase Import" sheet', async () => {
+  const buf = await excelGen.buildTallyImportWorkbook([TALLY_ROW])
   assert.equal(buf.subarray(0, 2).toString('latin1'), 'PK', 'a real .xlsx is a ZIP/OOXML archive')
-  await excelGen.validateComplianceWorkbook(buf) // must NOT throw
+  const ws = await loadSheet(buf)
+  assert.ok(ws, 'the "Purchase Import" worksheet exists')
+  assert.equal(ws.columnCount, 12, 'exactly 12 columns')
+  const headers = []
+  for (let i = 1; i <= 12; i += 1) headers.push(String(ws.getRow(1).getCell(i).text).trim())
+  assert.deepEqual(headers, EXPECTED_HEADERS, 'header text and ORDER match the accountant template')
 })
 
-test('WB2 the gate rejects truncated / non-archive / unparseable buffers (fails closed)', async () => {
-  const good = await excelGen.buildComplianceExcelWorkbook([LEDGER_ROW])
+test('T2 dates are REAL date cells (DD-MM-YYYY) and amounts/rate are NUMERIC cells', async () => {
+  const buf = await excelGen.buildTallyImportWorkbook([TALLY_ROW])
+  const ws = await loadSheet(buf)
+  const row = ws.getRow(2)
+  const dateCell = row.getCell(1)
+  assert.ok(dateCell.value instanceof Date, 'Date column is a genuine Excel date, not text')
+  assert.equal(dateCell.numFmt, 'DD-MM-YYYY', 'date is displayed DD-MM-YYYY')
+  assert.equal(dateCell.value.getFullYear(), 2026); assert.equal(dateCell.value.getMonth(), 8); assert.equal(dateCell.value.getDate(), 5)
+  assert.equal(typeof row.getCell(6).value, 'number', 'Taxable Amount is numeric')
+  assert.equal(row.getCell(6).value, 1000)
+  assert.equal(typeof row.getCell(7).value, 'number', 'Tax Rate is numeric')
+  assert.equal(row.getCell(7).value, 18)
+  assert.equal(row.getCell(12).value, 1180, 'Gross Total is the invoice total')
+})
+
+test('T3 blank vs zero is preserved — 0 stays 0, unknown (null) renders as a BLANK cell', async () => {
+  const line = { ...TALLY_ROW, ledger_name: null, gst_rate_percent: null, round_off: null, igst_amount: 0 }
+  const buf = await excelGen.buildTallyImportWorkbook([line])
+  const ws = await loadSheet(buf)
+  const row = ws.getRow(2)
+  assert.ok(row.getCell(5).value == null || row.getCell(5).value === '', 'unresolved ledger name is BLANK, never a guess')
+  assert.ok(row.getCell(7).value == null || row.getCell(7).value === '', 'unknown rate is BLANK (not coerced to 0)')
+  assert.ok(row.getCell(11).value == null || row.getCell(11).value === '', 'absent round-off is BLANK')
+  assert.equal(row.getCell(10).value, 0, 'a genuine 0 IGST stays 0')
+})
+
+test('T4 no summary/total row is ever appended (a trailing total would import as a phantom voucher)', async () => {
+  const buf = await excelGen.buildTallyImportWorkbook([TALLY_ROW, { ...TALLY_ROW, invoice_number: 'INV-2' }])
+  const ws = await loadSheet(buf)
+  assert.equal(ws.rowCount, 3, 'header + 2 data rows, nothing more')
+  await excelGen.validateTallyWorkbook(buf, 2) // must NOT throw
+  // The validator REFUSES an unexpected row count (a stray summary would fail here).
+  await assert.rejects(() => excelGen.validateTallyWorkbook(buf, 1), /WORKBOOK_INVALID/, 'a phantom row count mismatch is rejected')
+})
+
+test('T5 free-text that starts with = is stored as literal text, never a formula (no injection)', async () => {
+  const evil = { ...TALLY_ROW, vendor_name: '=SUM(A1:A9)', invoice_number: '+cmd|x' }
+  const buf = await excelGen.buildTallyImportWorkbook([evil])
+  const ws = await loadSheet(buf)
+  const vendor = ws.getRow(2).getCell(3)
+  assert.notEqual(vendor.type, 6, 'Supplier Name is not a Formula cell type')
+  assert.equal(String(vendor.value), '=SUM(A1:A9)', 'the literal string is preserved as text')
+  assert.equal(vendor.numFmt, '@', 'text columns carry an explicit Text format')
+})
+
+test('T6 the integrity gate reopens a good workbook and fails CLOSED on truncated/garbage buffers', async () => {
+  const good = await excelGen.buildTallyImportWorkbook([TALLY_ROW])
+  await excelGen.validateTallyWorkbook(good, 1) // must NOT throw
   const bad = {
     empty: Buffer.alloc(0),
     truncated: good.subarray(0, 10),
     wrongMagic: Buffer.concat([Buffer.from('XX', 'latin1'), good.subarray(2)]),
-    notAnArchive: Buffer.from('this is definitely not a zip archive at all', 'latin1'),
-    // Right signature but a garbage body -> must fail the ExcelJS reopen, not
-    // the magic check (proves we validate structure, not just the extension).
+    notAnArchive: Buffer.from('definitely not a zip archive at all', 'latin1'),
     fakeZipHeader: Buffer.concat([Buffer.from('PK\u0003\u0004', 'latin1'), Buffer.alloc(64, 0x41)]),
   }
   for (const [name, buf] of Object.entries(bad)) {
-    await assert.rejects(() => excelGen.validateComplianceWorkbook(buf), /WORKBOOK_INVALID/, `${name} must be rejected`)
+    await assert.rejects(() => excelGen.validateTallyWorkbook(buf), /WORKBOOK_INVALID/, `${name} must be rejected`)
   }
 })
 
-test('WB3 the register validates the workbook BEFORE it is encrypted or uploaded', () => {
+test('T7 the register validates the workbook AFTER build and BEFORE encrypt/upload', () => {
   const reg = registerSrc()
-  assert.ok(reg.includes('validateComplianceWorkbook(workbook)'), 'the integrity gate is wired into the handler')
-  const gen = reg.indexOf('await buildComplianceExcelWorkbook')
-  const validate = reg.indexOf('await validateComplianceWorkbook(workbook)')
+  assert.ok(reg.includes('validateTallyWorkbook(workbook'), 'the integrity gate is wired into the handler')
+  const gen = reg.indexOf('await buildTallyImportWorkbook')
+  const validate = reg.indexOf('await validateTallyWorkbook(workbook')
   const encrypt = reg.indexOf('encryptFile(workbook')
   assert.ok(gen > -1 && gen < validate && validate < encrypt,
     'generate -> validate -> encrypt: a malformed buffer can never be stored or delivered')
+})
+
+// ---- Ledger mapping: never fabricate a classification ----
+
+test('T8 a mapped rate-class echoes the configured ledger; an unmapped one is mapping-required, never invented', () => {
+  const row = { invoice_date: '2026-09-05', invoice_number: 'A', vendor_name: 'V', supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0, total_amount: 1180, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  assert.equal(tallyMap.resolveTaxTreatment(row), 'local', 'CGST+SGST only => local')
+  assert.equal(tallyMap.overallGstRatePercent(row, 'local'), 18, 'overall rate = printed CGST+SGST halves')
+  assert.equal(tallyMap.rateClassKey('local', 18), 'local@18')
+  // Unconfigured workspace => mapping-required with NO ledger name (never a guess).
+  const un = tallyMap.resolveLedgerName(row, [])
+  assert.equal(un.status, 'mapping-required')
+  assert.equal(un.ledgerName, null, 'an unmapped line carries NO ledger name')
+  // Configured => exactly echoes the configured ledger name.
+  const hit = tallyMap.resolveLedgerName(row, [{ rate_class_key: 'local@18', ledger_name: 'Purchase @ 18%' }])
+  assert.equal(hit.status, 'mapped')
+  assert.equal(hit.ledgerName, 'Purchase @ 18%')
+})
+
+test('T9 interstate resolves by printed IGST rate; an unclassifiable row is unresolved, never mapped', () => {
+  const inter = { invoice_date: '2026-09-05', invoice_number: 'B', vendor_name: 'V', supplier_gstin: '29AABCS1983H1Z8', taxable_value: 1000, cgst_amount: 0, sgst_amount: 0, igst_amount: 180, total_amount: 1180, igst_rate_percent: 18 }
+  assert.equal(tallyMap.resolveTaxTreatment(inter), 'interstate')
+  assert.equal(tallyMap.overallGstRatePercent(inter, 'interstate'), 18)
+  assert.equal(tallyMap.rateClassKey('interstate', 18), 'interstate@18')
+  // No rate evidence AND no tax heads (exempt/nil or unreadable) => unknown treatment.
+  const bare = { invoice_date: '2026-09-05', invoice_number: 'C', vendor_name: 'V', supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 1000 }
+  assert.equal(tallyMap.resolveTaxTreatment(bare), 'unknown')
+  const r = tallyMap.resolveLedgerName(bare, [{ rate_class_key: 'local@0', ledger_name: 'X' }])
+  assert.equal(r.status, 'unresolved-rate', 'an unestablished rate cannot be mapped by luck')
+  assert.equal(r.ledgerName, null)
+})
+
+test('T10 mapping resolution NEVER produces a ledger name that was not configured (no silent default)', () => {
+  const row = { invoice_date: '2026-09-05', invoice_number: 'D', vendor_name: 'V', supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0, total_amount: 1180, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  const out = tallyMap.resolveLedgerName(row, [{ rate_class_key: 'interstate@18', ledger_name: 'Interstate @ 18%' }])
+  assert.equal(out.status, 'mapping-required', 'a DIFFERENT class mapping is not wrongly applied')
+  assert.equal(out.ledgerName, null)
+})
+
+// ---- Canonical model: the new printed fields survive merge + stay backward-compatible ----
+
+test('T11 round-off and printed rates survive evaluateLedger into the stored row', () => {
+  const cand = { ...CLEAN_ROW, round_off: 0.5, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  const ev = ledger.evaluateLedger(cand, { minConfidence: 0.8 })
+  assert.equal(ev.row.round_off, 0.5, 'printed round-off is carried forward')
+  assert.equal(ev.row.cgst_rate_percent, 9)
+  assert.equal(ev.row.sgst_rate_percent, 9)
+})
+
+test('T12 round-off + rate evidence survive mergeCandidates (local primary wins, AI fills gaps)', () => {
+  const primary = { round_off: 1, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  const fallback = { round_off: 2, igst_rate_percent: 18 }
+  const merged = ledger.mergeCandidates(primary, fallback)
+  assert.equal(merged.round_off, 1, 'local printed round-off is kept over the AI value')
+  assert.equal(merged.cgst_rate_percent, 9)
+  assert.equal(merged.igst_rate_percent, 18, 'a field only the AI read is filled from it')
+})
+
+test('T13 a previously-stored 9-field payload stays readable by the extended model (backward compat)', () => {
+  const oldPayload = { invoice_date: '2026-09-05', invoice_number: 'OLD', vendor_name: 'V', supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 100, cgst_amount: 9, sgst_amount: 9, igst_amount: 0, total_amount: 118 }
+  // No round_off / rate keys present — the mapping layer must treat them as unknown, never 0.
+  assert.equal(oldPayload.round_off, undefined, 'an absent field is undefined, NOT fabricated')
+  const res = tallyMap.resolveLedgerName(oldPayload, [{ rate_class_key: 'local@18', ledger_name: 'L' }])
+  assert.equal(res.gstRatePercent, null, 'a row without rate evidence has an unknown rate')
+  assert.equal(res.status, 'unresolved-rate')
+  assert.equal(res.ledgerName, null)
 })
 
 // ---- Second-pass bug fix (17 Oct logs): selection precedence, money, dates ----

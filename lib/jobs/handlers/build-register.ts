@@ -22,7 +22,8 @@ import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
 import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
-import { buildComplianceExcelWorkbook, validateComplianceWorkbook } from '@/lib/excel/generator'
+import { buildTallyImportWorkbook, validateTallyWorkbook, type TallyImportRowInput } from '@/lib/excel/generator'
+import { resolveLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
 import type { LedgerRow } from '@/lib/ocr/ledger'
 
@@ -66,6 +67,29 @@ async function findOwnerSenderHmac(db: Db, workspaceId: string): Promise<string 
   const { data } = await db.from('whatsapp_identities').select('sender_hmac')
     .eq('workspace_id', workspaceId).limit(1)
   return ((data ?? [])[0]?.sender_hmac as string | undefined) ?? null
+}
+
+/**
+ * Load the workspace's Tally ledger mappings (rate-class -> ledger name). Tenant
+ * isolation is the WHERE workspace_id clause — a mapping is never read across a
+ * workspace boundary (§4 rule 6/7). A read error (e.g. the table not yet
+ * provisioned in this deployment) is treated as "no mappings configured", which
+ * makes every line mapping-required rather than inventing a ledger name: the
+ * register still ships, but never with a fabricated classification (§4 rule 2).
+ * Only the two non-sensitive columns are selected.
+ */
+async function loadLedgerMappings(db: Db, workspaceId: string): Promise<TallyLedgerMapping[]> {
+  const { data, error } = await db
+    .from('tally_ledger_mappings')
+    .select('rate_class_key,ledger_name')
+    .eq('workspace_id', workspaceId)
+  if (error) {
+    logger.warn('[Register] ledger mappings unavailable; treating all lines as mapping-required', {
+      code: error.code ?? null,
+    })
+    return []
+  }
+  return (data ?? []) as TallyLedgerMapping[]
 }
 
 export async function buildRegister(ctx: JobContext): Promise<void> {
@@ -161,13 +185,48 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   }
 
   logger.info('[Register] workbook generation started', { batchId, jobId: job.id, rowCount: rows.length })
-  const workbook = await buildComplianceExcelWorkbook(rows)
+  // Load the workspace's configured Tally ledger mappings (scoped strictly to
+  // this workspace_id — one tenant's ledger names can never reach another). A
+  // read failure (e.g. the mapping table not yet provisioned) is treated as "no
+  // mappings configured yet", which leaves every line explicitly mapping-required
+  // rather than fabricating a ledger — the register still generates, blank-safe.
+  const mappings = await loadLedgerMappings(db, workspaceId)
+  const lines: TallyImportRowInput[] = []
+  let mapped = 0
+  let mappingRequired = 0
+  let unresolvedRate = 0
+  for (const row of rows) {
+    const res = resolveLedgerName(row, mappings)
+    if (res.status === 'mapped') mapped += 1
+    else if (res.status === 'mapping-required') mappingRequired += 1
+    else unresolvedRate += 1
+    lines.push({
+      invoice_date: row.invoice_date || null,
+      invoice_number: row.invoice_number || null,
+      vendor_name: row.vendor_name || null,
+      supplier_gstin: row.supplier_gstin || null,
+      // Blank when unresolved — NEVER a guessed ledger name (§4).
+      ledger_name: res.ledgerName,
+      taxable_value: row.taxable_value,
+      gst_rate_percent: res.gstRatePercent,
+      cgst_amount: row.cgst_amount,
+      sgst_amount: row.sgst_amount,
+      igst_amount: row.igst_amount,
+      round_off: row.round_off ?? null,
+      gross_total: row.total_amount,
+    })
+  }
+  logger.info('[Register] ledger mapping resolved', {
+    batchId, jobId: job.id, mapped, mappingRequired, unresolvedRate,
+  })
+  const workbook = await buildTallyImportWorkbook(lines)
   // Integrity gate BEFORE anything is persisted: reopen the buffer and prove it
-  // is a genuine, openable .xlsx. A truncated/partial write or an ExcelJS
-  // regression throws here (the job requeues) instead of encrypting, storing,
-  // and later "delivering" a register the customer cannot open — we never claim
-  // success for a file we have not verified. No row data is logged.
-  await validateComplianceWorkbook(workbook)
+  // is a genuine, openable .xlsx with the exact 12 Tally headers and precisely
+  // one row per line (a stray summary row would import as a phantom voucher and
+  // is rejected here). A truncated/partial write or an ExcelJS regression throws
+  // (the job requeues) instead of encrypting, storing, and later "delivering" a
+  // register the accountant cannot import. No row data is logged.
+  await validateTallyWorkbook(workbook, lines.length)
   logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')
@@ -209,7 +268,7 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   logger.info('[Register] workbook ready', { workbookId, batchId, jobId: job.id, rowCount: rows.length })
 
   // Delivery is best-effort and NEVER fails the generation job (rule 5).
-  await scheduleDelivery(db, workspaceId, workbookId, job.id, rows.length, flagged ?? 0, expiresAt, assertLease)
+  await scheduleDelivery(db, workspaceId, workbookId, job.id, rows.length, flagged ?? 0, mappingRequired + unresolvedRate, expiresAt, assertLease)
 }
 
 /**
@@ -234,6 +293,7 @@ async function scheduleDelivery(
   jobId: string,
   rowCount: number,
   needsReview: number,
+  unmappedCount: number,
   expiresAt: string,
   assertLease: () => Promise<void>,
 ): Promise<void> {
@@ -246,13 +306,19 @@ async function scheduleDelivery(
     const reviewNote = needsReview > 0
       ? ` ${needsReview} invoice(s) need review and are not included. Reply Review or choose Menu > Review.`
       : ''
+    // Honest import-readiness: a workbook is only "import-ready" once every line
+    // has a configured ledger. Report the outstanding count truthfully (§8) rather
+    // than claiming a clean import when lines are still unmapped.
+    const mappingNote = unmappedCount > 0
+      ? ` ${unmappedCount} line(s) still need a ledger mapping before they import into Tally.`
+      : ''
     const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
     // Document delivery needs no public origin, so we never defer just because
     // the web link can't be built; the link is an EXTRA fallback when configured.
     const linkNote = base
       ? ` Secure download (sign in required): ${base}/api/exports/${workbookId}/download (valid until ${expiresAt}).`
       : ''
-    const body = `[[deliver:${workbookId}]]\nYour invoice register is ready — ${rowCount} invoice(s). I'll send the Excel file here in this chat.${linkNote}${reviewNote}`
+    const body = `[[deliver:${workbookId}]]\nYour invoice register is ready — ${rowCount} invoice(s). I'll send the Excel file here in this chat.${linkNote}${reviewNote}${mappingNote}`
     await assertLease()
     const queued = await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
     logger.info(queued
