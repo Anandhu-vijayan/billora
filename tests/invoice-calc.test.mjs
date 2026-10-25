@@ -322,23 +322,29 @@ test('vision resilience: Gemini timeout is configurable and the second pass is b
 })
 
 test('review corrections parse money with the shared decimal-safe engine, not raw Number()', () => {
-  const s = readSrc('app/api/invoices/[id]/review/route.ts')
+  const s = readSrc('lib/invoices/review.ts')
   assert.match(s, /moneyToMinorUnits/, 'uses the shared Indian-grouping/currency-aware parser')
-  assert.match(s, /function parseMoney/, 'routes every amount through parseMoney')
+  assert.match(s, /function parseReviewMoney/, 'routes every amount through the shared money parser')
   assert.ok(!/typeof v === 'string' \? Number\(v\)/.test(s), 'no raw Number() on reviewer money strings')
+  const r = readSrc('app/api/invoices/[id]/review/route.ts')
+  assert.match(r, /parseReviewCorrections\(body\)/, 'the HTTP route delegates to the ONE shared validator')
 })
 
 test('review API hardening: malformed corrections get field errors, canonical row returned, actor audited', () => {
-  const s = readSrc('app/api/invoices/[id]/review/route.ts')
-  assert.match(s, /INVALID_FIELDS/, 'present-but-malformed corrections are rejected, never silently dropped')
+  // Field validation now lives in the shared parseReviewCorrections (review.ts),
+  // used by BOTH the HTTP route and the WhatsApp editor — so it is asserted there,
+  // while the route is asserted to delegate to it and to keep its own auth/audit.
+  const s = readSrc('lib/invoices/review.ts')
   assert.match(s, /INVALID_AMOUNT/, 'an amount the money engine cannot parse yields a field error')
   assert.match(s, /NEGATIVE_NOT_ALLOWED/, 'a negative required amount is rejected explicitly')
-  assert.match(s, /code: 'INVALID_TYPE'/, 'a wrong-typed text field is rejected')
-  assert.match(s, /code: 'TOO_LONG'/, 'an over-length field is rejected, not truncated')
-  assert.match(s, /row: result\.row/, 'the canonical saved record is returned to the authorized reviewer')
-  assert.match(s, /\[Review\] correction applied/, 'a correction is audited')
-  assert.match(s, /actor: userId/, 'the audit records the acting user id')
-  assert.match(s, /fields: Object\.keys\(corrections\)/, 'the audit logs corrected field NAMES only')
+  assert.match(s, /INVALID_TYPE/, 'a wrong-typed text field is rejected')
+  assert.match(s, /TOO_LONG/, 'an over-length field is rejected, not truncated')
+  const r = readSrc('app/api/invoices/[id]/review/route.ts')
+  assert.match(r, /INVALID_FIELDS/, 'present-but-malformed corrections are rejected, never silently dropped')
+  assert.match(r, /row: result\.row/, 'the canonical saved record is returned to the authorized reviewer')
+  assert.match(r, /\[Review\] correction applied/, 'a correction is audited')
+  assert.match(r, /actor: userId/, 'the audit records the acting user id')
+  assert.match(r, /fields: Object\.keys\(corrections\)/, 'the audit logs corrected field NAMES only')
   // Values (GSTIN/vendor/amount) must never be logged; only the field-name projection is.
-  assert.ok(!s.includes('JSON.stringify(corrections)'), 'correction VALUES are never serialized into a log')
+  assert.ok(!r.includes('JSON.stringify(corrections)'), 'correction VALUES are never serialized into a log')
 })

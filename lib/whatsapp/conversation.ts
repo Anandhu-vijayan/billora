@@ -1,6 +1,9 @@
 // lib/whatsapp/conversation.ts — onboarding state machine (pure, DB-free, unit-tested).
 // Validated interactive reply IDs are the only application inputs; display labels are never trusted.
 import type { ConversationState } from '@/lib/statuses'
+// review-edit.ts is relative + import-only-types at its leaf, so it transpiles to
+// pure JS with the conversation layer and the REAL reply parser is unit-tested here.
+import { parseReviewEditCommand, type ReviewEditCommand } from './review-edit'
 
 // States mirror the CONVERSATION_STATES enum (lib/statuses.ts) and the DB CHECK
 // constraint in 20261011000000_phase1_status_lifecycle.sql. Re-exported for callers.
@@ -28,6 +31,10 @@ export const REPLY_IDS = {
   // WhatsApp-native review approval. The invoice id is embedded in the row id
   // and validated below; the display label is never the authorization.
   REVIEW_CONFIRM_PREFIX: 'billora:review:confirm:',
+  // WhatsApp-native editable review: tapping "Edit" enters the numbered
+  // field-correction sub-state for THAT invoice. Same validated-uuid rule as the
+  // confirm id; the display label never authorizes the edit.
+  REVIEW_EDIT_PREFIX: 'billora:review:edit:',
 } as const
 
 export const COMMANDS = {
@@ -42,6 +49,8 @@ export interface SessionSnapshot {
   clientId: string | null
   batchId: string | null
   pendingClientId: string | null
+  /** The invoice currently being corrected in the in-chat editor (edit sub-state only). */
+  reviewEditInvoiceId: string | null
   lastProviderMessageId: string | null
   expired: boolean
 }
@@ -66,8 +75,10 @@ export interface TransitionResult {
   workspaceId?: string | null
   clientId?: string | null
   batchId?: string | null
-  /** Present only for `review-confirm`: the invoice the reviewer tapped. */
+  /** Present only for `review-confirm` / `review-edit`: the invoice the reviewer tapped. */
   invoiceId?: string
+  /** Present only while in `awaiting_review_edit`: the parsed editor reply (never applied here). */
+  editCommand?: ReviewEditCommand
   note: string
 }
 
@@ -83,6 +94,21 @@ export function transition(input: TransitionInput): TransitionResult {
   const norm = normalizeText(text)
   if (session.lastProviderMessageId === input.providerMessageId) {
     return { nextState: session.state, outbound: { kind: 'none' }, note: 'duplicate' }
+  }
+  // Inside the in-chat editor, free text is ALWAYS an editor command — including
+  // "cancel" / "help", which here exit editing (not the whole session) and are
+  // therefore intercepted before the global command block. Interactive reply-ids
+  // (menu, edit another invoice, confirm) still route through the branches below.
+  if (session.state === 'awaiting_review_edit' && !replyId) {
+    const cmd = parseReviewEditCommand(text)
+    const nextState: ConversationState = cmd.action === 'cancel' ? 'collecting' : 'awaiting_review_edit'
+    return {
+      nextState,
+      outbound: { kind: 'none' },
+      note: `review-edit-${cmd.action}`,
+      invoiceId: session.reviewEditInvoiceId ?? undefined,
+      editCommand: cmd,
+    }
   }
   if (!replyId) {
     if (norm === COMMANDS.CANCEL) {
@@ -135,6 +161,16 @@ export function transition(input: TransitionInput): TransitionResult {
       return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-confirm', invoiceId }
     }
     return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-confirm-invalid' }
+  }
+  // A tapped "Edit" row: enter the numbered field-correction sub-state for that
+  // invoice. The validated invoice id is carried so the route renders its editor
+  // and persists the edit target; a malformed/stale id degrades to a re-prompt.
+  if (replyId && replyId.startsWith(REPLY_IDS.REVIEW_EDIT_PREFIX)) {
+    const invoiceId = replyId.slice(REPLY_IDS.REVIEW_EDIT_PREFIX.length)
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(invoiceId)) {
+      return { nextState: 'awaiting_review_edit', outbound: { kind: 'none' }, note: 'review-edit', invoiceId }
+    }
+    return { nextState: session.state, outbound: { kind: 'none' }, note: 'review-edit-invalid' }
   }
   switch (session.state) {
     case 'new':

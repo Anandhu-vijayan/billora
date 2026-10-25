@@ -12,7 +12,8 @@ import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
 import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState } from '@/lib/whatsapp/sessions';
-import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, type SendOutcome } from '@/lib/whatsapp/send';
+import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, sendReviewEditList, type SendOutcome } from '@/lib/whatsapp/send';
+import { composeReviewEditorMessage, REVIEW_EDIT_HELP } from '@/lib/whatsapp/review-edit';
 import {
   ensureIndividualWorkspace, ensureOrganizationWorkspace,
   listClients, createClient, verifyClientInWorkspace,
@@ -26,7 +27,7 @@ import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
   composeConfirmResultMessage, type ConfirmOutcome,
 } from '@/lib/whatsapp/finalize';
-import { listPendingReview, confirmInvoice } from '@/lib/whatsapp/review-confirm';
+import { listPendingReview, confirmInvoice, listEditableInvoices, loadInvoiceForEdit, applyInvoiceEdit } from '@/lib/whatsapp/review-confirm';
 import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
 
 export async function GET(req: Request) {
@@ -47,6 +48,21 @@ export async function GET(req: Request) {
 }
 
 type Db = SupabaseClient;
+
+/**
+ * Humanize a single editor field's validation failure (from the shared
+ * parseReviewCorrections) so the reviewer learns exactly WHICH field and WHY it
+ * was rejected — never a silent no-op. The codes mirror lib/invoices/review.ts.
+ */
+function describeFieldErrors(label: string, errors: Array<{ field: string; code: string }>): string {
+  const reason = (code: string): string =>
+    code === 'TOO_LONG' ? 'is too long'
+      : code === 'INVALID_AMOUNT' ? 'is not a readable amount'
+        : code === 'NEGATIVE_NOT_ALLOWED' ? 'cannot be negative'
+          : code === 'INVALID_TYPE' ? 'was not a valid value'
+            : 'was not accepted';
+  return `I could not save that change — ${label} ${reason(errors[0]?.code ?? '')}.`;
+}
 
 interface IncomingMedia { id?: string; mime_type?: string; caption?: string; filename?: string }
 interface InteractiveReply { id?: string; title?: string }
@@ -82,6 +98,13 @@ async function handleOnboardingSideEffects(
   let assignedNow = 0;
   // Result of a WhatsApp-native review confirmation, delivered as the reply.
   let confirmOutcome: ConfirmOutcome | null = null;
+  // The invoice currently open in the in-chat editor. Persisted (survives a
+  // restart / webhook retry) and cleared when the editor sub-state is exited.
+  let editInvoiceId: string | null = snapshot.reviewEditInvoiceId ?? null;
+  // The single text reply for an editor turn (open / correct / approve / help).
+  // Computed during side effects (which run BEFORE persist+send) so a DB write is
+  // never reordered ahead of its persistence guard.
+  let editReplyBody: string | null = null;
 
   // ---- provisioning + pending resolution (may rewrite nextState) ----
   if (result.note === 'individual-selected') {
@@ -139,6 +162,79 @@ async function handleOnboardingSideEffects(
         confirmOutcome = { ok: false, error: 'FAULT' };
       }
     }
+  } else if (result.note.startsWith('review-edit')) {
+    // The in-chat field editor. Every action here is scoped to the sender's own
+    // workspace and the ONE invoice the editor is open on. The cardinal rule (§7):
+    // a field CORRECTION persists + re-validates but NEVER approves or batches —
+    // only an explicit APPROVE (the shared confirm path) can file an invoice.
+    if (result.note === 'review-edit-invalid') {
+      editReplyBody = 'That edit request is no longer valid — send Review to see the current list.';
+    } else if (!workspaceId || !result.invoiceId) {
+      editInvoiceId = null;
+      editReplyBody = "You're not set up yet — send Hi to begin, then Review to correct an invoice.";
+    } else {
+      const cmd = result.editCommand;
+      const invoiceId = result.invoiceId;
+      if (result.note === 'review-edit') {
+        // ENTER the editor (tapped an Edit row): read-only, shows the stored row.
+        editInvoiceId = invoiceId;
+        const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
+        if (load.ok) editReplyBody = composeReviewEditorMessage(load.row);
+        else if (load.error === 'NOT_PENDING') editReplyBody = 'That invoice is no longer pending review — send Review to see the current list.';
+        else if (load.error === 'NOT_FOUND') editReplyBody = 'That invoice was not found — send Review to see the current list.';
+        else editReplyBody = 'I could not open that invoice right now — please try again in a moment.';
+      } else if (cmd && cmd.action === 'correct') {
+        const outcome = await applyInvoiceEdit(db, { workspaceId, invoiceId, fieldKey: cmd.field.key, rawValue: cmd.value });
+        if (outcome.ok && outcome.row) {
+          const note = outcome.approvable
+            ? 'Saved. Everything checks out now — reply APPROVE to file it for the register.'
+            : 'Saved. It is still flagged because something does not add up — correct another field, or reply APPROVE only if you are sure.';
+          editReplyBody = composeReviewEditorMessage(outcome.row, { note });
+        } else if (outcome.fieldErrors && outcome.fieldErrors.length > 0) {
+          // Never silently drop a malformed value: name the field + why.
+          editReplyBody = `${describeFieldErrors(cmd.field.label, outcome.fieldErrors)}\n\n${REVIEW_EDIT_HELP}`;
+        } else if (outcome.error === 'NOT_PENDING') {
+          editInvoiceId = null; result.nextState = 'collecting';
+          editReplyBody = 'That invoice is no longer pending review — send Review to see the current list.';
+        } else {
+          editReplyBody = 'I could not save that change right now — please try again in a moment.';
+        }
+      } else if (cmd && cmd.action === 'approve') {
+        // The ONLY editor action that may file + batch, via the shared confirm
+        // path. confirmInvoice echoes the stored number, so a genuine approval is
+        // honored but a still-incomplete row is NOT blind-approved (stays flagged).
+        let outcome: ConfirmOutcome;
+        try {
+          outcome = await confirmInvoice(db, { workspaceId, invoiceId });
+        } catch (e) {
+          logger.warn('[WhatsApp] review edit approve failed', { sender: label, error: e instanceof Error ? e.message : String(e) });
+          outcome = { ok: false, error: 'FAULT' };
+        }
+        editReplyBody = composeConfirmResultMessage(outcome);
+        if (outcome.ok && outcome.review === 'approved') {
+          editInvoiceId = null; result.nextState = 'collecting';
+        } else {
+          // Not approvable yet: stay in the editor and re-show it truthfully.
+          const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
+          if (load.ok) {
+            editReplyBody += '\n\n' + composeReviewEditorMessage(load.row, { header: 'Still needs a fix before it can be approved:', note: 'Correct a field above, or reply CANCEL to leave it flagged.' });
+          } else {
+            editInvoiceId = null; result.nextState = 'collecting';
+          }
+        }
+      } else if (cmd && cmd.action === 'cancel') {
+        // conversation.ts already moved nextState to 'collecting'; just drop the target.
+        editInvoiceId = null;
+        editReplyBody = 'Left that invoice flagged — nothing was changed. Send Review anytime to edit or approve it.';
+      } else if (cmd && cmd.action === 'help') {
+        editReplyBody = REVIEW_EDIT_HELP;
+      } else {
+        // unknown-field / reprompt: never guess which field a stray number meant.
+        editReplyBody = cmd && cmd.action === 'unknown-field' && cmd.fieldNo != null
+          ? `There is no field ${cmd.fieldNo} on this invoice. ${REVIEW_EDIT_HELP}`
+          : REVIEW_EDIT_HELP;
+      }
+    }
   }
 
   // "Remember context, never guess a client": when a client just became
@@ -160,6 +256,7 @@ async function handleOnboardingSideEffects(
     client_id: result.clientId ?? clientId,
     batch_id: result.batchId ?? snapshot.batchId,
     pending_client_id: pendingClientId,
+    review_edit_invoice_id: editInvoiceId,
     last_provider_message_id: providerMessageId,
     expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   });
@@ -319,11 +416,33 @@ async function handleOnboardingSideEffects(
             sender: label, error: e instanceof Error ? e.message : String(e),
           });
         }
+        // Then offer the EDIT picker over ALL needs_review invoices (including
+        // unbatched ones whose only problem is a missing date/number, which the
+        // confirm list deliberately omits). Best-effort: a read/send failure leaves
+        // the text guidance above as the reply — never a broken interactive send.
+        try {
+          const editable = await listEditableInvoices(db, workspaceId);
+          if (editable.length > 0) {
+            const outcome = await sendReviewEditList(to, editable);
+            if (outcome !== 'ok') {
+              logger.warn('[WhatsApp] review edit list send failed', { sender: label, outcome });
+            }
+            track(outcome);
+          }
+        } catch (e) {
+          logger.warn('[WhatsApp] review edit list unavailable', {
+            sender: label, error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
     } else if (result.note === 'review-confirm') {
       await deliverText(composeConfirmResultMessage(confirmOutcome ?? { ok: false, error: 'FAULT' }));
     } else if (result.note === 'review-confirm-invalid') {
       await deliverText('That confirmation is no longer valid — send Review to see the current list.');
+    } else if (result.note.startsWith('review-edit')) {
+      // One text reply for the whole editor turn (open / correct / approve /
+      // cancel / help). Already computed during side effects, BEFORE persist.
+      await deliverText(editReplyBody ?? REVIEW_EDIT_HELP);
     } else if (result.outbound.kind === 'menu_list') {
       await deliverMenu(result.outbound.workspace);
     } else if (result.outbound.kind === 'text') {
@@ -588,6 +707,7 @@ async function processMessage(
       : { senderHmac: hmac, state: stored.state as ConversationState,
           workspaceId: stored.workspace_id, clientId: stored.client_id,
           batchId: stored.batch_id, pendingClientId: stored.pending_client_id ?? null,
+          reviewEditInvoiceId: stored.review_edit_invoice_id ?? null,
           lastProviderMessageId: stored.last_provider_message_id,
           expired: false };
     // Session row lost its linkage but the identity is onboarded: backfill so

@@ -51,6 +51,10 @@ export interface DbSession {
   client_id: string | null
   batch_id: string | null
   pending_client_id: string | null
+  // The invoice the reviewer is currently correcting in the in-chat editor.
+  // Set when they tap "Edit"; cleared when the edit sub-state is exited. Like
+  // pending_client_id, this persisted target survives a restart / webhook retry.
+  review_edit_invoice_id: string | null
   last_provider_message_id: string | null
   // Stage 2 — outbound delivery decoupled from inbound idempotency. A failed
   // (transient) reply is remembered here and best-effort resent on the sender's
@@ -119,6 +123,18 @@ export async function loadAccountType(db: SupabaseClient, senderHmac: string): P
   return (data?.account_type as string | undefined) ?? null
 }
 
+/**
+ * True when PostgREST rejected an update because the additive review-edit column
+ * is not in its schema cache yet — i.e. migration 20261025000000_review_edit has
+ * been written but not applied. Detected narrowly (this column + a schema-cache /
+ * PGRST204 signal) so a genuine error is never swallowed.
+ */
+function isMissingReviewEditColumn(error: { code?: string; message?: string }): boolean {
+  const m = error.message ?? ''
+  const schemaCacheMiss = error.code === 'PGRST204' || /schema cache/i.test(m)
+  return schemaCacheMiss && /review_edit_invoice_id/.test(m)
+}
+
 /** Conditional persist: only advances if no newer message already moved the row. */
 export async function saveSession(
   db: SupabaseClient,
@@ -130,13 +146,39 @@ export async function saveSession(
     client_id?: string | null
     batch_id?: string | null
     pending_client_id?: string | null
+    review_edit_invoice_id?: string | null
     last_provider_message_id: string
     expires_at?: string | null
   },
 ): Promise<boolean> {
-  let query = db.from('whatsapp_sessions').update({ ...patch, updated_at: new Date().toISOString() }).eq('sender_hmac', senderHmac)
-  query = expectedLastId ? query.eq('last_provider_message_id', expectedLastId) : query.is('last_provider_message_id', null)
-  const { data, error } = await query.select('sender_hmac')
+  const { review_edit_invoice_id, ...base } = patch
+  const runUpdate = (body: Record<string, unknown>) => {
+    let query = db
+      .from('whatsapp_sessions')
+      .update({ ...body, updated_at: new Date().toISOString() })
+      .eq('sender_hmac', senderHmac)
+    query = expectedLastId
+      ? query.eq('last_provider_message_id', expectedLastId)
+      : query.is('last_provider_message_id', null)
+    return query.select('sender_hmac')
+  }
+  // Reference the editor column ONLY when there is an actual pointer to store. An
+  // ordinary (non-editor) turn carries null, so it never touches the possibly
+  // not-yet-migrated column and cannot fail on a schema the migration has not
+  // reached — this keeps greet/done/menu/collecting persistence alive pre-migration.
+  const wantsEditColumn = review_edit_invoice_id !== undefined && review_edit_invoice_id !== null
+  let { data, error } = await runUpdate(wantsEditColumn ? { ...base, review_edit_invoice_id } : base)
+  if (error && wantsEditColumn && isMissingReviewEditColumn(error)) {
+    // The additive migration is pending: persist the session WITHOUT the editor
+    // pointer rather than 503-looping the whole conversation. The in-chat editor
+    // cannot remember its target across turns until the migration is applied, but
+    // every other flow — and the state machine itself — keeps working.
+    logger.warn('[WhatsApp] review_edit_invoice_id absent from schema; saved session without editor pointer (apply migration 20261025000000_review_edit)', {
+      kind: classifyDbError(error.code, error.message),
+      ...safeDbFields(error),
+    })
+    ;({ data, error } = await runUpdate(base))
+  }
   if (error) {
     logger.error('[WhatsApp] session save failed', {
       kind: classifyDbError(error.code, error.message),
@@ -188,6 +230,7 @@ export function expiredSnapshot(s: DbSession, senderHmac: string) {
     clientId: s.client_id,
     batchId: s.batch_id,
     pendingClientId: s.pending_client_id ?? null,
+    reviewEditInvoiceId: s.review_edit_invoice_id ?? null,
     lastProviderMessageId: s.last_provider_message_id,
     expired: true,
   }

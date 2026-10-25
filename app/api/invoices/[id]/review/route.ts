@@ -17,9 +17,7 @@ import { NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/server'
 import { getAuthenticatedUserId } from '@/lib/supabase/server-session'
 import { resolveFileKeyConfig, isEncryptionConfigFailure } from '@/lib/encryption/files'
-import { applyInvoiceReview } from '@/lib/invoices/review'
-import type { LedgerCandidate } from '@/lib/ocr/ledger'
-import { moneyToMinorUnits, minorUnitsToNumber } from '@/lib/ocr/validators/money'
+import { applyInvoiceReview, parseReviewCorrections } from '@/lib/invoices/review'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -30,68 +28,12 @@ function deny(status: number, code: string): NextResponse {
   return NextResponse.json({ ok: false, error: { code } }, { status, headers: { 'Cache-Control': 'no-store' } })
 }
 
-/**
- * Parse a reviewer-supplied amount with the SAME decimal-safe, Indian-grouping
- * and currency-symbol-aware engine the extractor uses (moneyToMinorUnits). A
- * bare `Number('1,23,456.78')` is NaN and would silently discard a legitimate
- * correction, so formatted strings like "₹1,23,456.78" or "1,18,200/-" must
- * parse here too. Returns null for empty/invalid/non-finite input — never zero.
- */
-function parseMoney(v: unknown): number | null {
-  if (typeof v !== 'number' && typeof v !== 'string') return null
-  const minor = moneyToMinorUnits(v)
-  return minor === null ? null : minorUnitsToNumber(minor)
-}
-
-/** Upper bounds for reviewer-supplied text; over-length is a field error, not a silent truncate. */
-const MAX_LEN: Record<string, number> = {
-  invoice_date: 40, invoice_number: 64, vendor_name: 200, supplier_gstin: 15,
-}
-
-interface FieldError { field: string; code: string }
-
-/**
- * Validate a reviewer's submitted corrections.
- *   * Absent or blank (empty/whitespace) fields mean "no change" — the UI does
- *     NOT have to resubmit already-correct values, and blanks never wipe a field.
- *   * A field that IS present but malformed (wrong type, over length, an amount
- *     the money engine cannot parse, or a negative required amount) is returned
- *     as a field-specific error instead of being silently discarded — never
- *     coerced to zero and never lost without an actionable signal (§7.2 / §5).
- * Date VALUE correctness is intentionally NOT re-implemented here; the shared
- * date service in evaluateLedger re-scores it and keeps the row in review with a
- * reason code if it is unresolved (§4 single source of truth).
- */
-function parseCorrections(body: unknown): { corrections: LedgerCandidate; errors: FieldError[] } {
-  const src = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
-  const corrections: LedgerCandidate = {}
-  const errors: FieldError[] = []
-  const present = (v: unknown) => v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')
-
-  const strFields = ['invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin'] as const
-  for (const f of strFields) {
-    const v = src[f]
-    if (!present(v)) continue
-    if (typeof v !== 'string') { errors.push({ field: f, code: 'INVALID_TYPE' }); continue }
-    const t = v.trim()
-    if (t.length > MAX_LEN[f]) { errors.push({ field: f, code: 'TOO_LONG' }); continue }
-    corrections[f] = t
-  }
-
-  // Required amounts must be non-negative; optional reconciliation components
-  // (round_off, netting discount/deduction) may legitimately be negative.
-  const readAmount = (f: string, v: unknown, allowNegative: boolean) => {
-    if (!present(v)) return
-    const n = parseMoney(v)
-    if (n === null) { errors.push({ field: f, code: 'INVALID_AMOUNT' }); return }
-    if (!allowNegative && n < 0) { errors.push({ field: f, code: 'NEGATIVE_NOT_ALLOWED' }); return }
-    ;(corrections as Record<string, unknown>)[f] = n
-  }
-  for (const f of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) readAmount(f, src[f], false)
-  for (const f of ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const) readAmount(f, src[f], true)
-
-  return { corrections, errors }
-}
+// Field validation lives in the shared `parseReviewCorrections` (lib/invoices/review)
+// so a correction can never be accepted here and rejected in the WhatsApp numbered
+// editor (or vice-versa). Absent/blank fields mean "no change" and never wipe a
+// value; a present-but-malformed field is returned as a field-specific error rather
+// than silently coerced to zero or dropped (§7.2 / §5). Date VALUE correctness is
+// re-scored by the shared evaluateLedger, not re-implemented per channel (§4).
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
   const { id } = await ctx.params
@@ -135,7 +77,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return deny(400, 'INVALID_BODY')
   }
 
-  const { corrections, errors } = parseCorrections(body)
+  const { corrections, errors } = parseReviewCorrections(body)
   if (errors.length > 0) {
     // Never silently drop a malformed correction: tell the caller exactly which
     // fields were rejected and why, so the UI can surface field-level feedback.

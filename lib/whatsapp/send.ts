@@ -246,3 +246,37 @@ export function sendReviewList(
     },
   })
 }
+
+/**
+ * Editable-review picker: one row per needs_review invoice the reviewer may open
+ * to CORRECT fields in-chat. Row ids are `billora:review:edit:<invoiceId>` (the
+ * conversation layer validates that prefix + uuid); the display title is never the
+ * authorization. Unlike the confirm list this makes NO approval promise — tapping a
+ * row only opens the numbered editor for that one invoice, so nothing is approved
+ * or filed until a later explicit APPROVE (§7: an edit is not an approval).
+ */
+export function sendReviewEditList(
+  to: string,
+  invoices: Array<{ invoiceId: string; invoiceNumber: string; vendorName: string | null; total: string | null }>,
+): Promise<SendOutcome> {
+  const rows = invoices.slice(0, 10).map((inv) => {
+    // Same Meta caps as sendReviewList: title <=24, description <=72, or the
+    // whole list is rejected (error 100).
+    const title = `#${inv.invoiceNumber.slice(0, 14)}${inv.total ? ` \u20b9${inv.total}` : ''}`.slice(0, 24)
+    const description = `${(inv.vendorName || 'Invoice').slice(0, 40)}${inv.total ? ` \u00b7 \u20b9${inv.total}` : ''} \u00b7 tap to edit`.slice(0, 72)
+    return { id: `billora:review:edit:${inv.invoiceId}`, title, description }
+  })
+  return postMessage({
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: 'Edit a flagged invoice' },
+      body: {
+        text: 'Tap an invoice to correct its fields (number, GSTIN, date, supplier, amounts). Saving a correction keeps it flagged until you approve it.',
+      },
+      action: { button: 'Edit', sections: [{ title: 'Needs review', rows }] },
+    },
+  })
+}

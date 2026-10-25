@@ -19,8 +19,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { decryptExtractedPayload } from '@/lib/encryption'
 import { resolveFileKeyConfig } from '@/lib/encryption/files'
-import type { LedgerCandidate } from '@/lib/ocr/ledger'
-import { applyInvoiceReview } from '@/lib/invoices/review'
+import type { LedgerCandidate, LedgerRow } from '@/lib/ocr/ledger'
+import { applyInvoiceReview, applyInvoiceCorrection, parseReviewCorrections } from '@/lib/invoices/review'
 import type { ConfirmOutcome } from '@/lib/whatsapp/finalize'
 
 type Db = SupabaseClient
@@ -154,5 +154,150 @@ export async function confirmInvoice(
     invoiceNumber: typeof row.invoice_number === 'string' ? row.invoice_number : null,
     vendorName: typeof row.vendor_name === 'string' ? row.vendor_name : null,
     batchId: result.batchId,
+  }
+}
+
+// ---- WhatsApp-native editable review (correct a field, then approve) --------
+// These are the data/DB half of the in-chat editor. They perform NO sending and
+// NEVER invent a value or approve on a correction: a correction persists +
+// re-validates through the SAME shared path the web/API uses (applyInvoiceCorrec
+// tion), while only an explicit approve (confirmInvoice) files the invoice.
+
+/** One invoice shown in the edit picker. `invoiceNumber` is a DISPLAY label. */
+export interface EditableInvoiceItem {
+  invoiceId: string
+  invoiceNumber: string
+  vendorName: string | null
+  total: string | null
+}
+
+/**
+ * The needs_review invoices the reviewer may OPEN to correct fields. Unlike
+ * listPendingReview this does NOT require a batch or an extracted invoice number:
+ * an invoice whose only problem is a missing/unparseable DATE (so it was never
+ * batched) or a missing NUMBER is exactly the one that needs editing — leaving it
+ * out would make it unreachable in-chat. Newest first, capped at the WhatsApp
+ * list's 10 rows; an undecryptable row is skipped, never rendered as garbage.
+ */
+export async function listEditableInvoices(
+  db: Db, workspaceId: string,
+): Promise<EditableInvoiceItem[]> {
+  const { masterKeyHex } = resolveFileKeyConfig()
+  const { data: invoices, error } = await db
+    .from('invoices').select('id')
+    .eq('workspace_id', workspaceId).eq('status', 'needs_review')
+    .order('received_at', { ascending: false }).limit(10)
+  if (error) throw new Error(`REVIEW_EDIT_LIST_ERROR: ${error.message}`)
+  const ids = (invoices ?? []).map((r) => (r as { id: string }).id)
+  if (ids.length === 0) return []
+
+  const { data: records, error: recErr } = await db
+    .from('extracted_records').select('invoice_id,encrypted_payload')
+    .eq('workspace_id', workspaceId).eq('review_status', 'needs_review').in('invoice_id', ids)
+  if (recErr) throw new Error(`REVIEW_EDIT_RECORDS_ERROR: ${recErr.message}`)
+
+  const items: EditableInvoiceItem[] = []
+  for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
+    let row: StoredRow
+    try {
+      row = JSON.parse(decryptExtractedPayload(byteaToBuffer(rec.encrypted_payload), masterKeyHex)) as StoredRow
+    } catch {
+      continue // undecryptable: skip it, never surface a garbage row to edit
+    }
+    const number = typeof row.invoice_number === 'string' ? row.invoice_number.trim() : ''
+    const vendor = typeof row.vendor_name === 'string' && row.vendor_name.trim() ? row.vendor_name.trim() : null
+    items.push({
+      invoiceId: rec.invoice_id,
+      // A truthful picker label: fall back to the vendor, then a clear marker, so
+      // an invoice with no extracted number is still selectable (that is often
+      // exactly why it needs editing) — never shown as a blank '#'.
+      invoiceNumber: number || vendor || 'no number',
+      vendorName: vendor,
+      total: typeof row.total_amount === 'number' && Number.isFinite(row.total_amount)
+        ? row.total_amount.toFixed(2) : null,
+    })
+    if (items.length >= 10) break
+  }
+  return items
+}
+
+export type InvoiceEditLoad =
+  | { ok: true; row: LedgerRow }
+  | { ok: false; error: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT' }
+
+/**
+ * Read + decrypt one invoice's stored row so the route can render the numbered
+ * editor. Tenant-scoped; refuses an unknown/other-workspace id and an invoice
+ * that is no longer pending, and never renders a corrupt row (FAULT). Opening the
+ * editor is read-only — it changes nothing and approves nothing.
+ */
+export async function loadInvoiceForEdit(
+  db: Db, args: { workspaceId: string; invoiceId: string },
+): Promise<InvoiceEditLoad> {
+  const { workspaceId, invoiceId } = args
+  const { masterKeyHex } = resolveFileKeyConfig()
+  const { data: inv, error } = await db
+    .from('invoices').select('id,status')
+    .eq('workspace_id', workspaceId).eq('id', invoiceId).maybeSingle()
+  if (error) return { ok: false, error: 'FAULT' }
+  if (!inv) return { ok: false, error: 'NOT_FOUND' }
+  if ((inv as { status: string }).status !== 'needs_review') return { ok: false, error: 'NOT_PENDING' }
+  const { data: rec, error: recErr } = await db
+    .from('extracted_records').select('encrypted_payload')
+    .eq('workspace_id', workspaceId).eq('invoice_id', invoiceId).maybeSingle()
+  if (recErr) return { ok: false, error: 'FAULT' }
+  if (!rec) return { ok: false, error: 'NOT_FOUND' }
+  try {
+    const row = JSON.parse(
+      decryptExtractedPayload(byteaToBuffer((rec as { encrypted_payload: unknown }).encrypted_payload), masterKeyHex),
+    ) as LedgerRow
+    return { ok: true, row }
+  } catch {
+    return { ok: false, error: 'FAULT' }
+  }
+}
+
+export interface InvoiceEditOutcome {
+  ok: boolean
+  /** Field-level validation failures for this single edit (never silently dropped). */
+  fieldErrors?: Array<{ field: string; code: string }>
+  review?: 'approved' | 'needs_review'
+  reasons?: string[]
+  row?: LedgerRow
+  /** True when the corrected row now validates clean + dated: a later APPROVE files it. */
+  approvable?: boolean
+  error?: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT'
+}
+
+/**
+ * Apply ONE editor field correction and re-validate — WITHOUT approving or
+ * batching. The raw typed value goes through the SAME parseReviewCorrections the
+ * web/API uses (so a value accepted in chat can never be rejected in the API or
+ * vice-versa), then applyInvoiceCorrection persists the corrected row + audit and
+ * deterministically re-scores it. A correction NEVER touches the lifecycle status;
+ * only an explicit APPROVE does. Tenant + pending are re-checked before mutating.
+ */
+export async function applyInvoiceEdit(
+  db: Db, args: { workspaceId: string; invoiceId: string; fieldKey: keyof LedgerRow; rawValue: string },
+): Promise<InvoiceEditOutcome> {
+  const { workspaceId, invoiceId, fieldKey, rawValue } = args
+  const { masterKeyHex } = resolveFileKeyConfig()
+  const { data: inv, error } = await db
+    .from('invoices').select('id,status')
+    .eq('workspace_id', workspaceId).eq('id', invoiceId).maybeSingle()
+  if (error) return { ok: false, error: 'FAULT' }
+  if (!inv) return { ok: false, error: 'NOT_FOUND' }
+  if ((inv as { status: string }).status !== 'needs_review') return { ok: false, error: 'NOT_PENDING' }
+
+  const { corrections, errors } = parseReviewCorrections({ [fieldKey]: rawValue })
+  if (errors.length > 0) return { ok: false, fieldErrors: errors }
+
+  try {
+    const res = await applyInvoiceCorrection(db, { workspaceId, invoiceId, corrections, masterKeyHex })
+    return { ok: true, review: res.review, reasons: res.reasons, row: res.row, approvable: res.approvable }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/CORRECTION_INVOICE_NOT_FOUND/.test(msg)) return { ok: false, error: 'NOT_FOUND' }
+    return { ok: false, error: 'FAULT' }
   }
 }

@@ -39,10 +39,13 @@ export const INTAKE_STATUSES = ['received', 'accepted', 'failed'] as const
 export type IntakeStatus = (typeof INTAKE_STATUSES)[number]
 
 // whatsapp_sessions conversation lifecycle (distinct from batch/invoice/job status).
+// 'awaiting_review_edit' is the WhatsApp-native editable-review sub-state: a
+// reviewer tapped "Edit" on one flagged invoice, so the next text reply is a
+// numbered field correction for THAT invoice (target persisted on the session).
 export const CONVERSATION_STATES = [
   'new', 'awaiting_account_type', 'awaiting_org_name', 'awaiting_client_select',
   'awaiting_client_name', 'individual_ready', 'organization_ready',
-  'awaiting_pending_confirm', 'collecting', 'cancelled',
+  'awaiting_pending_confirm', 'awaiting_review_edit', 'collecting', 'cancelled',
 ] as const
 export type ConversationState = (typeof CONVERSATION_STATES)[number]
 

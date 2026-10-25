@@ -78,6 +78,9 @@ const reviewSrc = () => readFileSync(new URL('../lib/invoices/review.ts', import
 const reviewRouteSrc = () => readFileSync(
   new URL('../app/api/invoices/[id]/review/route.ts', import.meta.url), 'utf8')
 const batchSrc = () => readFileSync(new URL('../lib/invoices/batch.ts', import.meta.url), 'utf8')
+const reviewEditSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261025000000_review_edit.sql', import.meta.url), 'utf8')
+const reviewConfirmSrc = () => readFileSync(new URL('../lib/whatsapp/review-confirm.ts', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -115,6 +118,9 @@ const finalize = await importTs('lib/whatsapp/finalize.ts')
 // exercised in-process against a fake query builder, not reimplemented.
 const batch = await importTs('lib/invoices/batch.ts')
 const intakeMod = await importTs('lib/whatsapp/intake.ts')
+// review-edit.ts is alias-free + import-only-types, so the REAL numbered-editor
+// reply parser + composer are exercised in-process, not reimplemented.
+const reviewEdit = await importTs('lib/whatsapp/review-edit.ts')
 const excelGen = await importTs('lib/excel/generator.ts')
 // tally/ledger-mapping.ts has only an erased `import type`, so the REAL
 // never-fabricate ledger resolution is exercised in-process, not reimplemented.
@@ -289,7 +295,13 @@ test('D2 typed status enums match the DB CHECK constraints exactly', () => {
   }
   for (const s of list('INTAKE_STATUSES')) assert.ok(sqlSrc().includes(`'${s}'`), `intake status ${s} missing from SQL`)
   for (const s of list('CONVERSATION_STATES')) {
-    assert.ok(p2SqlSrc().includes(`'${s}'`), `conversation state ${s} missing from phase2 SQL`)
+    // The state set is authoritative in phase2, then widened by later additive
+    // migrations (the review-edit sub-state). Accept a state from EITHER so the
+    // alignment check still proves every machine state exists in some CHECK.
+    assert.ok(
+      p2SqlSrc().includes(`'${s}'`) || reviewEditSqlSrc().includes(`'${s}'`),
+      `conversation state ${s} missing from phase2 / review-edit SQL`,
+    )
   }
   for (const s of list('PENDING_UPLOAD_STATUSES')) {
     assert.ok(p2SqlSrc().includes(`'${s}'`), `pending upload status ${s} missing from SQL`)
@@ -2679,4 +2691,132 @@ test('RL3 route.ts enforces the cap before storing/enqueueing, and env + example
   assert.ok(r.includes('const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();'), 'cap read from validated env')
   assert.match(envSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY: z\.coerce\.number\(\)\.int\(\)\.min\(0\)\.default\(200\)/)
   assert.match(envExampleSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY=200/)
+})
+
+// ---- Phase 3: WhatsApp-native editable review ------------------------------
+
+test('RE1 the numbered editor parses unambiguous "<field> <value>"; never guesses a stray number', () => {
+  const { parseReviewEditCommand, EDITABLE_FIELDS } = reviewEdit
+  assert.equal(EDITABLE_FIELDS.length, 9, 'the canonical editable set is exposed')
+  // A multi-word value is captured whole (supplier names contain spaces/&).
+  const c1 = parseReviewEditCommand('3 Sharma & Sons Traders')
+  assert.equal(c1.action, 'correct'); assert.equal(c1.field.key, 'vendor_name'); assert.equal(c1.value, 'Sharma & Sons Traders')
+  // An amount keeps its Indian grouping — the SHARED validator parses it, not us.
+  const c2 = parseReviewEditCommand('5 1,18,200')
+  assert.equal(c2.action, 'correct'); assert.equal(c2.field.key, 'taxable_value'); assert.equal(c2.value, '1,18,200')
+  // Separator variants are tolerated.
+  assert.equal(parseReviewEditCommand('1: INV-9').value, 'INV-9')
+  // Approve / cancel / help are exact, case-insensitive words.
+  assert.equal(parseReviewEditCommand('APPROVE').action, 'approve')
+  assert.equal(parseReviewEditCommand(' cancel ').action, 'cancel')
+  assert.equal(parseReviewEditCommand('help').action, 'help')
+  // A bare number, an out-of-range number and a non-command are NOT guessed.
+  assert.equal(parseReviewEditCommand('4').action, 'unknown-field')
+  assert.equal(parseReviewEditCommand('99 x').action, 'unknown-field')
+  assert.equal(parseReviewEditCommand('hello there').action, 'reprompt')
+  assert.equal(parseReviewEditCommand('   ').action, 'reprompt')
+})
+
+test('RE2 the editor renders stored values truthfully; unset is "(not set)", never a guess', () => {
+  const { composeReviewEditorMessage } = reviewEdit
+  const body = composeReviewEditorMessage(
+    { invoice_number: 'INV-7', taxable_value: 100.5, total_amount: 0 }, { note: 'N' })
+  assert.ok(body.includes('1. Invoice number: INV-7'))
+  assert.ok(body.includes('5. Taxable value: 100.50'), 'amounts render to 2dp')
+  assert.ok(body.includes('9. Invoice total: 0.00'), 'a genuine zero is shown, not blanked')
+  assert.ok(body.includes('2. Supplier GSTIN: (not set)'), 'a missing field is never fabricated')
+  assert.ok(body.includes('N'), 'the note from the last action is surfaced')
+})
+
+test('RE3 conversation: tapping Edit enters the editor; a correction stays, CANCEL exits editing only', () => {
+  const uuid = '123e4567-e89b-12d3-a456-426614174000'
+  const base = { ...sess('collecting', 'ws'), reviewEditInvoiceId: null }
+  const enter = conv.transition({ session: base, replyId: `billora:review:edit:${uuid}`, text: null, providerMessageId: 'm1' })
+  assert.equal(enter.nextState, 'awaiting_review_edit')
+  assert.equal(enter.note, 'review-edit'); assert.equal(enter.invoiceId, uuid)
+  // A malformed edit id degrades and never enters the editor.
+  const bad = conv.transition({ session: base, replyId: 'billora:review:edit:../../etc', text: null, providerMessageId: 'm2' })
+  assert.equal(bad.nextState, 'collecting'); assert.equal(bad.note, 'review-edit-invalid')
+  const editing = { ...base, state: 'awaiting_review_edit', reviewEditInvoiceId: uuid }
+  const corr = conv.transition({ session: editing, replyId: null, text: '1 INV-000125', providerMessageId: 'm3' })
+  assert.equal(corr.nextState, 'awaiting_review_edit')
+  assert.equal(corr.note, 'review-edit-correct'); assert.equal(corr.invoiceId, uuid)
+  assert.equal(corr.editCommand.action, 'correct'); assert.equal(corr.editCommand.value, 'INV-000125')
+  // cancel exits EDITING back to collecting — NOT the whole session to 'cancelled'.
+  const cancel = conv.transition({ session: editing, replyId: null, text: 'cancel', providerMessageId: 'm4' })
+  assert.equal(cancel.nextState, 'collecting'); assert.equal(cancel.note, 'review-edit-cancel')
+  // approve keeps the editor open: the ROUTE only closes it on a real approval.
+  const approve = conv.transition({ session: editing, replyId: null, text: 'approve', providerMessageId: 'm5' })
+  assert.equal(approve.nextState, 'awaiting_review_edit'); assert.equal(approve.note, 'review-edit-approve')
+})
+
+test('RE4 applyInvoiceCorrection persists + re-scores but NEVER approves/batches (an edit is not an approval)', () => {
+  const s = reviewSrc()
+  const i = s.indexOf('export async function applyInvoiceCorrection')
+  assert.ok(i > 0, 'the correction entrypoint exists')
+  const body = s.slice(i)
+  assert.ok(body.includes("review_status: 'needs_review'"), 'a corrected row is stored needs_review, never approved')
+  assert.ok(!body.includes('resolveInvoiceBatch'), 'a correction never folds the invoice into a batch')
+  assert.ok(!/\.update\(\{ status:/.test(body), 'a correction never touches the invoices lifecycle status')
+  assert.ok(body.includes('buildCorrectionAudit'), 'the original values + correction history are preserved')
+  assert.ok(body.includes('mergeCandidates(args.corrections, existing)'), 'reviewer value is primary; engine fills only genuine gaps')
+  assert.ok(body.includes('evaluateLedger(merged'), 'the corrected row is re-validated deterministically')
+})
+
+test('RE5 one field validator is shared by HTTP + WhatsApp (a correction cannot diverge by channel)', () => {
+  const s = reviewSrc()
+  assert.ok(s.includes('export function parseReviewCorrections'), 'the shared validator lives in review.ts')
+  const r = reviewRouteSrc()
+  assert.ok(r.includes('parseReviewCorrections') && r.includes("from '@/lib/invoices/review'"), 'the HTTP route imports the shared validator')
+  assert.ok(!r.includes('function parseCorrections'), "the route's private duplicate parser is gone")
+  const c = reviewConfirmSrc()
+  assert.ok(c.includes('parseReviewCorrections') && c.includes('applyInvoiceCorrection'), 'the WhatsApp editor runs the SAME validator + persist path')
+})
+
+test('RE6 route.ts wires the editor: opens on tap, corrects without approving, closes only on a real APPROVE', () => {
+  const r = routeSrc()
+  assert.ok(r.includes('loadInvoiceForEdit') && r.includes('composeReviewEditorMessage'), 'tapping Edit loads + renders the stored row')
+  assert.ok(r.includes('applyInvoiceEdit(db, {'), 'a typed correction routes through the shared persist path')
+  assert.ok(r.includes("startsWith('review-edit')"), 'every editor note has a reply branch')
+  assert.ok(r.includes('review_edit_invoice_id: editInvoiceId'), 'the edit target is persisted across turns')
+  assert.ok(r.includes('sendReviewEditList(to, editable)'), 'Review offers the editable picker over ALL flagged invoices')
+  assert.ok(/result\.nextState = 'collecting'/.test(r) && r.includes("outcome.review === 'approved'"), 'the editor closes only after a genuine approval')
+})
+
+test('RE7 the edit picker uses validated billora:review:edit ids and Meta row caps', () => {
+  const s = sendSrc()
+  assert.ok(s.includes('export function sendReviewEditList'), 'the outbound sender exists')
+  assert.ok(s.includes('billora:review:edit:'), 'rows carry the edit namespace the conversation layer validates')
+  assert.ok(s.includes('slice(0, 10)'), 'capped to the WhatsApp list row limit')
+  assert.ok(s.includes('slice(0, 24)'), "title capped to Meta's 24-char limit")
+})
+
+test('RE8 review-edit migration widens the state CHECK and adds the persisted edit target', () => {
+  const sql = reviewEditSqlSrc()
+  assert.ok(/add column if not exists review_edit_invoice_id uuid/.test(sql), 'the edit target column is additive + idempotent')
+  assert.ok(sql.includes('references public.invoices(id) on delete set null'), 'a deleted invoice detaches the pointer, never orphans the session')
+  assert.ok(sql.includes("'awaiting_review_edit'"), 'the editor sub-state is admitted by the CHECK')
+  assert.ok(/drop constraint if exists whatsapp_sessions_state_check/.test(sql), 'the swap is guarded + rerunnable')
+})
+
+test('RE9 CONVERSATION_STATES declares the editor sub-state the machine + migration both use', () => {
+  assert.ok(statuses.CONVERSATION_STATES.includes('awaiting_review_edit'))
+  assert.ok(statusesSrc().includes("'awaiting_review_edit'"))
+})
+
+test('RE10 saveSession never 503-loops the whole pipeline when the edit column is not migrated yet', () => {
+  const s = sessionsSrc()
+  // The regression this guards: passing review_edit_invoice_id on EVERY turn made
+  // PostgREST reference a not-yet-created column, so greet/done/menu saves threw
+  // PGRST204 and Meta redelivered forever. The column must be touched ONLY when a
+  // real editor pointer exists, with a graceful fallback when it is absent.
+  assert.ok(/const wantsEditColumn = review_edit_invoice_id !== undefined && review_edit_invoice_id !== null/.test(s),
+    'an ordinary (null-pointer) turn must NOT reference the editor column')
+  assert.ok(/function isMissingReviewEditColumn/.test(s) && /PGRST204/.test(s) && /review_edit_invoice_id/.test(s),
+    'the schema-cache miss is detected narrowly for THIS column, not blanket-swallowed')
+  assert.ok(s.includes('runUpdate(base)'), 'on a pending migration the session is re-saved WITHOUT the editor pointer')
+  assert.ok(/logger\.warn\([^)]*apply migration 20261025000000_review_edit/.test(s),
+    'the degraded path names the migration the operator must apply')
+  // A genuine failure is still surfaced: the throw is retained after the fallback.
+  assert.ok(/throw new Error\(`SESSION_SAVE_ERROR: /.test(s), 'a real save failure still throws (never silent)')
 })
