@@ -187,6 +187,8 @@ export function sendMenu(to: string, opts: { workspace: boolean }): Promise<Send
         { id: 'billora:menu:status', title: 'Status & how to send' },
         { id: 'billora:menu:change_client', title: 'Change client' },
         { id: 'billora:menu:add_client', title: 'Add client' },
+        { id: 'billora:menu:set_gstin', title: 'My own GSTIN' },
+        { id: 'billora:menu:proactive', title: 'Proactive delivery' },
         { id: 'billora:menu:review', title: 'Review held / flagged' },
         { id: 'billora:menu:done', title: 'Done with this batch' },
         { id: 'billora:menu:help', title: 'Help' },
@@ -216,67 +218,64 @@ export function sendMenu(to: string, opts: { workspace: boolean }): Promise<Send
 /**
  * Review confirmation list: one row per batchable needs_review invoice, labeled
  * with the EXACT extracted invoice number / vendor / total the reviewer must
- * affirm. Row ids are `billora:review:confirm:<invoiceId>` (validated by the
- * conversation layer); the display title is never the authorization. Tapping a
- * row confirms the values shown on it — it is not a blind "approve" button.
+ * affirm. §user #2: tapping a row now OPENS the combined editor for that invoice
+ * (id `billora:review:edit:<invoiceId>`) so the reviewer sees every field, can
+ * correct any of them, and approve — all in ONE place, instead of a separate
+ * confirm list and a separate edit list. Row ids are validated by the conversation
+ * layer; the display title is never the authorization. The editor's approve step
+ * runs the shared confirm path, so opening it never files anything by itself.
+ *
+ * Each row's DESCRIPTION carries the invoice's accounting MONTH (so a long list
+ * never files an invoice into the wrong period unseen), and the list gains an
+ * "Approve all" control row (re-runs the SAME per-invoice confirm path for every
+ * complete pending row — never a bypass) and a "Next" row so a reviewer can page
+ * past Meta's 10-row cap. The caller sizes the page so the total (items +
+ * controls) never exceeds 10; we hard-slice to 10 defensively.
  */
 export function sendReviewList(
   to: string,
-  invoices: Array<{ invoiceId: string; invoiceNumber: string; vendorName: string | null; total: string | null }>,
+  invoices: Array<{ invoiceId: string; invoiceNumber: string; vendorName: string | null; total: string | null; why?: string; month?: string | null }>,
+  opts?: { approveAllCount?: number; page?: number; nextCount?: number },
 ): Promise<SendOutcome> {
-  const rows = invoices.slice(0, 10).map((inv) => {
+  type Row = { id: string; title: string; description: string }
+  const itemRows: Row[] = invoices.slice(0, 10).map((inv) => {
     // Cloud API caps a list row TITLE at 24 chars; the longer detail goes in the
     // optional DESCRIPTION (max 72). Exceeding the title limit makes Meta reject
-    // the entire list (error 100), so keep the title to the number + total.
+    // the entire list (error 100), so keep the title to the number + total and fit
+    // the plain-English "why" (§P0-3) + accounting month (§P1-7) inside 72 chars.
     const title = `#${inv.invoiceNumber.slice(0, 14)}${inv.total ? ` \u20b9${inv.total}` : ''}`.slice(0, 24)
-    const description = `${(inv.vendorName || 'Invoice').slice(0, 40)}${inv.total ? ` \u00b7 \u20b9${inv.total}` : ''} \u00b7 tap to confirm`.slice(0, 72)
-    return { id: `billora:review:confirm:${inv.invoiceId}`, title, description }
-  })
-  return postMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      header: { type: 'text', text: 'Confirm for review' },
-      body: {
-        text: 'Tap an invoice to confirm its number and approve it for the register. It is filed only under the month on its own invoice date.',
-      },
-      action: { button: 'Confirm', sections: [{ title: 'Needs review', rows }] },
-    },
-  })
-}
-
-/**
- * Editable-review picker: one row per needs_review invoice the reviewer may open
- * to CORRECT fields in-chat. Row ids are `billora:review:edit:<invoiceId>` (the
- * conversation layer validates that prefix + uuid); the display title is never the
- * authorization. Unlike the confirm list this makes NO approval promise — tapping a
- * row only opens the numbered editor for that one invoice, so nothing is approved
- * or filed until a later explicit APPROVE (§7: an edit is not an approval).
- */
-export function sendReviewEditList(
-  to: string,
-  invoices: Array<{ invoiceId: string; invoiceNumber: string; vendorName: string | null; total: string | null }>,
-): Promise<SendOutcome> {
-  const rows = invoices.slice(0, 10).map((inv) => {
-    // Same Meta caps as sendReviewList: title <=24, description <=72, or the
-    // whole list is rejected (error 100).
-    const title = `#${inv.invoiceNumber.slice(0, 14)}${inv.total ? ` \u20b9${inv.total}` : ''}`.slice(0, 24)
-    const description = `${(inv.vendorName || 'Invoice').slice(0, 40)}${inv.total ? ` \u00b7 \u20b9${inv.total}` : ''} \u00b7 tap to edit`.slice(0, 72)
+    const why = (inv.why || inv.vendorName || 'Invoice').slice(0, 40)
+    const monthPart = inv.month ? ` \u00b7 ${inv.month}` : ''
+    const description = `${why}${monthPart} \u00b7 tap to review & edit`.slice(0, 72)
     return { id: `billora:review:edit:${inv.invoiceId}`, title, description }
   })
+  const rows: Row[] = []
+  const approveAllCount = opts?.approveAllCount ?? 0
+  if (approveAllCount > 0 && itemRows.length > 0) {
+    rows.push({
+      id: 'billora:review:approve-all', title: 'Approve all',
+      description: `Confirm every complete invoice below (${approveAllCount} pending)`.slice(0, 72),
+    })
+  }
+  rows.push(...itemRows)
+  const nextCount = opts?.nextCount ?? 0
+  if (nextCount > 0) {
+    rows.push({
+      id: `billora:review:page:${(opts?.page ?? 1) + 1}`, title: `Next ${nextCount}`.slice(0, 24),
+      description: 'Show the remaining flagged invoices'.slice(0, 72),
+    })
+  }
   return postMessage({
     messaging_product: 'whatsapp',
     to,
     type: 'interactive',
     interactive: {
       type: 'list',
-      header: { type: 'text', text: 'Edit a flagged invoice' },
+      header: { type: 'text', text: 'Review & edit' },
       body: {
-        text: 'Tap an invoice to correct its fields (number, GSTIN, date, supplier, amounts). Saving a correction keeps it flagged until you approve it.',
+        text: 'Tap an invoice to open it in one place: check its fields, fix any (reply <number> <value>), then reply APPROVE to file it. It is filed only under the month on its own invoice date. "Approve all" confirms every complete invoice below in one go.',
       },
-      action: { button: 'Edit', sections: [{ title: 'Needs review', rows }] },
+      action: { button: 'Review', sections: [{ title: 'Needs review', rows: rows.slice(0, 10) }] },
     },
   })
 }

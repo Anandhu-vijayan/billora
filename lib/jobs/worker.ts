@@ -13,6 +13,7 @@
 import { randomUUID } from 'crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { logger } from '@/lib/logger'
+import { StageTimer } from '@/lib/jobs/timing'
 import type { JobType } from '@/lib/statuses'
 import type { InvoiceStatus } from '@/lib/statuses'
 import {
@@ -80,6 +81,14 @@ const minJobWindowMs = (): number => {
 
 const tickLimit = (): number => {
   const parsed = Number.parseInt(process.env.JOB_TICK_LIMIT ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 25) : 3
+}
+
+// How many claimed jobs a single tick runs CONCURRENTLY (§P2-10). Bounded to the
+// per-tick limit so it can never fan out wider than the tick is allowed to claim,
+// and hard-capped at 25 so a typo cannot overwhelm Gemini/storage. Default 3.
+const jobConcurrency = (): number => {
+  const parsed = Number.parseInt(process.env.JOB_CONCURRENCY ?? '', 10)
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 25) : 3
 }
 
@@ -164,6 +173,79 @@ function startHeartbeat(db: Db, job: ClaimedJob, worker: string, leaseSeconds: n
 }
 
 /**
+ * Process ONE already-claimed job to its fenced outcome, mutating the shared
+ * tick `result` counters. Extracted so a batch can run several concurrently
+ * (§P2-10). It NEVER rejects: every path (missing handler, lease loss, handler
+ * throw, fenced completion) is recorded and swallowed, so Promise.all over a batch
+ * can't let one bad job take the tick — or its siblings — down. Lease ownership is
+ * still enforced per job: a lost renewal fences ONLY that job, never the batch.
+ */
+async function processClaimedJob(
+  db: Db, job: ClaimedJob, worker: string, leaseSeconds: number, result: TickResult,
+): Promise<void> {
+  const handler = handlers.get(job.job_type)
+  if (!handler) {
+    // Defensive: registeredJobTypes() should prevent this. Requeue without
+    // settling — a later deploy may register the handler.
+    await failJob(db, {
+      jobId: job.id, worker, errorCode: 'HANDLER_NOT_REGISTERED',
+      retryInSeconds: backoffSeconds(job.attempts),
+    }).catch(() => undefined)
+    result.requeued += 1
+    return
+  }
+
+  const heartbeat = startHeartbeat(db, job, worker, leaseSeconds)
+  // §P2-12: time the handler itself so a slow job is attributable without any PII.
+  const jobTiming = new StageTimer()
+  try {
+    await handler({ db, job, worker, leaseSeconds, assertLease: heartbeat.assertOwned })
+    await heartbeat.assertOwned()
+    heartbeat.stop() // stop renewing BEFORE the job settles
+    const owned = await completeJob(db, job.id, worker)
+    jobTiming.mark('handler')
+    logger.info('[Worker] job timing', {
+      jobId: job.id, type: job.job_type, worker,
+      outcome: owned ? 'completed' : 'fenced', ...jobTiming.summary(),
+    })
+    if (owned) result.completed += 1
+    else {
+      result.fenced += 1
+      logger.warn('[Worker] completion fenced after handler', { jobId: job.id, worker })
+    }
+  } catch (e: unknown) {
+    heartbeat.stop() // never renew a lease while (or after) failing the job
+    if (e instanceof JobLeaseLostError) {
+      result.fenced += 1
+      logger.warn('[Worker] handler stopped after lease loss', { jobId: job.id, worker })
+      return
+    }
+    const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+    const code = detail.split(':')[0] || 'JOB_HANDLER_ERROR'
+    const permanent = isPermanentJobFailure(e)
+    const outcome = await failJob(db, {
+      jobId: job.id,
+      worker,
+      errorCode: code,
+      retryInSeconds: permanent ? 0 : backoffSeconds(job.attempts),
+      permanent,
+      // Applied by the RPC only when the job actually settles for good.
+      invoiceStatus: 'failed',
+    })
+    if (outcome === 'requeued') result.requeued += 1
+    else if (outcome === 'failed') result.failed += 1
+    else result.fenced += 1
+    logger.warn('[Worker] job failed', {
+      jobId: job.id, type: job.job_type, attempt: job.attempts,
+      outcome, error: code, detail: detail.slice(0, 200),
+      durationMs: jobTiming.total(),
+    })
+  } finally {
+    heartbeat.stop()
+  }
+}
+
+/**
  * One queue pass: sweep stale leases, claim due work for registered types,
  * run each handler independently. Never throws — a broken handler cannot take
  * the tick (or the other jobs) down with it.
@@ -201,68 +283,23 @@ export async function runWorkerTick(
 
   const deadline = Date.now() + budgetMs()
   const maxJobs = Math.min(Math.max(1, args?.limit ?? tickLimit()), 25)
+  const concurrency = jobConcurrency()
   while (result.claimed < maxJobs) {
     if (Date.now() > deadline || (result.claimed > 0 && Date.now() > deadline - minJobWindowMs())) {
       logger.info('[Worker] tick budget reached before next claim', { worker, claimed: result.claimed })
       break
     }
-    const batch = await claimJobs(db, { worker, jobTypes, limit: 1, leaseSeconds })
-    const job = batch[0]
-    if (!job) break
-    result.claimed += 1
+    // Claim a whole batch (bounded by the tick's remaining budget AND the
+    // concurrency cap) and run it CONCURRENTLY (§P2-10). claimJobs uses FOR UPDATE
+    // SKIP LOCKED, so a concurrent sibling worker never grabs the same rows, and
+    // each job still settles independently through the fenced RPCs — one slow or
+    // failing handler cannot block or corrupt the others in the same batch.
+    const want = Math.min(concurrency, maxJobs - result.claimed)
+    const batch = await claimJobs(db, { worker, jobTypes, limit: want, leaseSeconds })
+    if (batch.length === 0) break
+    result.claimed += batch.length
     result.idle = false
-    const handler = handlers.get(job.job_type)
-    if (!handler) {
-      // Defensive: registeredJobTypes() should prevent this. Requeue without
-      // settling — a later deploy may register the handler.
-      await failJob(db, {
-        jobId: job.id, worker, errorCode: 'HANDLER_NOT_REGISTERED',
-        retryInSeconds: backoffSeconds(job.attempts),
-      }).catch(() => undefined)
-      result.requeued += 1
-      continue
-    }
-
-    const heartbeat = startHeartbeat(db, job, worker, leaseSeconds)
-    try {
-      await handler({ db, job, worker, leaseSeconds, assertLease: heartbeat.assertOwned })
-      await heartbeat.assertOwned()
-      heartbeat.stop() // stop renewing BEFORE the job settles
-      const owned = await completeJob(db, job.id, worker)
-      if (owned) result.completed += 1
-      else {
-        result.fenced += 1
-        logger.warn('[Worker] completion fenced after handler', { jobId: job.id, worker })
-      }
-    } catch (e: unknown) {
-      heartbeat.stop() // never renew a lease while (or after) failing the job
-      if (e instanceof JobLeaseLostError) {
-        result.fenced += 1
-        logger.warn('[Worker] handler stopped after lease loss', { jobId: job.id, worker })
-        continue
-      }
-      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
-      const code = detail.split(':')[0] || 'JOB_HANDLER_ERROR'
-      const permanent = isPermanentJobFailure(e)
-      const outcome = await failJob(db, {
-        jobId: job.id,
-        worker,
-        errorCode: code,
-        retryInSeconds: permanent ? 0 : backoffSeconds(job.attempts),
-        permanent,
-        // Applied by the RPC only when the job actually settles for good.
-        invoiceStatus: 'failed',
-      })
-      if (outcome === 'requeued') result.requeued += 1
-      else if (outcome === 'failed') result.failed += 1
-      else result.fenced += 1
-      logger.warn('[Worker] job failed', {
-        jobId: job.id, type: job.job_type, attempt: job.attempts,
-        outcome, error: code, detail: detail.slice(0, 200),
-      })
-    } finally {
-      heartbeat.stop()
-    }
+    await Promise.all(batch.map((job) => processClaimedJob(db, job, worker, leaseSeconds, result)))
   }
 
   if (result.claimed > 0) {

@@ -106,6 +106,73 @@ function displayValue(row: Partial<LedgerRow>, field: EditableField): string {
 }
 
 /**
+ * Plain-English description of a machine reason code, so the reviewer sees WHY an
+ * invoice was flagged instead of an opaque code (§P0-3). Codes come from
+ * lib/ocr/ledger.ts + lib/invoices/review.ts. A dynamic code (a `low-confidence:`
+ * or `total-mismatch:` suffix, or an unknown future code) degrades to a truthful
+ * generic line rather than a fabricated specific claim — the description never
+ * asserts a cause we did not detect.
+ */
+const REASON_TEXT: Record<string, string> = {
+  'invoice-date-unresolved': 'no readable invoice date',
+  'invoice-date-future': 'the invoice date is in the future',
+  'invoice-date-before-gst': 'the invoice date is before GST existed',
+  'invoice-number-missing': 'no invoice number was found',
+  'invoice-number-placeholder': 'the invoice number looks like a placeholder',
+  'vendor-name-missing': 'no supplier name was found',
+  'vendor-name-placeholder': 'the supplier name looks like a placeholder',
+  'gstin-missing': 'no supplier GSTIN was found',
+  'gstin-invalid': 'the supplier GSTIN is not a valid format',
+  'gstin-state-invalid': 'the supplier GSTIN state code is invalid',
+  'gstin-checksum-failed': 'the supplier GSTIN failed its checksum',
+  'supplier-equals-buyer': 'the supplier GSTIN is actually your own (the buyer)',
+  'supplier-equals-recipient': 'the supplier and buyer GSTINs are the same',
+  'non-finite-amount': 'an amount could not be read as a number',
+  'negative-amount': 'an amount came back negative',
+  'total-zero': 'the total came back as zero',
+  'igst-with-cgst-sgst': 'IGST and CGST/SGST are both present (pick one)',
+  'cgst-sgst-unequal': 'CGST and SGST should be equal for a within-state bill',
+  'igst-on-intrastate': 'IGST was used on a within-state bill',
+  'cgst-sgst-on-interstate': 'CGST/SGST were used on an inter-state bill',
+  'tax-rate-mismatch': 'a printed tax rate and its amount disagree',
+  'tax-rate-amount-missing': 'a tax rate is printed but its amount is missing',
+  'tax-rate-invalid': 'a printed tax rate could not be read',
+  'tax-rate-cgst-sgst-unequal': 'the printed CGST/SGST rates are unequal',
+  'tax-rate-igst-with-cgst-sgst': 'the printed tax-head rates conflict',
+  'amount-words-total-mismatch': 'the amount in words disagrees with the numeric total',
+  'candidate-conflict': 'two readings of the same field disagree',
+  'image-too-blurry': 'the photo looks too blurry to read reliably',
+  'image-too-small': 'the image resolution is too low to read reliably',
+  'multi-invoice-document': 'this file looks like more than one invoice — only one was read, please split the others out',
+  'credit-debit-note': 'this is a credit/debit note (it changes an earlier invoice), so a person must check it before it is used',
+  'review-confirmation-required': 'the invoice number has not been confirmed yet',
+}
+
+/** Turn one reason code into a short plain-English phrase. Never invents a cause. */
+export function describeReason(code: string): string {
+  const base = code.split(':')[0]
+  if (base === 'low-confidence') return 'the reading was low-confidence'
+  if (base === 'total-mismatch') return 'the amounts do not add up to the total'
+  return REASON_TEXT[base] ?? 'it needs a manual check'
+}
+
+/**
+ * A compact, de-duplicated one-line summary of why a row is flagged, safe for a
+ * WhatsApp list description. `maxItems` bounds length so a row stays within the
+ * Meta interactive-row character caps even when many checks failed.
+ */
+export function summarizeReasons(codes: readonly string[], maxItems = 2): string {
+  const unique: string[] = []
+  for (const c of codes) {
+    const t = describeReason(c)
+    if (!unique.includes(t)) unique.push(t)
+  }
+  if (unique.length === 0) return 'needs a manual check'
+  const shown = unique.slice(0, maxItems).join('; ')
+  return unique.length > maxItems ? `${shown}; +${unique.length - maxItems} more` : shown
+}
+
+/**
  * Compose the numbered editor body. Shown ONLY to the invoice's own (verified)
  * reviewer in their private chat, so surfacing the extracted values is the whole
  * point of an editable review — this is a display, not a log. `note` carries the
@@ -114,11 +181,16 @@ function displayValue(row: Partial<LedgerRow>, field: EditableField): string {
  */
 export function composeReviewEditorMessage(
   row: Partial<LedgerRow>,
-  opts?: { header?: string; note?: string },
+  opts?: { header?: string; note?: string; reasons?: readonly string[] },
 ): string {
   const header = opts?.header ?? 'Editing this invoice. Reply with a number and the new value.'
   const lines: string[] = [header]
   if (opts?.note) lines.push(opts.note)
+  // Why this invoice is flagged, in plain English (§P0-3). Shown under the header
+  // so the reviewer knows which field to fix; purely descriptive, changes nothing.
+  if (opts?.reasons && opts.reasons.length > 0) {
+    lines.push(`Why this needs a check: ${summarizeReasons(opts.reasons, 3)}`)
+  }
   lines.push('')
   for (const f of EDITABLE_FIELDS) {
     lines.push(`${f.index}. ${f.label}: ${displayValue(row, f)}`)

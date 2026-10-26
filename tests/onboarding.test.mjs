@@ -81,6 +81,11 @@ const batchSrc = () => readFileSync(new URL('../lib/invoices/batch.ts', import.m
 const reviewEditSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261025000000_review_edit.sql', import.meta.url), 'utf8')
 const reviewConfirmSrc = () => readFileSync(new URL('../lib/whatsapp/review-confirm.ts', import.meta.url), 'utf8')
+const extractHandlerSrc = () => readFileSync(
+  new URL('../lib/jobs/handlers/extract-invoice.ts', import.meta.url), 'utf8')
+const ownGstinSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261026000000_client_own_gstin.sql', import.meta.url), 'utf8')
+const provisionSrc = () => readFileSync(new URL('../lib/whatsapp/provision.ts', import.meta.url), 'utf8')
 
 // Stage-1 envelope crypto is exercised against the REAL module (transpiled),
 // not a copy, so a format drift cannot silently pass here and break Stage-3.
@@ -125,6 +130,19 @@ const excelGen = await importTs('lib/excel/generator.ts')
 // tally/ledger-mapping.ts has only an erased `import type`, so the REAL
 // never-fabricate ledger resolution is exercised in-process, not reimplemented.
 const tallyMap = await importTs('lib/tally/ledger-mapping.ts')
+// own-gstin-tally.ts is alias-free (only ../ocr/gstin), so the REAL >=3-invoice
+// buyer-GSTIN plurality decision is exercised in-process, not copied. The
+// async suggestOwnGstin (touches Supabase + envelope crypto) stays source-contract.
+const ownGstinTally = await importTs('lib/invoices/own-gstin-tally.ts')
+const ownGstinSuggestSrc = () => readFileSync(new URL('../lib/invoices/own-gstin-suggest.ts', import.meta.url), 'utf8')
+// exports/naming.ts is pure + alias-free, so the EXACT per-month filename a client
+// receives (Billora_YYYY-MM.xlsx) is asserted in-process, not reimplemented.
+const naming = await importTs('lib/exports/naming.ts')
+// whatsapp/proactive.ts is pure + env-injected, so the EXACT opt-in gate (feature
+// flag + SEPARATE key + owner consent + 24h window) is exercised in-process.
+const proactive = await importTs('lib/whatsapp/proactive.ts')
+// proactive-store.ts touches envelope crypto + the DB, so it stays source-contract.
+const proactiveStoreSrc = () => readFileSync(new URL('../lib/whatsapp/proactive-store.ts', import.meta.url), 'utf8')
 const MASTER = randomBytes(32).toString('hex')
 const PATHK = randomBytes(32).toString('hex')
 function sess(state, workspaceId = null) {
@@ -411,16 +429,23 @@ test('E5 credential-blocked media never loops Meta retries and surfaces the real
   assert.ok(!src.includes("const code = detail.split(':')[0]"), 'retry path must not truncate the error to its code prefix')
 })
 
-test('E6 a freshly-filed invoice is acknowledged; redelivery stays silent', () => {
+test('E6 a freshly-filed invoice is acknowledged once per burst; redelivery + extra files stay silent', () => {
   const src = routeSrc()
   // Clean filing must confirm receipt (was previously silent, confusing users).
   assert.match(src, /Invoice received and queued for processing/)
-  // Guarded so a Meta webhook redelivery of the same media never double-pings.
-  assert.match(src, /if \(!deduped && !alreadyAcked\)/)
-  const dedupIdx = src.indexOf('if (!deduped && !alreadyAcked)')
+  // §user: a multi-file send arrives as separate near-simultaneous webhooks, so a
+  // plain session read let EVERY worker ack. The ack is now gated by an ATOMIC
+  // claim (sessions.claimUploadAck) so exactly one webhook in the burst sends.
+  assert.match(src, /if \(!deduped\)/)
+  assert.match(src, /claimUploadAck\(db, mHmac, UPLOAD_ACK_COALESCE_MS\)/)
+  assert.match(src, /const wonAck = await claimUploadAck/)
+  const dedupIdx = src.indexOf('if (!deduped)')
+  const claimIdx = src.indexOf('claimUploadAck(db, mHmac', dedupIdx)
   const sendIdx = src.indexOf('Invoice received and queued', dedupIdx)
   const acceptIdx = src.indexOf('accepted for queue')
-  assert.ok(dedupIdx > 0 && sendIdx > dedupIdx, 'acknowledgment must fire inside the !deduped guard')
+  assert.ok(dedupIdx > 0 && claimIdx > dedupIdx && sendIdx > claimIdx, 'acknowledgment must fire only after the atomic claim wins, inside the !deduped guard')
+  // The claim itself persists the ack timestamp (no separate post-send write).
+  assert.ok(!/upload_ack_sent_at: new Date\(\)/.test(src), 'route no longer races a read-modify-write on the ack flag')
   // Rule 5: delivery is best-effort and never rewinds the accepted intake.
   assert.ok(acceptIdx > 0, 'intake still reports accepted for queue')
 })
@@ -519,7 +544,7 @@ test('F6 worker claims nothing it cannot do, keeps leases alive, never fakes suc
   assert.match(queue, /if \(args\.jobTypes\.length === 0\) return \[\]/)
   assert.match(worker, /registerJobHandler/)
   assert.match(worker, /while \(result\.claimed < maxJobs\)/)
-  assert.match(worker, /claimJobs\(db, \{ worker, jobTypes, limit: 1, leaseSeconds \}\)/)
+  assert.match(worker, /claimJobs\(db, \{ worker, jobTypes, limit: want, leaseSeconds \}\)/)
   // Lease is renewed while the handler runs, and released afterwards.
   assert.match(worker, /startHeartbeat\(db, job, worker, leaseSeconds\)/)
   assert.match(worker, /renewLease\(db, job\.id, worker, leaseSeconds\)/)
@@ -711,8 +736,12 @@ test('G4d sendMenu is a Cloud API list with namespaced ids and a no-workspace su
     'billora:menu:review', 'billora:menu:done', 'billora:menu:help', 'billora:menu:cancel']) {
     assert.ok(m.includes(id), `menu row ${id} missing`)
   }
-  // A Cloud API list allows at most 10 rows; the no-workspace case is Help/Cancel only.
-  assert.ok((m.match(/id: 'billora:menu:/g) || []).length <= 10)
+  // A Cloud API list allows at most 10 rows; the no-workspace case is Help/Cancel
+  // only. The two arrays here are MUTUALLY EXCLUSIVE alternative lists (workspace vs
+  // pre-onboarding), so the real cap is on the LARGER (workspace) list, not the sum.
+  const wsBlock = (m.match(/\? \[([\s\S]*?)\]\s*:\s*\[/) || [null, ''])[1]
+  const wsCount = (wsBlock.match(/id: 'billora:menu:/g) || []).length
+  assert.ok(wsCount >= 1 && wsCount <= 10, `workspace menu list must be 1..10 rows (found ${wsCount})`)
   assert.match(m, /opts\.workspace\s*\?\s*\[[\s\S]*:\s*\[[\s\S]*billora:menu:help[\s\S]*billora:menu:cancel/)
 })
 
@@ -724,31 +753,37 @@ test('G4e route renders menu/status/review and decouples resend (never re-runs i
   assert.match(src, /note === 'review-requested'/)
   assert.match(src, /async function resendPendingReply/)
   assert.match(src, /updateSessionDeliveryState/)
-  // The register handoff token is parsed for delivery and stripped from any
-  // text fallback so internal markup is never shown to the sender.
+  // The register handoff token(s) are parsed for delivery and stripped from any
+  // text fallback so internal markup is never shown to the sender. A multi-month
+  // burst can queue several tokens, so the flush reads them ALL (global match).
   assert.match(src, /deliver:/)
-  assert.match(src, /rawBody\.slice\(token\[0\]\.length\)/)
+  assert.match(src, /rawBody\.matchAll\(/)
+  assert.match(src, /rawBody\.replace\(/)
   // The resend path only sends — it must not re-run business operations.
   const rpr = src.slice(src.indexOf('async function resendPendingReply'), src.indexOf('Onboarding + upload decision engine'))
   assert.ok(!/recordMediaIntake|assignPendingUploads|transition\(/.test(rpr), 'resend must not re-run business ops')
-  // Ack fires once per session; later clean uploads stay silent (no nag).
-  assert.match(src, /upload_ack_sent_at: new Date\(\)/)
+  // Ack fires once per burst via the atomic claim (the flag write lives in
+  // sessions.claimUploadAck, not a racy read-modify-write here).
+  assert.match(src, /claimUploadAck\(/)
 })
 
-test('G4e2 deferred register keeps its handoff on a transient/blocked send (never strands a ready workbook)', () => {
+test('G4e2 deferred registers keep their handoff on a transient/blocked send (never strand a ready workbook)', () => {
   const src = routeSrc()
   const rpr = src.slice(src.indexOf('async function resendPendingReply'), src.indexOf('Onboarding + upload decision engine'))
-  // A document that is NOT yet delivered but could succeed later must return
-  // BEFORE the text fallback that clears pending_reply_body — otherwise the
-  // reassuring "I'll send the Excel" text retires the handoff and the file never
-  // arrives (exactly the reported "can't get it in WhatsApp" failure).
-  const guard = /if \(r\.outcome === 'transient' \|\| r\.outcome === 'blocked'\) \{[\s\S]*?return;\s*\}/.exec(rpr)
-  assert.ok(guard, 'transient/blocked outcome must early-return to keep the handoff')
+  // Every token is attempted; one NOT yet delivered but that could succeed later is
+  // collected as outstanding rather than silently dropped.
+  assert.match(rpr, /if \(r\.outcome === 'transient' \|\| r\.outcome === 'blocked'\) outstanding\.push\(workbookId\)/)
+  // If ANY register is still outstanding the slot is re-armed with ONLY those
+  // tokens and the function returns BEFORE the text fallback that clears it —
+  // otherwise the reassuring "I'll send the Excel" text retires the handoff and the
+  // file never arrives (the reported "can't get it in WhatsApp" failure).
+  const guard = /if \(outstanding\.length > 0\) \{[\s\S]*?return;\s*\}/.exec(rpr)
+  assert.ok(guard, 'an outstanding register must re-arm the handoff and early-return')
+  assert.match(rpr, /const kept = outstanding\.map/)
   const sendTextIdx = rpr.indexOf('const o = await sendText(to, body')
-  assert.ok(sendTextIdx > -1 && guard.index < sendTextIdx, 'retry guard must run before the text-clear fallback')
-  // The successful-delivery path likewise returns before the text fallback.
-  assert.match(rpr, /if \(r\.delivered\) \{[\s\S]*?return;\s*\}/)
-  // Only a 'skipped' (gone/expired) workbook is allowed to fall through to text+clear.
+  assert.ok(sendTextIdx > -1 && guard.index < sendTextIdx, 'the keep-handoff guard must run before the text-clear fallback')
+  // A delivered register clears its token (continue); only an all-skipped set falls to text.
+  assert.match(rpr, /if \(r\.delivered\) \{ deliveredCount \+= 1; continue \}/)
   assert.match(rpr, /'skipped'[\s\S]*?fall through/i)
 })
 
@@ -889,6 +924,13 @@ test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, ver
   assert.ok(s.includes('/api/exports/${workbookId}/download'), 'authenticated link included as a fallback')
   assert.ok(s.includes('PUBLIC_APP_URL'), 'link only built when a public origin is configured')
   assert.ok(s.includes('[[deliver:${workbookId}]]'), 'records an in-chat document handoff token')
+  // §user "another file is missing": the single pending_reply_body slot must NOT
+  // clobber a different month's register that is still waiting to be handed off.
+  // The writer reads the outstanding tokens and MERGES them so every ready register
+  // flushes on the next inbound (this one last).
+  assert.ok(s.includes("select('pending_reply_body')"), 'reads the outstanding handoff before writing')
+  assert.ok(s.includes('priorIds'), 'collects any prior deliver tokens')
+  assert.ok(s.includes('[[deliver:${id}]]'), 're-emits each prior workbook as a token')
   assert.ok(s.includes('updateSessionDeliveryState(db, senderHmac'), 'delivery via next inbound reply')
   assert.ok(!/public URL unset; workbook ready, delivery deferred/.test(s), 'must NOT skip delivery when PUBLIC_APP_URL is unset')
   // Batch readiness gate lives HERE: never build a premature workbook.
@@ -911,7 +953,7 @@ test('E7 WhatsApp send and delivery callbacks log Meta response metadata without
   }
   assert.match(route, /\[WhatsApp\] delivery status received/)
   assert.match(route, /providerMessageIdSuffix: delivery\.id\?\.slice\(-8\)/)
-  assert.match(route, /workbookId \? \{ workbookId \} : undefined/)
+  assert.match(route, /workbookIds\[0\] \? \{ workbookId: workbookIds\[0\] \} : undefined/)
   assert.match(send, /headers: \{ Authorization: `Bearer \$\{token\}`/)
   const loggedFields = send.split(/logger\.(?:info|warn|error|debug)\(/).slice(1).join('\n')
   assert.ok(!/logger\.[a-z]+\([^)]*\btoken\b/i.test(loggedFields), 'authorization token is never logged')
@@ -1007,8 +1049,10 @@ test('H1c intake validates keys BEFORE any media download (no wasted fetch, no r
   const uploadIdx = src.indexOf('.upload(pendingPath, enc.container')
   assert.ok(keyIdx > 0 && dlIdx > keyIdx, 'key validation must precede the Graph media download')
   assert.ok(uploadIdx > keyIdx, 'key validation must precede any storage write')
-  // Exactly one resolution point: hoisted before the download, not re-read later.
-  assert.equal(src.match(/resolveFileKeyConfig\(\)/g).length, 1)
+  // The intake destructures the FULL key pair exactly once (hoisted before the
+  // download and reused for every write). A separate onboarding feature may
+  // resolve only masterKeyHex best-effort; that must not mask a re-read here.
+  assert.equal((src.match(/const \{ masterKeyHex, pathKeyHex \} = resolveFileKeyConfig\(\)/g) || []).length, 1)
 })
 
 test('H1d a config failure settles the intake as final, notifies once, and never loops', () => {
@@ -1562,7 +1606,8 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   assert.ok(e.includes("import sharp from 'sharp'"), 'image decode/normalize runs through sharp')
   assert.ok(e.includes("from 'tesseract.js'"), 'local OCR runs through tesseract.js')
   assert.ok(e.includes('const MAX_PDF_PAGES = 10'), 'scanned PDF page count is bounded')
-  assert.ok(e.includes('extractPdfTextLayer(buffer, maxPdfPages)'), 'a digital PDF text layer is preferred before OCR')
+  assert.ok(e.includes('extractPdfTextLayerPages(buffer, maxPdfPages)'), 'a digital PDF text layer is read page-by-page before OCR')
+  assert.ok(e.includes('combinePageCandidates(') && e.includes('groupPageCandidates('), 'multi-page candidates are grouped by invoice number, never blindly concatenated (§P3-14)')
   assert.ok(e.includes('extractScannedPdf(') && e.includes('recognizeText(png, worker)'), 'scanned PDFs are rasterized then OCR-read')
   assert.ok(e.includes('langPath: process.cwd()') && e.includes('gzip: false'), 'Tesseract loads the bundled traineddata locally')
   assert.ok(e.includes('.greyscale()') && e.includes('.normalize()'), 'OCR input receives contrast normalization')
@@ -1694,9 +1739,22 @@ test('M4 image uses the vision path only when the operator enabled AI; disabled 
   const s = extractSrc()
   assert.ok(s.includes('allowAI,'), 'handler passes the gate result to the engine (never literal true)')
   const e = extractorSrc()
-  const aiGate = e.indexOf('if (allowAI && needsAI)')
-  const provider = e.indexOf('extractInvoiceFields(')
-  assert.ok(aiGate > 0 && provider > aiGate, 'provider call lives ONLY inside the engine AI gate')
+  // §P2-11 refactor: the vision call now lives in a runVisionFirstPass helper that
+  // is DEFINED above the gate, so a textual "provider-after-gate" check is no longer
+  // the right proof. Preserve the intent — NO provider call is reachable when the
+  // operator disabled AI — structurally: both entry paths demand allowAI.
+  const aiGate = e.indexOf('if (allowAI && (needsAI || speculativeAi !== null))')
+  assert.ok(aiGate > 0, 'AI decision block is gated on allowAI')
+  const parallelGate = e.indexOf('const parallelVision = options.parallelVision === true && allowAI && Boolean(apiKey)')
+  assert.ok(parallelGate > 0, 'speculative launch is gated on allowAI + a key')
+  assert.ok(e.indexOf('if (parallelVision) {') > parallelGate, 'the launch only runs under the gated flag')
+  // The helper has ONE definition + TWO call sites: the gated speculative launch and
+  // the consumption inside the allowAI block. Nothing calls it unguarded.
+  assert.equal((e.match(/runVisionFirstPass\(/g) ?? []).length, 3, 'one definition + two gated call sites')
+  const consume = e.indexOf('const firstPass = speculativeAi ?? runVisionFirstPass')
+  assert.ok(consume > aiGate, 'the non-speculative first pass is reached only inside the AI block')
+  const retry = e.indexOf('const retryCandidate = await extractInvoiceFields(')
+  assert.ok(retry > aiGate, 'the bounded retry lives inside the allowAI block')
   assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"), 'AI off by default')
   assert.ok(pdfEngineSrc().includes("if (!PDF_MIME.test(mimeType ?? '')) return null"), 'pdfjs-text is not claimed to OCR images')
 })
@@ -2464,6 +2522,25 @@ test('T13 a previously-stored 9-field payload stays readable by the extended mod
   assert.equal(res.ledgerName, null)
 })
 
+test('T14 §P3-15 a local row whose CGST/SGST halves disagree is NEVER collapsed to one overall rate', () => {
+  // A mixed-rate document (or a misread) surfaces as unequal halves. Upstream
+  // validators already route these to review, but the EXPORT mapping must not
+  // blindly sum them into a confidently-wrong single ledger class (defence in depth).
+  const mixed = { invoice_date: '2026-09-05', invoice_number: 'M', vendor_name: 'V', supplier_gstin: '27AAPFU0939F1ZV', taxable_value: 1000, cgst_amount: 105, sgst_amount: 105, igst_amount: 0, total_amount: 1210, cgst_rate_percent: 2.5, sgst_rate_percent: 9 }
+  assert.equal(tallyMap.resolveTaxTreatment(mixed), 'local')
+  assert.equal(tallyMap.overallGstRatePercent(mixed, 'local'), null, 'unequal halves -> no single overall rate')
+  const out = tallyMap.resolveLedgerName(mixed, [{ rate_class_key: 'local@11.5', ledger_name: 'Should-not-apply' }])
+  assert.equal(out.gstRatePercent, null)
+  assert.equal(out.status, 'unresolved-rate', 'a mixed-rate line is flagged, never mapped by luck')
+  assert.equal(out.ledgerName, null, 'no ledger name is invented for an unclassifiable rate')
+  // Equal halves still resolve exactly as before (no regression for the common case).
+  const clean = { ...mixed, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  assert.equal(tallyMap.overallGstRatePercent(clean, 'local'), 18)
+  // A 2.5/2.5 (5% slab) invoice is equal halves and resolves to 5.
+  const five = { ...mixed, cgst_rate_percent: 2.5, sgst_rate_percent: 2.5 }
+  assert.equal(tallyMap.overallGstRatePercent(five, 'local'), 5, 'equal halves within epsilon still sum')
+})
+
 // ---- Second-pass bug fix (17 Oct logs): selection precedence, money, dates ----
 
 const NOW_17 = new Date('2026-10-14T00:00:00Z')
@@ -2779,14 +2856,16 @@ test('RE6 route.ts wires the editor: opens on tap, corrects without approving, c
   assert.ok(r.includes('applyInvoiceEdit(db, {'), 'a typed correction routes through the shared persist path')
   assert.ok(r.includes("startsWith('review-edit')"), 'every editor note has a reply branch')
   assert.ok(r.includes('review_edit_invoice_id: editInvoiceId'), 'the edit target is persisted across turns')
-  assert.ok(r.includes('sendReviewEditList(to, editable)'), 'Review offers the editable picker over ALL flagged invoices')
+  assert.ok(r.includes('sendReviewList(to, pg.items'), '§user #2: Review sends ONE combined list whose rows open the editor (no separate edit picker)')
+  assert.ok(!r.includes('sendReviewEditList'), 'the separate edit-list send is gone (review + edit consolidated)')
   assert.ok(/result\.nextState = 'collecting'/.test(r) && r.includes("outcome.review === 'approved'"), 'the editor closes only after a genuine approval')
 })
 
-test('RE7 the edit picker uses validated billora:review:edit ids and Meta row caps', () => {
+test('RE7 the combined review list uses validated billora:review:edit ids and Meta row caps', () => {
   const s = sendSrc()
-  assert.ok(s.includes('export function sendReviewEditList'), 'the outbound sender exists')
-  assert.ok(s.includes('billora:review:edit:'), 'rows carry the edit namespace the conversation layer validates')
+  assert.ok(s.includes('export function sendReviewList'), 'the single combined outbound sender exists')
+  assert.ok(s.includes('billora:review:edit:'), 'rows carry the edit namespace so a tap opens the combined editor')
+  assert.ok(!s.includes('export function sendReviewEditList'), 'the redundant separate edit sender is removed (§user #2)')
   assert.ok(s.includes('slice(0, 10)'), 'capped to the WhatsApp list row limit')
   assert.ok(s.includes('slice(0, 24)'), "title capped to Meta's 24-char limit")
 })
@@ -2819,4 +2898,477 @@ test('RE10 saveSession never 503-loops the whole pipeline when the edit column i
     'the degraded path names the migration the operator must apply')
   // A genuine failure is still surfaced: the throw is retained after the fallback.
   assert.ok(/throw new Error\(`SESSION_SAVE_ERROR: /.test(s), 'a real save failure still throws (never silent)')
+})
+
+// ---- P0-1 supplier vs buyer GSTIN (own_gstin) ------------------------------
+
+test('P0-1 extract handler feeds the client own_gstin into extraction + the independent re-eval', () => {
+  const h = extractHandlerSrc()
+  assert.ok(h.includes("from('clients')"), 'the handler reads the client row to learn the buyer GSTIN')
+  assert.ok(/\.select\('\*'\)/.test(h), 'it selects without naming own_gstin, so an unapplied migration cannot crash extraction (PGRST204 class)')
+  assert.ok(/\.eq\('workspace_id', workspaceId\)[\s\S]*\.eq\('id', invoice\.client_id\)/.test(h),
+    'the own_gstin read is tenant-scoped (workspace_id AND client id)')
+  assert.ok(/own_gstin[\s\S]*\?\? null/.test(h), 'a missing/absent own_gstin degrades to null, never a guess')
+  assert.ok(/runExtraction\([\s\S]*?\bbuyerGstin,/.test(h), 'buyerGstin is passed to the extractor')
+  assert.ok(/evaluateLedger\(result\.candidate,[\s\S]*?\bbuyerGstin,/.test(h),
+    'the handler-owned re-evaluation also gets buyerGstin')
+})
+
+test('P0-1 the own_gstin migration is additive, optional and only shape-guarded', () => {
+  const sql = ownGstinSqlSrc()
+  assert.ok(/add column if not exists own_gstin text/.test(sql), 'the column is additive + idempotent')
+  assert.ok(!/\bown_gstin text not null\b/i.test(sql), 'own_gstin is optional so existing clients are untouched')
+  assert.ok(/own_gstin is null/.test(sql) && /drop constraint if exists clients_own_gstin_shape_check/.test(sql),
+    'the shape CHECK allows NULL and is a guarded, re-runnable swap')
+})
+
+// ---- P0-4 the human approval path also applies the buyer guard -------------
+
+test('P0-4 review + correction re-validate WITH the buyer guard (a tap can never approve a buyer-as-supplier)', () => {
+  const s = reviewSrc()
+  assert.ok(/async function loadBuyerGstin/.test(s), 'a shared, tenant-scoped buyer loader exists')
+  assert.ok(/\.from\('clients'\)\.select\('\*'\)/.test(s), 'reads without naming own_gstin, so an unapplied migration cannot PGRST204 approval')
+  assert.ok(/\.eq\('workspace_id', workspaceId\)\.eq\('id', clientId\)/.test(s), 'the own_gstin read is tenant-scoped')
+  assert.ok(/own_gstin[\s\S]*\?\? null/.test(s), 'an absent own_gstin degrades to null, never a guess')
+  assert.ok(/loadBuyerGstin\(db, workspaceId, invoice\.client_id\)/.test(s), 'applyInvoiceReview loads the buyer before re-scoring')
+  assert.ok(/loadBuyerGstin\(db, workspaceId, correctionInvoice\.client_id\)/.test(s), 'applyInvoiceCorrection loads the buyer before re-scoring')
+  // Every approval-path re-evaluation must carry buyerGstin — a single miss would
+  // reopen the exact hole this item closes.
+  const evalCalls = [...s.matchAll(/evaluateLedger\(merged,\s*\{[\s\S]*?\}\)/g)].map((m) => m[0])
+  assert.ok(evalCalls.length >= 2, 'both the review and correction paths re-evaluate the merged row')
+  assert.ok(evalCalls.every((c) => /buyerGstin,/.test(c)), 'no approval-path re-eval skips the buyer guard')
+})
+
+// ---- P0-3 reason codes are persisted and surfaced in plain English ---------
+
+test('P0-3 a reason code maps to plain English and NEVER fabricates a specific cause', () => {
+  assert.equal(reviewEdit.describeReason('supplier-equals-buyer'),
+    'the supplier GSTIN is actually your own (the buyer)')
+  // Dynamic codes degrade truthfully instead of inventing a number/field.
+  assert.match(reviewEdit.describeReason('low-confidence:0.42'), /low-confidence/)
+  assert.match(reviewEdit.describeReason('total-mismatch:100!=200'), /add up/)
+  assert.equal(reviewEdit.describeReason('some-future-code'), 'it needs a manual check',
+    'an unknown code is generic, never a guessed explanation')
+  const summary = reviewEdit.summarizeReasons(['gstin-missing', 'gstin-missing', 'total-zero'], 1)
+  assert.match(summary, /no supplier GSTIN was found/, 'duplicates collapse')
+  assert.match(summary, /\+1 more/, 'overflow is counted, not silently dropped')
+})
+
+test('P0-3 the in-chat editor explains WHY the invoice is flagged (and stays silent when it is not)', () => {
+  const msg = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, { reasons: ['invoice-date-unresolved'] })
+  assert.match(msg, /Why this needs a check:.*no readable invoice date/)
+  const none = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, {})
+  assert.ok(!none.includes('Why this needs a check'), 'a row with no stored reason shows no phantom cause')
+})
+
+test('P0-3 the machine reason codes ride in the encrypted payload and reach the list + editor', () => {
+  const r = reviewSrc()
+  assert.ok(/const REASONS_KEY = '_reviewReasons'/.test(r), 'one sibling key name carries the codes')
+  assert.ok(/encodeRow\(evaluation\.row, audit, reasons\)/.test(r), 'approval persists the current reasons')
+  assert.ok(/encodeRow\(evaluation\.row, audit, evaluation\.reasons\)/.test(r), 'correction persists the re-scored reasons')
+  assert.ok(/\[REASONS_KEY\]: reasonsRaw/.test(r) && /\.\.\.candidate/.test(r),
+    'splitAudit strips the sibling so it never becomes a candidate field or reaches the export')
+  const e = extractHandlerSrc()
+  assert.ok(/JSON\.stringify\(\{[\s\S]*?_reviewReasons: evaluation\.reasons[\s\S]*?\}\)/.test(e),
+    'extraction writes the reasons into the stored payload')
+  const rc = reviewConfirmSrc()
+  assert.ok(/why: summarizeReasons\(storedReasons\(row\)/.test(rc), 'pending + editable list rows carry a plain-English why')
+  assert.ok(/reasons: storedReasons\(parsed\)/.test(rc), 'the editor loader returns the stored reasons')
+  assert.ok(/inv\.why/.test(sendSrc()), 'the interactive list descriptions render the why')
+  assert.ok(/composeReviewEditorMessage\(load\.row, \{ reasons: load\.reasons/.test(routeSrc()),
+    'the route feeds the reasons into the editor render')
+})
+
+// ---- P0-1b optional own-GSTIN capture (command + menu, checksum-validated) ---
+
+test('P0-1b the My-GSTIN command parses to a validated value and never a guess', () => {
+  assert.deepEqual(conv.parseGstinCommand('My GSTIN 27AAPFU0939F1ZV'), { action: 'set', value: '27AAPFU0939F1ZV' })
+  assert.deepEqual(conv.parseGstinCommand('my gstin 27 aapfu0939f1zv'), { action: 'set', value: '27AAPFU0939F1ZV' },
+    'case + inner spaces are normalised before the checksum')
+  assert.equal(conv.parseGstinCommand('My GSTIN skip').action, 'skip')
+  assert.equal(conv.parseGstinCommand('My GSTIN clear').action, 'clear')
+  assert.equal(conv.parseGstinCommand('My GSTIN').action, 'prompt')
+  // A one-character near-miss is refused, never silently stored (the SAME checksum
+  // the extractor uses — we never persist a GSTIN we are unsure of).
+  assert.equal(conv.parseGstinCommand('My GSTIN 27AAPFU0939F1ZW').action, 'invalid')
+  // Not a GSTIN command at all -> null, so ordinary messages pass through untouched.
+  assert.equal(conv.parseGstinCommand('invoice total 500'), null)
+  assert.equal(conv.parseGstinCommand('hello'), null)
+})
+
+test('P0-1b a valid GSTIN is captured as a side note without changing the conversation state', () => {
+  const s = sess('collecting', 'w1')
+  const r = conv.transition({ session: s, replyId: null, text: 'My GSTIN 27AAPFU0939F1ZV', providerMessageId: 'g1' })
+  assert.equal(r.nextState, 'collecting', 'capture is a side note, not a turn')
+  assert.equal(r.note, 'gstin-set:27AAPFU0939F1ZV')
+  // Only recognised once the sender has a workspace, so it can never hijack an
+  // in-progress onboarding answer (an org name typed here is just a name).
+  const pre = conv.transition({ session: sess('awaiting_org_name', null), replyId: null, text: 'My GSTIN 27AAPFU0939F1ZV', providerMessageId: 'g2' })
+  assert.notEqual(pre.note, 'gstin-set:27AAPFU0939F1ZV', 'pre-onboarding "my gstin ..." is NOT a capture command')
+})
+
+test('P0-1b the menu opens the prompt; skip and no-workspace degrade safely', () => {
+  const s = sess('collecting', 'w1')
+  const m = conv.transition({ session: s, replyId: 'billora:menu:set_gstin', text: null, providerMessageId: 'g3' })
+  assert.equal(m.note, 'gstin-prompt'); assert.equal(m.nextState, 'collecting'); assert.equal(m.outbound.kind, 'text')
+  const nw = conv.transition({ session: sess('new', null), replyId: 'billora:menu:set_gstin', text: null, providerMessageId: 'g4' })
+  assert.equal(nw.note, 'no-workspace', 'a pre-onboarding menu tap asks for setup, not a GSTIN')
+  const skip = conv.transition({ session: s, replyId: null, text: 'My GSTIN skip', providerMessageId: 'g5' })
+  assert.equal(skip.note, 'gstin-skip'); assert.equal(skip.outbound.kind, 'text')
+})
+
+test('P0-1b the route persists own_gstin tenant-scoped + migration-safe, never from a near-miss', () => {
+  const src = routeSrc()
+  assert.ok(/setClientOwnGstin\(db, workspaceId, clientId, value\)/.test(src), 'the route calls the shared, tenant-scoped setter')
+  assert.ok(/startsWith\('gstin-set:'\)/.test(src), 'only the checksum-valid set note is persisted (invalid/skip never write)')
+  assert.ok(/if \(!workspaceId \|\| !clientId\)/.test(src), 'a capture with no active client asks to pick one, never guesses a client')
+  assert.ok(/NOT_MIGRATED/.test(src), 'an unapplied migration is a soft, honest failure — not a 503 retry loop')
+  const p = provisionSrc()
+  assert.ok(/\.from\('clients'\)[\s\S]*?\.update\(\{ own_gstin: value \}\)/.test(p) && /\.eq\('workspace_id', workspaceId\)[\s\S]*?\.eq\('id', clientId\)/.test(p),
+    'the write is scoped by BOTH workspace_id AND client id')
+  assert.ok(/PGRST204/.test(p) && /NOT_MIGRATED/.test(p), 'the setter returns a reason instead of throwing when the column is absent')
+  assert.ok(/billora:menu:set_gstin/.test(sendSrc()), 'the interactive menu offers the optional GSTIN row')
+})
+
+// ---- P0-1c learn own_gstin from >=3 invoices -> SUGGEST, never silent ----
+
+test('P0-1c the recipient tally needs a strict plurality of a VALID gstin', () => {
+  const { tallyRecipientGstins } = ownGstinTally
+  // A recurring valid buyer GSTIN on >=3 bills is the one suggestion we make.
+  assert.deepEqual(tallyRecipientGstins([SUP_GSTIN, SUP_GSTIN, SUP_GSTIN], 3),
+    { value: SUP_GSTIN, count: 3 })
+  // Case + spacing are normalised before counting (same real number on every bill).
+  assert.equal(tallyRecipientGstins(['27aapfu0939f1zv', SUP_GSTIN, SUP_GSTIN], 3).value, SUP_GSTIN)
+  // Blanks / nulls are ignored, never counted toward a candidate.
+  assert.deepEqual(tallyRecipientGstins([null, '', '   ', SUP_GSTIN, SUP_GSTIN, SUP_GSTIN], 3),
+    { value: SUP_GSTIN, count: 3 })
+  // Below the threshold -> no suggestion (a single bill is not proof of ownership).
+  assert.deepEqual(tallyRecipientGstins([SUP_GSTIN, SUP_GSTIN], 3), { value: null, count: 0 })
+  // A tie at the top is refused outright — never a coin-flip on the buyer value.
+  assert.deepEqual(tallyRecipientGstins([SUP_GSTIN, SUP_GSTIN, BUY_GSTIN_MH, BUY_GSTIN_MH], 2),
+    { value: null, count: 0 }, 'an even split between two buyers is never guessed')
+  // A dominant value that is NOT a fully-valid GSTIN is refused (never fabricate).
+  assert.deepEqual(tallyRecipientGstins(['ZZZZZZZZZZZZZZZZ', 'ZZZZZZZZZZZZZZZZ', 'ZZZZZZZZZZZZZZZZ'], 3),
+    { value: null, count: 0 })
+  // A clear plurality (4 vs 3) still wins — only an exact tie is refused.
+  assert.equal(tallyRecipientGstins(
+    [SUP_GSTIN, SUP_GSTIN, SUP_GSTIN, SUP_GSTIN, BUY_GSTIN_MH, BUY_GSTIN_MH, BUY_GSTIN_MH], 3).value, SUP_GSTIN)
+})
+
+test('P0-1c the suggestion NEVER writes — it only reads and reports a candidate', () => {
+  const s = ownGstinSuggestSrc()
+  // Migration-safe, tenant-scoped own_gstin probe (select('*') so an unapplied
+  // additive column cannot raise PGRST204 here).
+  assert.ok(/\.from\('clients'\)\.select\('\*'\)/.test(s) && /\.eq\('workspace_id', workspaceId\)\.eq\('id', clientId\)/.test(s),
+    'the own_gstin probe is migration-safe and tenant-scoped')
+  assert.ok(/alreadySet: true/.test(s), 'a client that already set own_gstin gets no suggestion at all')
+  assert.ok(/minCount \s*\n?\s*:?=? 3|args\.minCount \?\? 3|\?\? 3/.test(s),
+    'the >=3 recurrence threshold is the default')
+  // The decisive non-negotiable: a machine must never silently rewrite the buyer
+  // fact. This module contains NO write path whatsoever.
+  assert.ok(!/\.(update|upsert|insert|delete)\(/.test(s),
+    'suggestOwnGstin is read-only — applying requires the reviewer to confirm')
+})
+
+test('P0-1c the recipient GSTIN rides the encrypted payload as a sibling only', () => {
+  assert.ok(/_recipientGstin: result\.candidate\.recipient_gstin \?\? null/.test(extractHandlerSrc()),
+    'extraction persists the printed recipient as an underscore sibling (never a candidate field)')
+  const r = reviewSrc()
+  assert.ok(/const RECIPIENT_KEY = '_recipientGstin'/.test(r), 'review names the sibling it must strip')
+  assert.ok(/delete candidate\[RECIPIENT_KEY\]/.test(r),
+    'a review merge strips the sibling so it is never read back as invoice data')
+})
+
+test('P0-1c the route only SURFACES the suggestion and cannot auto-apply it', () => {
+  const src = routeSrc()
+  assert.ok(/suggestOwnGstin\(db, \{/.test(src), 'the review reply computes the candidate')
+  assert.ok(/reply "My GSTIN \$\{hint\.suggestion\}"/.test(src),
+    'the reply asks the user to confirm via the existing command — never applies silently')
+  // Best-effort: a failure (missing key / read / decrypt) must leave the reply intact.
+  assert.ok(/\} catch \{ \/\* suggestion is a bonus/.test(src), 'the suggestion is wrapped best-effort')
+  // The ONLY own_gstin write path in the route is the reviewer-confirmed note branch;
+  // the suggestion path shares no setter call.
+  assert.equal((src.match(/setClientOwnGstin\(/g) || []).length, 1,
+    'exactly one own_gstin write call exists — the confirmed capture, never the suggestion')
+})
+
+// ---- P1-5 per-month Excel naming (Billora_YYYY-MM.xlsx) + bulk summary ----
+
+test('P1-5 the register file is named ONLY from its own accounting month', () => {
+  assert.equal(naming.monthToken('2026-10-01'), '2026-10')
+  assert.equal(naming.monthToken('2026-01-31T00:00:00+00:00'), '2026-01', 'a full timestamptz still yields the month')
+  assert.equal(naming.workbookFileName('2026-10-01'), 'Billora_2026-10.xlsx')
+  assert.equal(naming.monthLabel('2026-10-01'), 'Oct 2026')
+  // Never invent a month: an absent / malformed / out-of-range period falls back
+  // to the stable generic name rather than stamping a guessed period on the file.
+  assert.equal(naming.workbookFileName(null), naming.GENERIC_REGISTER_FILENAME)
+  assert.equal(naming.workbookFileName('not-a-date'), naming.GENERIC_REGISTER_FILENAME)
+  assert.equal(naming.monthToken('2026-13-01'), null, 'month 13 is refused, never coerced')
+  assert.equal(naming.monthLabel('2026-13-01'), null)
+})
+
+test('P1-5 renderMonthBreakdown only details a genuine MULTI-month delivery', () => {
+  // Single (or none): the untouched one-register wording, so existing promises hold.
+  assert.equal(finalize.renderMonthBreakdown(undefined), '')
+  assert.equal(finalize.renderMonthBreakdown([{ workbookId: 'w', monthLabel: 'Oct 2026', fileName: 'Billora_2026-10.xlsx', invoiceCount: 3 }]), '')
+  const two = finalize.renderMonthBreakdown([
+    { workbookId: 'w1', monthLabel: 'Oct 2026', fileName: 'Billora_2026-10.xlsx', invoiceCount: 12 },
+    { workbookId: 'w2', monthLabel: 'Sep 2026', fileName: 'Billora_2026-09.xlsx', invoiceCount: 0 },
+  ])
+  assert.match(two, /Oct 2026: Billora_2026-10\.xlsx — 12 invoice\(s\)/, 'names the month, the exact file, the count')
+  assert.match(two, /Sep 2026: Billora_2026-09\.xlsx/, 'a zero-count month still lists its file, without a fake count')
+})
+
+test('P1-5 the bulk Done + Review summaries name every ready month and its file', () => {
+  const months = [
+    { workbookId: 'w1', monthLabel: 'Oct 2026', fileName: 'Billora_2026-10.xlsx', invoiceCount: 12 },
+    { workbookId: 'w2', monthLabel: 'Sep 2026', fileName: 'Billora_2026-09.xlsx', invoiceCount: 5 },
+  ]
+  const done = finalize.composeDoneMessage(FC({ readyWorkbooks: 2, readyWorkbookIds: ['w1', 'w2'], readyMonths: months }), { delivered: true })
+  assert.match(done, /register is ready \(2 workbooks\)/, 'plural workbook count preserved')
+  assert.ok(done.includes('Billora_2026-10.xlsx') && done.includes('Billora_2026-09.xlsx'), 'both monthly files named in the summary')
+  // The single-workbook phrasing is UNCHANGED (backwards-compatible with M5/M8f).
+  const one = finalize.composeDoneMessage(FC({ readyWorkbooks: 1, readyWorkbookIds: ['w1'], readyMonths: [months[0]] }), { delivered: true })
+  assert.match(one, /register is ready \(1 workbook\)/)
+  assert.ok(!one.includes('Billora_2026-10.xlsx'), 'no breakdown line for a single register')
+  const rev = finalize.composeReviewMessage(FC({ readyWorkbooks: 2, readyWorkbookIds: ['w1', 'w2'], readyMonths: months }), { delivered: true })
+  assert.ok(rev.includes('Billora_2026-09.xlsx'), 'the Review reply carries the same per-month summary')
+})
+
+test('P1-5 collectFinalizeState builds the per-month breakdown from each batch period', async () => {
+  const future = new Date(Date.now() + 3600_000).toISOString()
+  const wb = [
+    { id: 'w1', batch_id: 'b1', file_object_path: 'p1', expires_at: future },
+    { id: 'w2', batch_id: 'b2', file_object_path: 'p2', expires_at: future },
+  ]
+  const db = fakeDb(({ table }) => {
+    if (table === 'generated_workbooks') return { data: wb, error: null }
+    if (table === 'invoice_batches') return { data: [{ id: 'b1', period_start: '2026-10-01' }, { id: 'b2', period_start: '2026-09-01' }], error: null }
+    if (table === 'invoices') return { data: [{ batch_id: 'b1' }, { batch_id: 'b1' }, { batch_id: 'b2' }], count: 0, error: null }
+    return { data: [], count: 0, error: null }
+  })
+  const c = await finalize.collectFinalizeState(db, 'ws')
+  assert.equal(c.readyWorkbooks, 2)
+  const m1 = c.readyMonths.find((m) => m.workbookId === 'w1')
+  assert.equal(m1.monthLabel, 'Oct 2026'); assert.equal(m1.fileName, 'Billora_2026-10.xlsx'); assert.equal(m1.invoiceCount, 2)
+  const m2 = c.readyMonths.find((m) => m.workbookId === 'w2')
+  assert.equal(m2.fileName, 'Billora_2026-09.xlsx'); assert.equal(m2.invoiceCount, 1)
+})
+
+test('P1-5 both serve paths name the download by the batch period (source contract)', () => {
+  const dl = downloadRouteSrc()
+  assert.ok(/workbookFileName\(periodStart\)/.test(dl) && /batch_id/.test(dl),
+    'the download route resolves the batch period and names the file per month')
+  assert.ok(/'Content-Disposition': `attachment; filename="\$\{filename\}"`/.test(dl),
+    'the served filename is the computed per-month name, not a hard-coded const')
+  assert.ok(!/filename="billora-register\.xlsx"/.test(dl), 'the old fixed filename is gone from the web download')
+  const dv = readFileSync(new URL('../lib/exports/deliver.ts', import.meta.url), 'utf8')
+  assert.ok(/workbookFileName\(periodStart\)/.test(dv), 'the in-chat document uses the same per-month naming')
+  assert.ok(!/const FILENAME = 'billora-register\.xlsx'/.test(dv), 'the fixed in-chat filename const is removed')
+})
+
+// ---- §P1-6 opt-in proactive delivery ----
+test('P1-6 proactive gate: the feature flag is the exact literal "true" only', () => {
+  assert.ok(proactive.proactiveDeliveryEnabled({ WHATSAPP_PROACTIVE_DELIVERY: 'true' }))
+  for (const v of [undefined, '', 'TRUE', '1', 'yes', 'on', 'True']) {
+    assert.ok(!proactive.proactiveDeliveryEnabled({ WHATSAPP_PROACTIVE_DELIVERY: v }), `off unless exact 'true' (got ${String(v)})`)
+  }
+})
+
+test('P1-6 proactive gate: the SEPARATE key must be a full 64-hex string', () => {
+  assert.ok(proactive.proactiveKeyConfigured({ WHATSAPP_PROACTIVE_KEY: 'a'.repeat(64) }))
+  assert.ok(proactive.proactiveKeyConfigured({ WHATSAPP_PROACTIVE_KEY: '0123456789abcdef'.repeat(4) }))
+  for (const v of [undefined, '', 'abc', 'z'.repeat(64), 'a'.repeat(63), 'a'.repeat(65)]) {
+    assert.ok(!proactive.proactiveKeyConfigured({ WHATSAPP_PROACTIVE_KEY: v }), `rejects ${String(v)}`)
+  }
+})
+
+test('P1-6 proactive gate: 24h service-window boundaries are exact', () => {
+  const now = 1_000_000_000_000
+  assert.ok(proactive.isWithinProactiveWindow(now, now), 'age 0 is in window')
+  assert.ok(proactive.isWithinProactiveWindow(now - proactive.PROACTIVE_WINDOW_MS + 1, now), 'just inside is in window')
+  assert.ok(!proactive.isWithinProactiveWindow(now - proactive.PROACTIVE_WINDOW_MS, now), 'exactly 24h is OUT')
+  assert.ok(!proactive.isWithinProactiveWindow(now + 1, now), 'a future timestamp is OUT')
+})
+
+test('P1-6 proactive gate: a push needs ALL of flag + key + consent + window', () => {
+  const now = 1_000_000_000_000
+  const envOn = { WHATSAPP_PROACTIVE_DELIVERY: 'true', WHATSAPP_PROACTIVE_KEY: 'a'.repeat(64) }
+  const recent = now - 60_000
+  assert.ok(proactive.canProactivelyPush({ consent: true, lastActivityMs: recent, env: envOn, nowMs: now }))
+  assert.ok(!proactive.canProactivelyPush({ consent: false, lastActivityMs: recent, env: envOn, nowMs: now }), 'no consent -> no push')
+  assert.ok(!proactive.canProactivelyPush({ consent: true, lastActivityMs: recent, env: { ...envOn, WHATSAPP_PROACTIVE_DELIVERY: 'false' }, nowMs: now }), 'flag off -> no push')
+  assert.ok(!proactive.canProactivelyPush({ consent: true, lastActivityMs: recent, env: { WHATSAPP_PROACTIVE_DELIVERY: 'true' }, nowMs: now }), 'key missing -> no push')
+  assert.ok(!proactive.canProactivelyPush({ consent: true, lastActivityMs: null, env: envOn, nowMs: now }), 'no activity timestamp -> no push')
+  assert.ok(!proactive.canProactivelyPush({ consent: true, lastActivityMs: now - proactive.PROACTIVE_WINDOW_MS - 1, env: envOn, nowMs: now }), 'outside window -> no push')
+})
+
+test('P1-6 conversation: parseProactiveCommand recognizes only the fixed phrases', () => {
+  assert.deepEqual(conv.parseProactiveCommand('Proactive on'), { action: 'enable' })
+  assert.deepEqual(conv.parseProactiveCommand('  opt in '), { action: 'enable' })
+  assert.deepEqual(conv.parseProactiveCommand('PROACTIVE OFF'), { action: 'disable' })
+  assert.deepEqual(conv.parseProactiveCommand('opt out'), { action: 'disable' })
+  assert.deepEqual(conv.parseProactiveCommand('proactive'), { action: 'prompt' })
+  // Ordinary text / invoice captions are NEVER mistaken for consent.
+  assert.equal(conv.parseProactiveCommand('invoice total 500'), null)
+  assert.equal(conv.parseProactiveCommand(''), null)
+  assert.equal(conv.parseProactiveCommand(null), null)
+})
+
+test('P1-6 conversation: opt-in/out is a side note that never changes state, gated on workspace', () => {
+  // Pre-onboarding: the phrase is NOT treated as consent (mirrors the GSTIN gating)
+  // and must not emit a proactive note.
+  const noWs = conv.transition({ session: sess('awaiting_org_name', null), replyId: null, text: 'Proactive on', providerMessageId: 'p0' })
+  assert.ok(!String(noWs.note).startsWith('proactive'), 'cannot opt in before a workspace exists')
+  // With a workspace: enable/disable are recorded as notes, state UNCHANGED, no outbound.
+  const on = conv.transition({ session: sess('collecting', 'ws'), replyId: null, text: 'Proactive on', providerMessageId: 'p1' })
+  assert.equal(on.note, 'proactive-enable'); assert.equal(on.nextState, 'collecting'); assert.deepEqual(on.outbound, { kind: 'none' })
+  const off = conv.transition({ session: sess('collecting', 'ws'), replyId: null, text: 'Proactive off', providerMessageId: 'p2' })
+  assert.equal(off.note, 'proactive-disable'); assert.equal(off.nextState, 'collecting')
+  // Bare "proactive" (or the menu row) only OPENS the prompt — it never opts in.
+  const help = conv.transition({ session: sess('collecting', 'ws'), replyId: null, text: 'proactive', providerMessageId: 'p3' })
+  assert.equal(help.note, 'proactive-prompt'); assert.equal(help.outbound.kind, 'text')
+  const menu = conv.transition({ session: sess('collecting', 'ws'), replyId: 'billora:menu:proactive', text: null, providerMessageId: 'p4' })
+  assert.equal(menu.note, 'proactive-prompt'); assert.equal(menu.outbound.kind, 'text')
+})
+
+test('P1-6 store: seals the wa_id under the SEPARATE key and deletes it on opt-out', () => {
+  const src = proactiveStoreSrc()
+  assert.ok(/encryptExtractedPayload\(args\.waId\.trim\(\), key\)/.test(src), 'the phone is sealed with the AES-256-GCM envelope under the proactive key')
+  assert.ok(/resolveProactiveKeyHex/.test(src) && /WHATSAPP_PROACTIVE_KEY/.test(src), 'the key comes from the dedicated WHATSAPP_PROACTIVE_KEY, not the master key')
+  assert.ok(/wa_id_encrypted: sealed/.test(src), 'the write stores the sealed buffer (null when opting out)')
+  assert.ok(/enabled: false[\s\S]*?|proactive_consent: args\.enabled/.test(src), 'consent flag is written')
+  // Opt-out stores consent=false AND a null sealed value (a delete), leaving no residue.
+  assert.ok(/const patch = \{ proactive_consent: args\.enabled, wa_id_encrypted: sealed \}/.test(src), 'a single patch nulls the sealed value on opt-out')
+  // Migration-safe reads + PGRST204 soft-fail writes.
+  assert.ok(/\.select\('\*'\)/.test(src), 'reads use select(*) so an unapplied migration never raises')
+  assert.ok(/PGRST204/.test(src) && /NOT_MIGRATED/.test(src), 'a schema-cache miss is a soft NOT_MIGRATED, not a thrown error')
+})
+
+test('P1-6 store: the raw phone / sealed bytes / key are NEVER logged', () => {
+  const src = proactiveStoreSrc()
+  // No logger call may reference waId, the sealed buffer, the decrypted value, or key
+  // hex. Bound each capture to the call's own argument list (stop at the first ')')
+  // so a nearby declaration can never be over-matched into a false positive.
+  const offenders = [...src.matchAll(/logger\.\w+\(([^)]*)\)/g)].map((m) => m[1])
+  assert.ok(offenders.length > 0, 'the store logs only safe kinds (sanity: at least one bounded log call seen)')
+  for (const arg of offenders) {
+    assert.ok(!/waId/.test(arg), 'wa_id is never passed to the logger')
+    assert.ok(!/sealed/i.test(arg), 'sealed bytes are never logged')
+    assert.ok(!/keyHex|masterKey|proactiveKey|WHATSAPP_PROACTIVE_KEY/.test(arg), 'the key is never logged')
+    assert.ok(!/plain/.test(arg), 'the decrypted phone is never logged')
+  }
+  // openWaId swallows any decrypt failure and returns null (fail-closed, no leak).
+  assert.ok(/catch \{\s*\n?\s*return null/.test(src) || /catch \{ return null \}/.test(src), 'openWaId fails closed to null')
+})
+
+test('P1-6 route: consent is stored only when the flag AND separate key are set', () => {
+  const src = routeSrc()
+  assert.ok(/import \{ proactiveDeliveryEnabled, proactiveKeyConfigured \} from '@\/lib\/whatsapp\/proactive'/.test(src), 'route imports the pure gate')
+  assert.ok(/import \{ setProactiveConsent \} from '@\/lib\/whatsapp\/proactive-store'/.test(src), 'route imports the consent store')
+  assert.ok(/enable && !\(proactiveDeliveryEnabled\(\) && proactiveKeyConfigured\(\)\)/.test(src), 'a bare opt-in with the feature off stores NOTHING')
+  assert.ok(/setProactiveConsent\(db, hmac, \{ enabled: enable, waId: enable \? to : null \}\)/.test(src),
+    'consent write is scoped to THIS sender (hmac) and passes the raw wa_id only on opt-in, null on opt-out')
+  assert.ok(/result\.note === 'proactive-enable' \|\| result\.note === 'proactive-disable'/.test(src), 'both opt turns are handled')
+})
+
+test('P1-6 register build: attempts an in-window proactive push, else falls back to next-inbound', () => {
+  const src = registerSrc()
+  assert.ok(/canProactivelyPush\(\{ consent: identity\.consent, lastActivityMs: identity\.lastActivityMs \}\)/.test(src), 'the full gate is consulted before any spontaneous push')
+  assert.ok(/openWaId\(identity\.sealed\)/.test(src), 'the wa_id is opened only after the gate passes')
+  assert.ok(/deliverWorkbookToWhatsApp\(db, \{/.test(src), 'the push reuses the same document-delivery primitive (ready->sent, idempotent)')
+  assert.ok(/pending_reply_body: null/.test(src), 'a confirmed push clears the pending handoff')
+  // The next-inbound queue stays intact as the fallback (never lost).
+  assert.ok(/delivery queued for next inbound reply|pending_reply_body: body/.test(src), 'the next-inbound handoff fallback is preserved')
+})
+
+test('P1-6 menu: a proactive row is offered without exceeding the WhatsApp 10-row cap', () => {
+  const src = sendSrc()
+  assert.ok(/'billora:menu:proactive'/.test(src), 'the workspace menu offers a proactive-delivery row')
+  // Count only the WORKSPACE list (the pre-onboarding list is a separate, mutually
+  // exclusive message), which is the array Meta caps at 10 rows. The regex stops at
+  // the first `] :[`, so slicing from sendMenu to EOF is safe.
+  const menuFn = src.slice(src.indexOf('export function sendMenu'))
+  const wsBlock = (menuFn.match(/\? \[([\s\S]*?)\]\s*:\s*\[/) || [null, ''])[1]
+  const rowCount = (wsBlock.match(/id: 'billora:menu:/g) || []).length
+  assert.ok(rowCount >= 1 && rowCount <= 10, `workspace menu rows must stay <= 10 (found ${rowCount})`)
+})
+
+test('P1-6 migration: forward-only consent + sealed-wa_id columns, never applied here', () => {
+  const sql = readFileSync(new URL('../supabase/migrations/20261026000001_proactive_delivery.sql', import.meta.url), 'utf8')
+  assert.ok(/add column if not exists proactive_consent boolean not null default false/.test(sql), 'consent column is additive and defaults OFF')
+  assert.ok(/add column if not exists wa_id_encrypted bytea/.test(sql), 'the sealed wa_id column is a nullable bytea')
+  assert.ok(!/drop column|drop table|delete from/i.test(sql), 'the migration is forward-only (no destructive statements)')
+})
+
+// ---- §P1-7 single review list + Approve all + pagination + month ----
+test('P1-7 conversation: a page id routes to review-page with the parsed page number', () => {
+  const s = sess('collecting', 'w1')
+  const r = conv.transition({ session: s, replyId: 'billora:review:page:2', text: null, providerMessageId: 'pg1' })
+  assert.equal(r.note, 'review-page'); assert.equal(r.page, 2)
+  assert.equal(r.nextState, 'collecting', 'paging is a side note, not a turn')
+  assert.deepEqual(r.outbound, { kind: 'none' }, 'the route sends the list; the machine emits nothing')
+})
+
+test('P1-7 conversation: a garbage page id degrades to re-showing the list, never an action', () => {
+  const s = sess('collecting', 'w1')
+  for (const bad of ['billora:review:page:0', 'billora:review:page:-3', 'billora:review:page:abc', 'billora:review:page:1000']) {
+    const r = conv.transition({ session: s, replyId: bad, text: null, providerMessageId: `pg-${bad}` })
+    assert.equal(r.note, 'review-requested', `${bad} must not page or act`)
+    assert.equal(r.nextState, 'collecting')
+  }
+})
+
+test('P1-7 conversation: approve-all routing (fixed control id + text phrase), never a uuid path', () => {
+  const s = sess('collecting', 'w1')
+  const tap = conv.transition({ session: s, replyId: 'billora:review:approve-all', text: null, providerMessageId: 'aa1' })
+  assert.equal(tap.note, 'review-approve-all'); assert.equal(tap.nextState, 'collecting')
+  const cmd = conv.transition({ session: s, replyId: null, text: 'Approve all', providerMessageId: 'aa2' })
+  assert.equal(cmd.note, 'review-approve-all')
+  // A real confirm id still routes to the per-invoice confirm (control ids never collide).
+  const id = '50430a9a-2e40-45b0-bcd0-9e23baab2339'
+  const conf = conv.transition({ session: s, replyId: `billora:review:confirm:${id}`, text: null, providerMessageId: 'aa3' })
+  assert.equal(conf.note, 'review-confirm'); assert.equal(conf.invoiceId, id)
+  // Pre-onboarding the bare text phrase is NOT an approval command (workspace-gated).
+  const pre = conv.transition({ session: sess('awaiting_org_name', null), replyId: null, text: 'approve all', providerMessageId: 'aa4' })
+  assert.notEqual(pre.note, 'review-approve-all', 'no workspace -> never a bulk approval')
+})
+
+test('P1-7 review-confirm: the pending list is offset-paged and carries the batch month', () => {
+  const src = reviewConfirmSrc()
+  assert.ok(/export async function listPendingReviewPage/.test(src), 'a page-aware listing exists')
+  assert.ok(/\.range\(from, from \+ pageSize - 1\)/.test(src), 'paging uses an offset range, not just limit(10)')
+  assert.ok(/select\('id,batch_id', \{ count: 'exact' \}\)/.test(src), 'the page query selects batch_id + an exact count')
+  assert.ok(/hasMore: from \+ pageSize < total/.test(src), 'hasMore is derived from the true total')
+  assert.ok(/month: monthLabel\(period\)/.test(src), 'each pending row carries its accounting month from the batch period')
+  assert.ok(/export const REVIEW_PAGE_SIZE = 8/.test(src), 'a page leaves room for the Approve-all + Next control rows (<=10)')
+  assert.ok(/invoice_batches'\)\.select\('id,period_start'\)/.test(src), 'month comes from the authoritative batch period, same as the export')
+})
+
+test('P1-7 review-confirm: approve-all reuses the shared confirm path and never force-approves', () => {
+  const src = reviewConfirmSrc()
+  assert.ok(/export async function approveAllPending/.test(src), 'the bounded bulk-approve exists')
+  assert.ok(/await confirmInvoice\(db, \{ workspaceId, invoiceId: item\.invoiceId \}\)/.test(src), 'every row goes through the SAME re-validating confirm path')
+  assert.ok(/if \(r\.review === 'approved'\) approved \+= 1/.test(src), 'a row is only counted approved when it truly validated')
+  assert.ok(/else stillPending \+= 1/.test(src), 'a still-flagging row is reported honestly, never forced through')
+  assert.ok(/\.slice\(0, Math\.max\(0, cap\)\)/.test(src), 'the fan-out is bounded by a cap (cost + 24h window)')
+})
+
+test('P1-7 send: the review list adds Approve-all + Next controls and the month, staying <=10 rows', () => {
+  const src = sendSrc()
+  assert.ok(/id: 'billora:review:approve-all'/.test(src), 'an Approve-all control row is offered')
+  assert.ok(/billora:review:page:\$\{\(opts\?\.page \?\? 1\) \+ 1\}/.test(src), 'the Next row targets the following page id')
+  assert.ok(/inv\.month/.test(src), 'the row description carries the accounting month (§P1-7)')
+  assert.ok(/billora:review:edit:\$\{inv\.invoiceId\}/.test(src), '§user #2: per-invoice rows carry EDIT ids so one tap opens the combined review+edit editor (no separate confirm list)')
+  assert.ok(/rows: rows\.slice\(0, 10\)/.test(src), 'the rendered list is hard-capped at Meta 10 rows')
+})
+
+test('P1-7 route: paging + bulk approval are wired to the shared, re-validating paths', () => {
+  const src = routeSrc()
+  assert.ok(/import \{ listPendingReviewPage, confirmInvoice, approveAllPending/.test(src), 'the route imports the paged listing + bulk approve')
+  assert.ok(/result\.note === 'review-page'/.test(src) && /await sendReviewPage\(result\.page \?\? 2\)/.test(src), 'a page tap re-sends just that page')
+  assert.ok(/result\.note === 'review-approve-all'/.test(src) && /approveAllPending\(db, workspaceId, 25\)/.test(src), 'approve-all runs the bounded bulk path')
+  assert.ok(/sendReviewPage\(1\)/.test(src), 'Review and post-approve re-show show the first confirmable page')
+  // approve-all must never claim a row was approved that is still flagged.
+  assert.ok(/stillPending[\s\S]*?nothing was forced through/.test(src), 'the reply states a bad row was not forced')
 })

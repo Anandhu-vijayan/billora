@@ -23,8 +23,15 @@ import type { JobContext } from '@/lib/jobs/worker'
 import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
 import { buildTallyImportWorkbook, validateTallyWorkbook, type TallyImportRowInput } from '@/lib/excel/generator'
-import { resolveLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
+import { resolveLedgerName, tallyDefaultLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
+// Opt-in proactive delivery (§P1-6): when the owner consented AND the feature flag +
+// separate key are set AND the send is inside Meta's 24h window, push the workbook
+// straight away; otherwise fall through to the next-inbound handoff. The wa_id is
+// opened in memory only and never logged.
+import { canProactivelyPush } from '@/lib/whatsapp/proactive'
+import { loadProactiveIdentity, openWaId } from '@/lib/whatsapp/proactive-store'
+import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver'
 import type { LedgerRow } from '@/lib/ocr/ledger'
 
 type Db = SupabaseClient
@@ -205,8 +212,13 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
       invoice_number: row.invoice_number || null,
       vendor_name: row.vendor_name || null,
       supplier_gstin: row.supplier_gstin || null,
-      // Blank when unresolved — NEVER a guessed ledger name (§4).
-      ledger_name: res.ledgerName,
+      // §user #4b: with no workspace mapping configured the cell used to render
+      // blank, which an accountant reads as a broken register. We now write a
+      // conventional `Purchase @ <rate>%` display name (a plain `Purchase` when the
+      // rate is unestablished) so the sheet is always populated. This NEVER touches
+      // an amount and NEVER overrides a real mapping — a configured ledger name
+      // (`res.ledgerName`) always wins; the default only fills the gap.
+      ledger_name: res.ledgerName ?? tallyDefaultLedgerName(res.gstRatePercent),
       taxable_value: row.taxable_value,
       gst_rate_percent: res.gstRatePercent,
       cgst_amount: row.cgst_amount,
@@ -312,13 +324,56 @@ async function scheduleDelivery(
     const mappingNote = unmappedCount > 0
       ? ` ${unmappedCount} line(s) still need a ledger mapping before they import into Tally.`
       : ''
+    // §P1-6 OPT-IN PROACTIVE PUSH. Attempted only when the owner explicitly consented,
+    // the operator switched the feature on AND configured the separate sealing key,
+    // and the send is inside Meta's 24-hour service window. deliverWorkbookToWhatsApp
+    // is idempotent (ready→sent), so this is safe even if the lease lapses mid-send.
+    // Any non-delivery (ineligible, decrypt failure, transient send) falls through to
+    // the reliable next-inbound handoff below — the register is NEVER lost, and the
+    // owner's number is never logged on any path.
+    try {
+      const identity = await loadProactiveIdentity(db, senderHmac)
+      const waId = identity && canProactivelyPush({ consent: identity.consent, lastActivityMs: identity.lastActivityMs })
+        ? openWaId(identity.sealed)
+        : null
+      if (waId) {
+        const push = await deliverWorkbookToWhatsApp(db, {
+          workbookId, to: waId,
+          caption: `Your invoice register is ready — ${rowCount} invoice(s).${reviewNote}${mappingNote}`,
+        })
+        if (push.delivered) {
+          await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: null, last_reply_error_code: null })
+          logger.info('[Register] proactive delivery pushed', { workbookId, jobId, rowCount })
+          return
+        }
+        logger.info('[Register] proactive push not delivered; using next-inbound handoff', {
+          workbookId, jobId, outcome: push.outcome,
+        })
+      }
+    } catch (e) {
+      logger.warn('[Register] proactive push unavailable; using next-inbound handoff', {
+        jobId, workbookId, error: e instanceof Error ? e.message : String(e),
+      })
+    }
     const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
     // Document delivery needs no public origin, so we never defer just because
     // the web link can't be built; the link is an EXTRA fallback when configured.
     const linkNote = base
       ? ` Secure download (sign in required): ${base}/api/exports/${workbookId}/download (valid until ${expiresAt}).`
       : ''
-    const body = `[[deliver:${workbookId}]]\nYour invoice register is ready — ${rowCount} invoice(s). I'll send the Excel file here in this chat.${linkNote}${reviewNote}${mappingNote}`
+    // whatsapp_sessions has ONE pending_reply_body slot. If a register for a
+    // DIFFERENT month finished since the owner's last inbound and its handoff is
+    // still waiting there, blindly overwriting it would silently drop that Excel
+    // file (§user: "another file is missing"). Merge the outstanding deliver
+    // tokens so every ready register flushes on the next inbound, this one last.
+    const { data: slot } = await db.from('whatsapp_sessions').select('pending_reply_body')
+      .eq('sender_hmac', senderHmac).maybeSingle()
+    const existing = (slot?.pending_reply_body as string | null | undefined) ?? ''
+    const priorIds = [...existing.matchAll(/\[\[deliver:([0-9a-f-]{36})\]\]/gi)]
+      .map((m) => m[1]).filter((id) => id !== workbookId)
+    const priorTokens = priorIds.map((id) => `[[deliver:${id}]]\n`).join('')
+    const multi = priorIds.length > 0
+    const body = `${priorTokens}[[deliver:${workbookId}]]\nYour invoice register${multi ? 's are' : ' is'} ready — ${rowCount} invoice(s). I'll send the Excel ${multi ? 'files' : 'file'} here in this chat.${linkNote}${reviewNote}${mappingNote}`
     await assertLease()
     const queued = await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
     logger.info(queued

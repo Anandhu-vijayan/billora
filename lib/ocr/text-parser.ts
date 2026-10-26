@@ -189,6 +189,39 @@ function findVendor(text: string): { value: string; confidence: number } | null 
 }
 
 /**
+ * §P3-16 Detect a CREDIT / DEBIT NOTE from the document TITLE only (never from an
+ * amount). These are correction documents that reverse part of an earlier invoice,
+ * so they carry the opposite sign and must be handled by a human — ledger.ts forces
+ * review whenever this returns a note. Matching the two-word phrase (not a bare
+ * "credit") avoids false positives from payment terms like "on credit" / "credit
+ * period". A combined "Credit/Debit Note" heading is ambiguous, so we take whichever
+ * token appears first (nearest the title position); the choice is informational and
+ * never financially load-bearing because a note is always sent to review anyway.
+ */
+const CREDIT_NOTE_RE = /\bcredit\s*[/ ]?\s*note\b/i
+const DEBIT_NOTE_RE = /\bdebit\s*[/ ]?\s*note\b/i
+// A combined "CREDIT/DEBIT NOTE" heading prints both words around a slash; the two
+// single-head regexes above need contiguity and miss it, so match the combined form
+// explicitly and classify by the FIRST word (the issuer's usual emphasis).
+const COMBINED_CREDIT_FIRST = /\bcredit\s*\/\s*debit\s+note\b/i
+const COMBINED_DEBIT_FIRST = /\bdebit\s*\/\s*credit\s+note\b/i
+export function detectDocumentType(
+  text: string,
+): 'invoice' | 'credit_note' | 'debit_note' {
+  const t = (text ?? '').replace(/\r/g, '')
+  if (COMBINED_CREDIT_FIRST.test(t)) return 'credit_note'
+  if (COMBINED_DEBIT_FIRST.test(t)) return 'debit_note'
+  const credit = CREDIT_NOTE_RE.test(t)
+  const debit = DEBIT_NOTE_RE.test(t)
+  if (credit && debit) {
+    return t.search(CREDIT_NOTE_RE) <= t.search(DEBIT_NOTE_RE) ? 'credit_note' : 'debit_note'
+  }
+  if (credit) return 'credit_note'
+  if (debit) return 'debit_note'
+  return 'invoice'
+}
+
+/**
  * Parse an invoice text layer into a candidate. Every field is optional: only
  * values we can actually locate are populated. When nothing usable is present
  * (e.g. a scanned PDF with no text layer) the caller gets an essentially empty
@@ -284,6 +317,11 @@ export function parseInvoiceText(
     candidate.total_amount = total.value
     candidate.confidence.total_amount = total.confidence
   }
+
+  // §P3-16 Only tag a NON-invoice document type; a plain invoice leaves the field
+  // unset so stored payloads stay as lean as before for the common case.
+  const docType = detectDocumentType(normalized)
+  if (docType !== 'invoice') candidate.document_type = docType
 
   return candidate
 }

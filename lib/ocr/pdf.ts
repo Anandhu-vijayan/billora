@@ -91,13 +91,16 @@ async function openDoc(pdfjs: PdfModule, buffer: Buffer): Promise<PdfDoc> {
 }
 
 /**
- * Extract the embedded text layer from at most ten pages. Returns '' for a
- * scanned/image PDF (no text operators) — an honest empty, never a guess.
+ * Extract the embedded text layer as ONE STRING PER PAGE (index 0 = page 1),
+ * bounded by maxPages. Page boundaries are preserved so a caller can GROUP pages
+ * by invoice number instead of blindly concatenating a multi-invoice PDF into a
+ * single read (§P3-14). A scanned/image PDF yields near-empty per-page strings —
+ * an honest nothing, never a guess.
  */
-export async function extractPdfTextLayer(
+export async function extractPdfTextLayerPages(
   buffer: Buffer,
   maxPages = MAX_PDF_PAGES,
-): Promise<string> {
+): Promise<string[]> {
   if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > MAX_PDF_PAGES) {
     throw new Error(`maxPages must be between 1 and ${MAX_PDF_PAGES}`)
   }
@@ -111,10 +114,23 @@ export async function extractPdfTextLayer(
       const content = await page.getTextContent()
       chunks.push(content.items.map((it) => it.str).join('\n'))
     }
-    return chunks.join('\n')
+    return chunks
   } finally {
     await doc.destroy?.().catch(() => {})
   }
+}
+
+/**
+ * Extract the embedded text layer from at most ten pages, joined into a single
+ * string. Kept for callers that do not need page boundaries; a scanned/image PDF
+ * returns '' — an honest empty, never a guess.
+ */
+export async function extractPdfTextLayer(
+  buffer: Buffer,
+  maxPages = MAX_PDF_PAGES,
+): Promise<string> {
+  const pages = await extractPdfTextLayerPages(buffer, maxPages)
+  return pages.join('\n')
 }
 
 /**

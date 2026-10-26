@@ -23,6 +23,7 @@
 //     deliveries never create duplicate batches or workbook jobs.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { getEnv } from '@/lib/env'
+import { logger } from '@/lib/logger'
 import { encryptExtractedPayload, decryptExtractedPayload } from '@/lib/encryption'
 import { deriveKeyVersion } from '@/lib/encryption/files'
 import { evaluateLedger, mergeCandidates, type LedgerCandidate, type LedgerRow } from '@/lib/ocr/ledger'
@@ -30,6 +31,31 @@ import { moneyToMinorUnits, minorUnitsToNumber } from '@/lib/ocr/validators/mone
 import { resolveInvoiceBatch } from '@/lib/invoices/batch'
 
 type Db = SupabaseClient
+
+/**
+ * The client's OWN (buyer) GSTIN, read tenant-scoped and FAIL-SOFT. This is what
+ * lets the human approval / correction paths run the SAME supplier==buyer guard
+ * as extraction (§P0-4): a row the reviewer confirms is re-validated against the
+ * known buyer, so a buyer GSTIN mislabelled as the supplier can never be approved
+ * into the register. We `select('*')` so an unapplied additive own_gstin migration
+ * can never raise PGRST204 here — the key is simply absent and we continue null
+ * (the same resilience that fixed the session-save regression).
+ */
+async function loadBuyerGstin(
+  db: Db, workspaceId: string, clientId: string | null | undefined,
+): Promise<string | null> {
+  if (!clientId) return null
+  const { data, error } = await db
+    .from('clients').select('*')
+    .eq('workspace_id', workspaceId).eq('id', clientId).maybeSingle()
+  if (error) {
+    logger.warn('[Review] client own_gstin read failed; approving without buyer cross-check', {
+      clientId, kind: error.code ?? 'unknown',
+    })
+    return null
+  }
+  return (data as { own_gstin?: string | null } | null)?.own_gstin ?? null
+}
 
 /** PostgREST renders bytea as a `\x`-prefixed hex string (same as intake/register). */
 function byteaToBuffer(value: unknown): Buffer {
@@ -48,6 +74,14 @@ type StoredRecord = Record<string, unknown>
 interface CorrectionHistoryEntry { field: string; from: string | null; to: string | null; at: string; source: 'human' }
 interface CorrectionAudit { originalExtracted: StoredRecord | null; history: CorrectionHistoryEntry[] }
 const AUDIT_KEY = '_audit'
+// The machine reason codes for the CURRENT row, carried as an encrypted sibling
+// key (like the audit) so no new column is needed and nothing leaks into the
+// register (only the canonical LedgerRow is read for export) or the logs (§P0-3).
+const REASONS_KEY = '_reviewReasons'
+// Informational sibling written by extraction so P0-1c can learn a client's own
+// GSTIN from the recurring buyer token. Stripped here (underscore-prefixed, never
+// a candidate field) so a review merge can never read it as invoice data.
+const RECIPIENT_KEY = '_recipientGstin'
 const AUDIT_HISTORY_CAP = 50
 
 function decodeStoredRecord(encryptedPayload: unknown, masterKeyHex: string): StoredRecord | null {
@@ -62,19 +96,26 @@ function decodeStoredRecord(encryptedPayload: unknown, masterKeyHex: string): St
   }
 }
 
-/** Split a stored record into the field candidate and its (optional) audit. */
-function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; audit: CorrectionAudit | null } {
-  if (!record) return { candidate: {}, audit: null }
-  const { [AUDIT_KEY]: auditRaw, ...candidate } = record
+/** Split a stored record into the field candidate, its audit and its reason codes. */
+function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; audit: CorrectionAudit | null; reasons: string[] } {
+  if (!record) return { candidate: {}, audit: null, reasons: [] }
+  const { [AUDIT_KEY]: auditRaw, [REASONS_KEY]: reasonsRaw, ...candidate } = record
+  // Drop the informational recipient sibling (§P0-1c) so a review merge can never
+  // read it back as a candidate field; underscore-prefixed keys are never invoice data.
+  delete candidate[RECIPIENT_KEY]
   const audit = auditRaw && typeof auditRaw === 'object' && !Array.isArray(auditRaw)
     ? auditRaw as CorrectionAudit
     : null
-  return { candidate: candidate as LedgerCandidate, audit }
+  const reasons = Array.isArray(reasonsRaw)
+    ? (reasonsRaw as unknown[]).filter((r): r is string => typeof r === 'string')
+    : []
+  return { candidate: candidate as LedgerCandidate, audit, reasons }
 }
 
-/** Re-encode a canonical row, preserving its audit only when one exists. */
-function encodeRow(row: LedgerRow, audit: CorrectionAudit | null): string {
-  return audit ? JSON.stringify({ ...row, [AUDIT_KEY]: audit }) : JSON.stringify(row)
+/** Re-encode a canonical row, preserving its audit and current reason codes. */
+function encodeRow(row: LedgerRow, audit: CorrectionAudit | null, reasons: readonly string[]): string {
+  const payload: StoredRecord = { ...row, [REASONS_KEY]: [...reasons] }
+  return audit ? JSON.stringify({ ...payload, [AUDIT_KEY]: audit }) : JSON.stringify(payload)
 }
 
 function scalarToString(v: unknown): string | null {
@@ -161,9 +202,11 @@ export async function applyInvoiceReview(
   const merged = mergeCandidates(args.corrections, existing)
   const env = getEnv()
   const minConfidence = args.minConfidence ?? env.EXTRACTION_MIN_CONFIDENCE
+  const buyerGstin = await loadBuyerGstin(db, workspaceId, invoice.client_id)
   const evaluation = evaluateLedger(merged, {
     minConfidence,
     amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
+    buyerGstin,
   })
 
   // A human approval must MEAN the reviewer confirmed the invoice's identity —
@@ -184,7 +227,7 @@ export async function applyInvoiceReview(
   }
 
   const keyVersion = deriveKeyVersion(masterKeyHex)
-  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit), masterKeyHex)
+  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit, reasons), masterKeyHex)
   const { error: recWriteErr } = await db.from('extracted_records').upsert({
     workspace_id: workspaceId,
     invoice_id: invoiceId,
@@ -316,10 +359,11 @@ export async function applyInvoiceCorrection(
   const { workspaceId, invoiceId, masterKeyHex } = args
 
   const { data: invData, error: invErr } = await db.from('invoices')
-    .select('id')
+    .select('id,client_id')
     .eq('workspace_id', workspaceId).eq('id', invoiceId).maybeSingle()
   if (invErr) throw new Error(`CORRECTION_INVOICE_READ_ERROR: ${invErr.message}`)
   if (!invData) throw new Error('CORRECTION_INVOICE_NOT_FOUND')
+  const correctionInvoice = invData as { client_id: string | null }
 
   const { data: rec, error: recReadErr } = await db.from('extracted_records')
     .select('encrypted_payload')
@@ -334,14 +378,16 @@ export async function applyInvoiceCorrection(
   // is trusted blindly and no field is invented (same engine as every other path).
   const merged = mergeCandidates(args.corrections, existing)
   const env = getEnv()
+  const buyerGstin = await loadBuyerGstin(db, workspaceId, correctionInvoice.client_id)
   const evaluation = evaluateLedger(merged, {
     minConfidence: env.EXTRACTION_MIN_CONFIDENCE,
     amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
+    buyerGstin,
   })
 
   const audit = buildCorrectionAudit(priorAudit, existing, args.corrections)
   const keyVersion = deriveKeyVersion(masterKeyHex)
-  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit), masterKeyHex)
+  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit, evaluation.reasons), masterKeyHex)
   // review_status stays 'needs_review' on this path: a correction is not an
   // approval. This keeps the invoice discoverable in the pending list so the
   // reviewer can still APPROVE (or keep correcting) it.

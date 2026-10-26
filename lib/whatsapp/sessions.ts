@@ -218,6 +218,39 @@ export async function updateSessionDeliveryState(
 }
 
 /**
+ * Race-safe "claim the next upload acknowledgment" for a sender, so a burst of
+ * files uploaded together yields ONE confirmation, not one per file. Each file
+ * arrives as its own near-simultaneous webhook, and a plain session read lets
+ * every worker see a null/stale `upload_ack_sent_at` and all of them ack. A single
+ * conditional UPDATE is atomic at the row level (Postgres re-checks the predicate
+ * under the row lock), so ONLY the worker whose write actually flips the slot wins
+ * and may send; the rest get zero affected rows and stay silent. The slot re-arms
+ * once it is older than `windowMs`, so a genuinely later batch still gets exactly
+ * one ack. Fails quiet on error — one missing ack beats a burst of nags.
+ */
+export async function claimUploadAck(
+  db: SupabaseClient,
+  senderHmac: string,
+  windowMs: number,
+): Promise<boolean> {
+  const now = new Date()
+  const cutoff = new Date(now.getTime() - Math.max(0, windowMs)).toISOString()
+  const { data, error } = await db
+    .from('whatsapp_sessions')
+    .update({ upload_ack_sent_at: now.toISOString(), updated_at: now.toISOString() })
+    .eq('sender_hmac', senderHmac)
+    .or(`upload_ack_sent_at.is.null,upload_ack_sent_at.lt.${cutoff}`)
+    .select('sender_hmac')
+  if (error) {
+    logger.error('[WhatsApp] upload-ack claim failed', {
+      kind: classifyDbError(error.code, error.message), ...safeDbFields(error),
+    })
+    return false
+  }
+  return (data?.length ?? 0) > 0
+}
+
+/**
  * Expired conversations restart at `new`, but setup is NOT repeated: the
  * workspace/client/batch linkage survives expiry (returning-user rule). The
  * route backfills from the identity row if the session itself is brand new.

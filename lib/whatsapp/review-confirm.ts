@@ -21,6 +21,8 @@ import { decryptExtractedPayload } from '@/lib/encryption'
 import { resolveFileKeyConfig } from '@/lib/encryption/files'
 import type { LedgerCandidate, LedgerRow } from '@/lib/ocr/ledger'
 import { applyInvoiceReview, applyInvoiceCorrection, parseReviewCorrections } from '@/lib/invoices/review'
+import { summarizeReasons } from '@/lib/whatsapp/review-edit'
+import { monthLabel } from '@/lib/exports/naming'
 import type { ConfirmOutcome } from '@/lib/whatsapp/finalize'
 
 type Db = SupabaseClient
@@ -43,6 +45,17 @@ interface StoredRow {
   sgst_amount?: number | null
   igst_amount?: number | null
   total_amount?: number | null
+  // Encrypted sibling key carrying the machine reason codes for this row (§P0-3).
+  // Absent on pre-P0-3 rows; readers treat that as "no stored reason" and show a
+  // generic prompt rather than guessing a cause.
+  _reviewReasons?: string[]
+}
+
+/** The stored reason codes for a row, defensively read (never throws on shape). */
+function storedReasons(row: StoredRow): string[] {
+  return Array.isArray(row._reviewReasons)
+    ? row._reviewReasons.filter((r): r is string => typeof r === 'string')
+    : []
 }
 
 export interface PendingReviewItem {
@@ -50,31 +63,78 @@ export interface PendingReviewItem {
   invoiceNumber: string
   vendorName: string | null
   total: string | null
+  /** Plain-English "why flagged" for the list row description (§P0-3). */
+  why: string
+  /** Accounting month label (e.g. "Oct 2026") from the invoice's OWN batch period, or
+   *  null when it is not yet attributable (§P1-7 — the month is shown so a reviewer
+   *  paging a long list never approves an invoice into the wrong period). */
+  month: string | null
+}
+
+/** How many invoices one review page offers. A WhatsApp list caps at 10 rows total,
+ *  and a page leaves room for an "Approve all" control row and a "Next" row, so a
+ *  full page is 8 item rows + those two controls = 10 (no real row is ever skipped). */
+export const REVIEW_PAGE_SIZE = 8
+
+/** Resolve batch_id -> period_start for a set of batches, tenant-scoped, error-tolerant. */
+async function batchPeriodMap(
+  db: Db, workspaceId: string, batchIds: Array<string | null>,
+): Promise<Map<string, string | null>> {
+  const ids = batchIds.filter((b): b is string => typeof b === 'string' && b.length > 0)
+  const map = new Map<string, string | null>()
+  if (ids.length === 0) return map
+  const { data } = await db
+    .from('invoice_batches').select('id,period_start')
+    .eq('workspace_id', workspaceId).in('id', ids)
+  for (const b of (data ?? []) as Array<{ id: string; period_start?: string | null }>) {
+    map.set(b.id, b.period_start ?? null)
+  }
+  return map
+}
+
+export interface PendingReviewPage {
+  items: PendingReviewItem[]
+  page: number
+  pageSize: number
+  total: number
+  hasMore: boolean
 }
 
 /**
- * The needs_review invoices in this workspace that CAN be confirmed in chat:
- * they must already be batched (a reliable invoice date existed), carry an
- * extracted invoice number (the field a confirm affirms), and store a readable
- * row. Returns at most 10 (a WhatsApp list's row cap), newest first.
+ * ONE page of the needs_review invoices shown in the combined Review & edit list
+ * (§user #2). Eligibility is deliberately broad: EVERY pending row is reachable,
+ * including an UNBATCHED one whose only problem is a missing/unparseable date, and
+ * a NUMBERLESS one — those are exactly the rows a reviewer must open to correct.
+ * Rows are offset-paged so a reviewer can walk a list longer than the 10-row
+ * WhatsApp cap, and each carries its accounting month when attributable. A number
+ * is never REQUIRED to list a row: approval remains gated downstream (confirmInvoice
+ * / review.ts will not file a still-incomplete row), so widening this list can never
+ * cause a blind approval. `total` is the count of pending invoices so the caller
+ * knows whether a further page exists.
  */
-export async function listPendingReview(
-  db: Db, workspaceId: string,
-): Promise<PendingReviewItem[]> {
+export async function listPendingReviewPage(
+  db: Db, workspaceId: string, page = 1, pageSize = REVIEW_PAGE_SIZE,
+): Promise<PendingReviewPage> {
   const { masterKeyHex } = resolveFileKeyConfig()
-  const { data: invoices, error } = await db
-    .from('invoices').select('id')
-    .eq('workspace_id', workspaceId).eq('status', 'needs_review').not('batch_id', 'is', null)
-    .order('received_at', { ascending: false }).limit(10)
+  const p = Math.max(1, Math.trunc(page))
+  const from = (p - 1) * pageSize
+  const { data: invoices, error, count } = await db
+    .from('invoices').select('id,batch_id', { count: 'exact' })
+    .eq('workspace_id', workspaceId).eq('status', 'needs_review')
+    .order('received_at', { ascending: false }).range(from, from + pageSize - 1)
+  const total = typeof count === 'number' ? count : 0
   if (error) throw new Error(`REVIEW_LIST_ERROR: ${error.message}`)
-  const ids = (invoices ?? []).map((r) => (r as { id: string }).id)
-  if (ids.length === 0) return []
+  const rows = (invoices ?? []) as Array<{ id: string; batch_id?: string | null }>
+  if (rows.length === 0) return { items: [], page: p, pageSize, total, hasMore: false }
 
+  const periods = await batchPeriodMap(db, workspaceId, rows.map((r) => r.batch_id ?? null))
+  const ids = rows.map((r) => r.id)
   const { data: records, error: recErr } = await db
     .from('extracted_records').select('invoice_id,encrypted_payload')
     .eq('workspace_id', workspaceId).eq('review_status', 'needs_review').in('invoice_id', ids)
   if (recErr) throw new Error(`REVIEW_RECORDS_ERROR: ${recErr.message}`)
 
+  const batchById = new Map(rows.map((r) => [r.id, r.batch_id ?? null]))
   const items: PendingReviewItem[] = []
   for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
     let row: StoredRow
@@ -83,19 +143,37 @@ export async function listPendingReview(
     } catch {
       continue // undecryptable: skip it, never surface a garbage row to confirm
     }
-    const invoiceNumber = typeof row.invoice_number === 'string' ? row.invoice_number.trim() : ''
-    if (!invoiceNumber) continue // nothing to confirm meaningfully; stays flagged
+    const number = typeof row.invoice_number === 'string' ? row.invoice_number.trim() : ''
+    const vendor = typeof row.vendor_name === 'string' && row.vendor_name.trim() ? row.vendor_name.trim() : null
+    const period = periods.get(batchById.get(rec.invoice_id) ?? '') ?? null
     items.push({
       invoiceId: rec.invoice_id,
-      invoiceNumber,
-      vendorName: typeof row.vendor_name === 'string' ? row.vendor_name : null,
+      // Combined list label: fall back to vendor, then a clear marker, so a row
+      // with no extracted number is still selectable (often exactly why it needs
+      // editing) and never shown as a blank '#'.
+      invoiceNumber: number || vendor || 'no number',
+      vendorName: vendor,
       total: typeof row.total_amount === 'number' && Number.isFinite(row.total_amount)
         ? row.total_amount.toFixed(2) : null,
+      why: summarizeReasons(storedReasons(row), 1),
+      month: monthLabel(period),
     })
-    if (items.length >= 10) break
+    if (items.length >= pageSize) break
   }
-  return items
+  return { items, page: p, pageSize, total, hasMore: from + pageSize < total }
 }
+
+/**
+ * The first page of confirmable invoices (backwards-compatible thin wrapper over
+ * listPendingReviewPage). New callers should page explicitly.
+ */
+export async function listPendingReview(
+  db: Db, workspaceId: string,
+): Promise<PendingReviewItem[]> {
+  return (await listPendingReviewPage(db, workspaceId, 1, pageSize(10))).items
+}
+
+function pageSize(n: number): number { return Math.max(1, n) }
 
 /**
  * Confirm ONE pending invoice on the reviewer's behalf: re-read its stored row
@@ -157,72 +235,49 @@ export async function confirmInvoice(
   }
 }
 
-// ---- WhatsApp-native editable review (correct a field, then approve) --------
-// These are the data/DB half of the in-chat editor. They perform NO sending and
-// NEVER invent a value or approve on a correction: a correction persists +
-// re-validates through the SAME shared path the web/API uses (applyInvoiceCorrec
-// tion), while only an explicit approve (confirmInvoice) files the invoice.
+// ---- WhatsApp-native bulk approval over the pending list (§P1-7) -----------
+// A bounded, re-validating approve-everything path. It NEVER force-approves: each
+// row runs the SAME confirmInvoice path, so an incomplete row stays needs_review.
 
-/** One invoice shown in the edit picker. `invoiceNumber` is a DISPLAY label. */
-export interface EditableInvoiceItem {
-  invoiceId: string
-  invoiceNumber: string
-  vendorName: string | null
-  total: string | null
+/** Result of a bounded bulk-approve over the current confirmable page (§P1-7). */
+export interface ApproveAllResult {
+  approved: number
+  stillPending: number
+  failed: number
 }
 
 /**
- * The needs_review invoices the reviewer may OPEN to correct fields. Unlike
- * listPendingReview this does NOT require a batch or an extracted invoice number:
- * an invoice whose only problem is a missing/unparseable DATE (so it was never
- * batched) or a missing NUMBER is exactly the one that needs editing — leaving it
- * out would make it unreachable in-chat. Newest first, capped at the WhatsApp
- * list's 10 rows; an undecryptable row is skipped, never rendered as garbage.
+ * Approve EVERY confirmable pending invoice in this workspace that is otherwise
+ * complete, bounded to `cap` so a single tap can never fan out unbounded (cost +
+ * the WhatsApp 24h window). Each one runs through confirmInvoice — the SAME shared
+ * re-validating path — so precision is never traded for convenience: a row that
+ * still fails validation simply stays needs_review (counted in stillPending) and is
+ * NEVER force-approved. Tenant-scoped and idempotent (safe against a redelivery).
  */
-export async function listEditableInvoices(
-  db: Db, workspaceId: string,
-): Promise<EditableInvoiceItem[]> {
-  const { masterKeyHex } = resolveFileKeyConfig()
-  const { data: invoices, error } = await db
-    .from('invoices').select('id')
-    .eq('workspace_id', workspaceId).eq('status', 'needs_review')
-    .order('received_at', { ascending: false }).limit(10)
-  if (error) throw new Error(`REVIEW_EDIT_LIST_ERROR: ${error.message}`)
-  const ids = (invoices ?? []).map((r) => (r as { id: string }).id)
-  if (ids.length === 0) return []
-
-  const { data: records, error: recErr } = await db
-    .from('extracted_records').select('invoice_id,encrypted_payload')
-    .eq('workspace_id', workspaceId).eq('review_status', 'needs_review').in('invoice_id', ids)
-  if (recErr) throw new Error(`REVIEW_EDIT_RECORDS_ERROR: ${recErr.message}`)
-
-  const items: EditableInvoiceItem[] = []
-  for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
-    let row: StoredRow
-    try {
-      row = JSON.parse(decryptExtractedPayload(byteaToBuffer(rec.encrypted_payload), masterKeyHex)) as StoredRow
-    } catch {
-      continue // undecryptable: skip it, never surface a garbage row to edit
-    }
-    const number = typeof row.invoice_number === 'string' ? row.invoice_number.trim() : ''
-    const vendor = typeof row.vendor_name === 'string' && row.vendor_name.trim() ? row.vendor_name.trim() : null
-    items.push({
-      invoiceId: rec.invoice_id,
-      // A truthful picker label: fall back to the vendor, then a clear marker, so
-      // an invoice with no extracted number is still selectable (that is often
-      // exactly why it needs editing) — never shown as a blank '#'.
-      invoiceNumber: number || vendor || 'no number',
-      vendorName: vendor,
-      total: typeof row.total_amount === 'number' && Number.isFinite(row.total_amount)
-        ? row.total_amount.toFixed(2) : null,
-    })
-    if (items.length >= 10) break
+export async function approveAllPending(
+  db: Db, workspaceId: string, cap = 25,
+): Promise<ApproveAllResult> {
+  const items = await listPendingReview(db, workspaceId) // first (up to 10) confirmable
+  let approved = 0; let stillPending = 0; let failed = 0
+  for (const item of items.slice(0, Math.max(0, cap))) {
+    const r = await confirmInvoice(db, { workspaceId, invoiceId: item.invoiceId })
+    if (!r.ok) { failed += 1; continue }
+    if (r.review === 'approved') approved += 1
+    else stillPending += 1 // re-validated but still flagged — never force-approved
   }
-  return items
+  return { approved, stillPending, failed }
 }
 
+// ---- WhatsApp-native editable review (correct a field, then approve) --------
+// The data/DB half of the combined in-chat editor (§user #2): the Review list row
+// opens THIS editor, where a reviewer sees every field, corrects any of them, and
+// only then approves. These helpers perform NO sending and NEVER invent a value or
+// approve on a correction: a correction persists + re-validates through the SAME
+// shared path the web/API uses (applyInvoiceCorrection), while only an explicit
+// approve (confirmInvoice) files the invoice.
+
 export type InvoiceEditLoad =
-  | { ok: true; row: LedgerRow }
+  | { ok: true; row: LedgerRow; reasons: string[] }
   | { ok: false; error: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT' }
 
 /**
@@ -248,10 +303,10 @@ export async function loadInvoiceForEdit(
   if (recErr) return { ok: false, error: 'FAULT' }
   if (!rec) return { ok: false, error: 'NOT_FOUND' }
   try {
-    const row = JSON.parse(
+    const parsed = JSON.parse(
       decryptExtractedPayload(byteaToBuffer((rec as { encrypted_payload: unknown }).encrypted_payload), masterKeyHex),
-    ) as LedgerRow
-    return { ok: true, row }
+    ) as StoredRow
+    return { ok: true, row: parsed as unknown as LedgerRow, reasons: storedReasons(parsed) }
   } catch {
     return { ok: false, error: 'FAULT' }
   }

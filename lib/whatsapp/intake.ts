@@ -6,6 +6,7 @@
 // Only `accepted` suppresses reprocessing. Retries are idempotent.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { IntakeStatus } from '@/lib/statuses'
+import { wakeWorker } from '../jobs/wake'
 
 export type { IntakeStatus } from '@/lib/statuses'
 
@@ -177,6 +178,11 @@ export async function recordMediaIntake(
   } else {
     throw new Error(`JOB_RECORD_ERROR: ${job.error?.message ?? 'missing id'}`)
   }
+  // Best-effort, NON-BLOCKING wake so a freshly-filed invoice is picked up in
+  // seconds instead of waiting for the next cron tick (§P2-9). Only fired when a
+  // NEW job was created (a webhook redelivery dedups and stays quiet). It never
+  // throws and the cron remains the durable backstop.
+  if (!jobPreexisting) wakeWorker()
   return { invoiceId, jobId, invoicePreexisting, jobPreexisting }
 }
 

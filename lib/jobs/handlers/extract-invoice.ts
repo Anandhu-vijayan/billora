@@ -18,6 +18,7 @@
 import { getEnv } from '@/lib/env'
 import { bucketFor } from '@/lib/supabase/server'
 import { logger } from '@/lib/logger'
+import { StageTimer } from '@/lib/jobs/timing'
 import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -81,7 +82,34 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     throw new PermanentJobError('INVOICE_INCOMPLETE: no stored object/content type')
   }
 
+  // The client's OWN (buyer) GSTIN, when set, is the fact that lets extraction
+  // reject a buyer GSTIN mislabelled as the supplier. Read it tenant-scoped. We
+  // select('*') and fail SOFT: if the additive own_gstin migration has not been
+  // applied yet the key is simply absent and we continue with null — this
+  // enhancement must never be able to break extraction the way an unknown-column
+  // reference would (see the PGRST204 session-save regression).
+  let buyerGstin: string | null = null
+  if (invoice.client_id) {
+    const { data: clientRow, error: clientErr } = await db
+      .from('clients')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('id', invoice.client_id)
+      .maybeSingle()
+    if (clientErr) {
+      logger.warn('[Extract] client own_gstin read failed; continuing without buyer cross-check', {
+        invoiceId, kind: clientErr.code ?? 'unknown',
+      })
+    } else {
+      buyerGstin = (clientRow as { own_gstin?: string | null } | null)?.own_gstin ?? null
+    }
+  }
+
   const { masterKeyHex } = resolveFileKeyConfig()
+
+  // §P2-12 per-stage timing. Started before the download so 'decrypt' also accounts
+  // for the storage fetch. Stage names + integer ms only — never invoice content.
+  const timing = new StageTimer()
 
   // Download the encrypted container and decrypt it IN MEMORY only.
   const { data: blob, error: dlErr } = await db.storage.from(bucketFor('invoices'))
@@ -100,6 +128,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     if (isMediaDecryptFailure(e)) throw new PermanentJobError(`MEDIA_DECRYPT_FAILED: ${(e as Error).message}`)
     throw e
   }
+  timing.mark('decrypt')
 
   // Extraction now runs through the dedicated OCR engine (lib/ocr/invoice-extractor):
   // sharp + tesseract.js for images, a PDF text layer / bounded rendered-page OCR
@@ -125,6 +154,9 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       allowAI,
       apiKey: allowAI ? (env.GEMINI_API_KEY || '') : undefined,
       model: env.EXTRACTION_VISION_MODEL || env.GEMINI_MODEL,
+      buyerGstin,
+      parallelVision: env.EXTRACTION_VISION_PARALLEL === true,
+      imageQualityGate: imageQualityGateFromEnv(env),
     }).catch((e: unknown): never => {
       if (e instanceof InvoiceExtractionError) {
         if (!e.retryable) throw new PermanentJobError(`EXTRACTION_FAILED: ${e.message}`)
@@ -138,6 +170,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       if (e instanceof VisionPermanentError) throw new PermanentJobError(`EXTRACTION_FAILED: ${e.message}`)
       throw e
     })
+    timing.mark('extract')
 
     // Re-evaluate the returned candidate independently so the handler owns the
     // canonical row and the date-resolved batching gate (the engine never returns
@@ -145,6 +178,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     const evaluation = evaluateLedger(result.candidate, {
       minConfidence: env.EXTRACTION_MIN_CONFIDENCE,
       amountToleranceMinorUnits: env.EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS,
+      buyerGstin,
     })
     const confidenceSource: ExtractionSource = result.source
 
@@ -161,6 +195,49 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       })
     }
 
+    // §P3-13 fold the image-quality verdict into the authoritative row. A failing
+    // gate can only ADD reasons and push the row to review (never approve it), so it
+    // can never weaken auto-approve precision. Kept separate from the conflict rule.
+    const imageQualityReasons = result.imageQualityReasons ?? []
+    if (imageQualityReasons.length > 0) {
+      if (evaluation.review === 'approved') evaluation.review = 'needs_review'
+      evaluation.reasons = [...evaluation.reasons, ...imageQualityReasons]
+      logger.info('[Extract] image quality gate forced review', {
+        invoiceId, jobId: job.id, reasons: imageQualityReasons,
+      })
+    }
+
+    // §P3-14 a multi-invoice document: the engine read TWO+ invoice numbers off one
+    // file and returned a single group's row, dropping the others. That row can
+    // never be auto-approved — a human must split the file. Like the quality gate
+    // this only ADDS a reason and pushes to review, so precision is never weakened.
+    if (result.multiInvoiceDetected) {
+      if (evaluation.review === 'approved') evaluation.review = 'needs_review'
+      if (!evaluation.reasons.includes('multi-invoice-document')) {
+        evaluation.reasons = [...evaluation.reasons, 'multi-invoice-document']
+      }
+      logger.info('[Extract] multi-invoice document forced review', {
+        invoiceId, jobId: job.id, pagesProcessed: result.pagesProcessed,
+      })
+    }
+
+    // §P3-16 a printed CREDIT/DEBIT NOTE reverses an earlier invoice, so a machine
+    // must never auto-approve it. Like the quality / multi-invoice gates this only
+    // ADDS a reason and pushes to review (never approves), so auto-approve precision
+    // is untouched. Because the reason is folded HERE (not inside the shared
+    // evaluateLedger), a human correcting the note in applyInvoiceReview can still
+    // approve it — the block is on silent machine approval, not on human review.
+    const documentType = evaluation.row.document_type ?? 'invoice'
+    if (documentType !== 'invoice') {
+      if (evaluation.review === 'approved') evaluation.review = 'needs_review'
+      if (!evaluation.reasons.includes('credit-debit-note')) {
+        evaluation.reasons = [...evaluation.reasons, 'credit-debit-note']
+      }
+      logger.info('[Extract] credit/debit note forced review', {
+        invoiceId, jobId: job.id, documentType,
+      })
+    }
+
     // Say WHY nothing could read the file: a silent empty review row was previously
     // indistinguishable from a model failure in the logs.
     if (confidenceSource === 'human' && evaluation.review === 'needs_review') {
@@ -173,7 +250,22 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     }
 
     const keyVersion = deriveKeyVersion(masterKeyHex)
-    const payload = encryptExtractedPayload(JSON.stringify(evaluation.row), masterKeyHex)
+    // Carry the machine reason codes inside the encrypted payload as a sibling
+    // key (`_reviewReasons`) so the Review list and in-chat editor can explain
+    // WHY a row was flagged, in plain English (§P0-3). No new column; readers
+    // index known fields, it never reaches the register export, and it is never
+    // logged. An approved row carries an empty list.
+    // `_recipientGstin` is likewise an informational sibling (underscore-prefixed
+    // so it is never mistaken for a candidate field) that lets P0-1c learn a
+    // client's own GSTIN from the buyer token recurring across their bills.
+    const payload = encryptExtractedPayload(
+      JSON.stringify({
+        ...evaluation.row,
+        _reviewReasons: evaluation.reasons,
+        _recipientGstin: result.candidate.recipient_gstin ?? null,
+      }),
+      masterKeyHex,
+    )
 
     await assertLease()
     const { error: recErr } = await db.from('extracted_records').upsert({
@@ -199,6 +291,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       }),
       reasonCodes: evaluation.reasons.slice(0, 8),
     })
+    timing.mark('persist')
 
     // Opt-in local debugging: print the complete field -> value map that was
     // extracted. Emitted at DEBUG level, which lib/logger drops when
@@ -249,6 +342,9 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     if (evaluation.review === 'needs_review') {
       await queueReviewNotice(db, workspaceId, job.id, invoiceId, assertLease)
     }
+    timing.mark('batch')
+    // §P2-12 one structured line per job with the per-stage breakdown (metadata only).
+    logger.info('[Extract] stage timing', { invoiceId, jobId: job.id, ...timing.summary() })
     logger.info('[Extract] complete', {
       invoiceId, jobId: job.id, review: evaluation.review,
       source: confidenceSource, reasonCodes: evaluation.reasons.slice(0, 8),
@@ -256,6 +352,23 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     })
   } finally {
     plain.fill(0) // wipe plaintext bytes on every exit path (approve, review, throw)
+  }
+}
+
+// §P3-13 translate the operator's image-quality knobs into the engine gate options.
+// The gate is ON unless explicitly disabled; only thresholds the operator actually
+// set are forwarded, so the engine applies its own sane defaults for the rest.
+function imageQualityGateFromEnv(env: ReturnType<typeof getEnv>): {
+  enabled: boolean
+  blurVarianceAtMost?: number
+  minLongEdge?: number
+  minPixels?: number
+} {
+  return {
+    enabled: env.IMAGE_QUALITY_GATE !== false,
+    ...(typeof env.IMAGE_BLUR_VARIANCE_MAX === 'number' ? { blurVarianceAtMost: env.IMAGE_BLUR_VARIANCE_MAX } : {}),
+    ...(typeof env.IMAGE_MIN_LONG_EDGE === 'number' ? { minLongEdge: env.IMAGE_MIN_LONG_EDGE } : {}),
+    ...(typeof env.IMAGE_MIN_PIXELS === 'number' ? { minPixels: env.IMAGE_MIN_PIXELS } : {}),
   }
 }
 

@@ -16,6 +16,7 @@ import { getSupabaseAdmin, bucketFor } from '@/lib/supabase/server'
 import { getAuthenticatedUserId } from '@/lib/supabase/server-session'
 import { decryptFile, resolveFileKeyConfig } from '@/lib/encryption/files'
 import { decideDownloadAccess } from '@/lib/exports/access'
+import { workbookFileName } from '@/lib/exports/naming'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -25,6 +26,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 interface WorkbookRow {
   workspace_id: string
+  batch_id: string | null
   status: string
   expires_at: string | null
   file_object_path: string
@@ -50,7 +52,7 @@ export async function GET(
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,status,expires_at,file_object_path,file_encryption_key_version')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version')
     .eq('id', id)
     .maybeSingle()
   if (readErr) {
@@ -99,10 +101,22 @@ export async function GET(
       expectedKeyVersion: workbook.file_encryption_key_version ?? undefined,
     })
 
+    // Name the register by its REAL accounting month (Billora_YYYY-MM.xlsx, §P1-5),
+    // derived only from the batch's own period_start — never a guessed month. An
+    // unresolvable period falls back to the stable generic name inside workbookFileName.
+    let periodStart: string | null = null
+    if (workbook.batch_id) {
+      const { data: batchRow } = await db
+        .from('invoice_batches').select('period_start')
+        .eq('workspace_id', workbook.workspace_id).eq('id', workbook.batch_id).maybeSingle()
+      periodStart = (batchRow as { period_start?: string | null } | null)?.period_start ?? null
+    }
+    const filename = workbookFileName(periodStart)
+
     return new Response(new Uint8Array(plain), {
       headers: {
         'Content-Type': SPREADSHEET_MIME,
-        'Content-Disposition': 'attachment; filename="billora-register.xlsx"',
+        'Content-Disposition': `attachment; filename="${filename}"`,
         'Cache-Control': 'no-store',
       },
     })

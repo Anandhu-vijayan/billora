@@ -5,13 +5,17 @@ name: Worker Tick
 # one tick of POST /api/jobs/worker per interval. On a persistent host use
 # `npm run worker:poll` instead — both call the same endpoint.
 #
+# Intake now also fires an immediate best-effort wake when it files work
+# (lib/jobs/wake.ts), so a fresh invoice starts in seconds; this schedule is the
+# durable backstop for anything a wake missed, so it runs every minute.
+#
 # The endpoint is fail-closed: without WORKER_SECRET (repo secret) and a
 # deployed APP_URL (repo variable) it returns 503/401 and this workflow is a
 # harmless no-op. Real work also needs ENCRYPTION_MASTER_KEY, STORAGE_PATH_KEY
 # and GEMINI_API_KEY configured on the deployed app.
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 permissions:

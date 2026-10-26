@@ -69,9 +69,14 @@ export function resolveTaxTreatment(row: LedgerRow): TaxTreatment {
 /**
  * The overall GST rate percentage for the line, taken ONLY from printed rate
  * evidence. For a local invoice CGST and SGST are equal halves, so the overall
- * rate is their SUM — but ONLY when BOTH halves were actually printed; a single
- * printed half is not enough to assert the whole rate, so it stays null rather
- * than being doubled by inference. Interstate uses the printed IGST rate directly.
+ * rate is their SUM — but ONLY when BOTH halves were actually printed AND AGREE
+ * (§P3-15 defence-in-depth: a genuine mixed-rate invoice produces inconsistent
+ * halves that the upstream validators already flag for review; this guard ensures
+ * that even if one such row reaches export, we NEVER blindly assert a single
+ * overall rate by summing unequal halves, which would assign a wrong ledger class).
+ * A single printed half is not enough to assert the whole rate, so it stays null
+ * rather than being doubled by inference. Interstate uses the printed IGST rate
+ * directly.
  */
 export function overallGstRatePercent(row: LedgerRow, treatment: TaxTreatment): number | null {
   if (treatment === 'interstate') {
@@ -83,6 +88,12 @@ export function overallGstRatePercent(row: LedgerRow, treatment: TaxTreatment): 
     const c = row.cgst_rate_percent
     const s = row.sgst_rate_percent
     if (typeof c === 'number' && Number.isFinite(c) && typeof s === 'number' && Number.isFinite(s)) {
+      // §P3-15: CGST and SGST are legally equal halves. If they disagree beyond
+      // a tiny epsilon the row represents a MIXED-RATE document (or a misread),
+      // and no single overall rate can faithfully classify it. Return null so
+      // the mapping status becomes 'unresolved-rate' and the operator must handle
+      // this line explicitly, rather than importing a confidently-wrong voucher.
+      if (Math.abs(c - s) > 0.001) return null
       return c + s
     }
     return null
@@ -94,6 +105,21 @@ export function overallGstRatePercent(row: LedgerRow, treatment: TaxTreatment): 
 function rateLabel(rate: number | null): string {
   if (rate === null) return 'na'
   return String(Number(rate.toFixed(2)))
+}
+
+/**
+ * §user #4b: the ledger name to WRITE when the workspace has not configured a
+ * mapping, so an accountant's register is never a column of blanks. This is a
+ * DISPLAY default only — it lives in the export path, never in `resolveLedgerName`
+ * (which stays pure: it still reports `mapping-required`/`unresolved-rate` with a
+ * null name so the operator can tell configured from defaulted). A known rate
+ * yields `Purchase @ <rate>%`; an unestablished rate yields a plain `Purchase`.
+ * It never fabricates an amount — only a conventional ledger label off the rate
+ * the row already printed.
+ */
+export function tallyDefaultLedgerName(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate)) return 'Purchase'
+  return `Purchase @ ${rateLabel(rate)}%`
 }
 
 /**

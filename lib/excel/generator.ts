@@ -48,8 +48,11 @@ export const TALLY_HEADERS = [
 ] as const;
 
 const MONEY_FMT = '#,##0.00';
-// Up to 2 decimals with no trailing zeros: 18 -> "18", 1.5 -> "1.5", 3 -> "3".
-const RATE_FMT = '0.##';
+// Up to 2 decimals, no trailing zeros, DISPLAYED with a trailing percent sign:
+// 18 -> "18%", 1.5 -> "1.5%", 5 -> "5%". The stored value stays a plain NUMBER
+// (18, not 0.18 and not the text "18%"), so Tally's importer reads a numeric rate
+// while an accountant eyeballing the sheet sees the % they expect (§user #4).
+const RATE_FMT = '0.##"%"';
 const DATE_FMT = 'DD-MM-YYYY';
 
 /** Parse a canonical `YYYY-MM-DD` date into a local Date, or null if unparseable. */

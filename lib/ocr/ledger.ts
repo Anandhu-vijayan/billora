@@ -18,6 +18,16 @@ import { parseIndianAmountWords, validateInvoiceCrossChecks } from './validators
 import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
 import { reconcileInvoiceTotal } from './calc/reconcile'
 
+/**
+ * §P3-16 The kind of source document, read from its printed TITLE (never from an
+ * amount). A CREDIT/DEBIT NOTE is a correction to an earlier invoice and carries
+ * the opposite sign, so it is ALWAYS routed to human review — a machine never
+ * auto-approves one. This is informational: it does not relax any amount validator
+ * (a negative total on a note is STILL a hard review trigger), it only ADDS context
+ * and forces review.
+ */
+export type DocumentType = 'invoice' | 'credit_note' | 'debit_note'
+
 export interface LedgerRow {
   invoice_date: string;
   invoice_number: string;
@@ -39,6 +49,11 @@ export interface LedgerRow {
   cgst_rate_percent?: number | null;
   sgst_rate_percent?: number | null;
   igst_rate_percent?: number | null;
+  /**
+   * §P3-16 the printed document type. Absent on a previously-stored payload means
+   * 'invoice' (backward compatible). A credit/debit note can never be auto-approved.
+   */
+  document_type?: DocumentType;
 }
 
 /** A raw extraction candidate: values plus an optional per-field confidence. */
@@ -75,6 +90,12 @@ export interface LedgerCandidate {
   sgst_rate_percent?: number | string | null;
   igst_rate_percent?: number | string | null;
   total_amount_in_words?: string | null;
+  /**
+   * §P3-16 the printed document type detected from the document TITLE. The AI
+   * schema never returns it, so only the local parser sets it; it survives the
+   * local/AI merge and forces human review for a credit/debit note.
+   */
+  document_type?: DocumentType;
   confidence?: Record<string, number> | null;
 }
 
@@ -100,6 +121,15 @@ export interface LedgerEvaluation {
    */
   repairs?: string[];
 }
+
+/**
+ * §clean-row rule: the model's self-report only vetoes an otherwise-valid row
+ * when it expresses GENUINE doubt on a field it actually filled. We literally tell
+ * the vision model to "never default to high", so a modest 0.6-0.79 is normal for
+ * a perfectly clean read and must NOT force a human review on its own; only belief
+ * below this floor is a real "the source guessed here" signal.
+ */
+const AI_SELF_CONFIDENCE_FLOOR = 0.6;
 
 // Mirrors lib/ocr/quality.ts GSTIN_RE exactly (kept in sync by a test).
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
@@ -223,10 +253,20 @@ function toNumber(v: number | string | null | undefined): number {
   return minor === null ? Number.NaN : minorUnitsToNumber(minor)
 }
 
+/** Does a candidate field actually carry a value? Blank text / absent amount = no. */
+function fieldHasValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false
+  if (typeof value === 'string') return value.trim() !== ''
+  if (typeof value === 'number') return Number.isFinite(value)
+  return true
+}
+
 /**
- * The model's own lowest required-field confidence, or null when it gave none.
- * This is only ever a conservative DOWNGRADE signal — it can lower trust, and
- * the auto-approve gate never rests on it alone (see measuredConfidence below).
+ * The model's own lowest confidence over the required fields it ACTUALLY filled,
+ * or null when it gave none. Absent/blank values are skipped: vision stamps a 0
+ * self-score on a null amount ("no belief because nothing there"), which the
+ * objective checks already judge — letting it drag the whole row down would flag a
+ * legitimate local bill that simply carries no IGST (§clean-row rule).
  */
 function selfConfidence(candidate: LedgerCandidate): number | null {
   const c = candidate.confidence;
@@ -234,6 +274,7 @@ function selfConfidence(candidate: LedgerCandidate): number | null {
   let min = 1;
   let seen = false;
   for (const field of REQUIRED_FIELDS) {
+    if (!fieldHasValue(candidate[field])) continue;
     const value = c[field];
     if (typeof value === 'number' && Number.isFinite(value)) {
       seen = true;
@@ -345,6 +386,11 @@ export function mergeCandidates(
       ;(merged as Record<string, unknown>)[field] = fallbackValue
     }
   }
+  // §P3-16 document type is a LOCAL structural signal (a printed Credit/Debit Note
+  // title). The AI schema never returns it, so a note read locally must survive a
+  // merge with an AI candidate that reports nothing. Prefer the primary (local) read.
+  const docType = primary.document_type ?? fallback?.document_type
+  if (docType) merged.document_type = docType
   merged.confidence = confidence
   return merged
 }
@@ -409,6 +455,13 @@ export function evaluateLedger(
     minConfidence: number
     amountToleranceMinorUnits?: number
     /** Injectable clock (tests). */ now?: Date
+    /**
+     * The workspace client's OWN GSTIN (the buyer on this purchase bill), when
+     * known. A GSTIN equal to it can NEVER be the supplier, so the evaluator
+     * rejects that assignment even when the invoice printed no separate recipient
+     * token — the common AI-path gap that let a buyer GSTIN ship as the supplier.
+     */
+    buyerGstin?: string | null
   },
 ): LedgerEvaluation {
   const reasons: string[] = [];
@@ -510,14 +563,30 @@ export function evaluateLedger(
       structureConsistent = false;
       reasons.push('cgst-sgst-unequal');
     }
+    // The client's OWN GSTIN is the buyer. Placing it in the supplier slot is a
+    // hard data-integrity error: the seller issued the bill, not the customer.
+    // Caught even when no recipient token was independently parsed (the AI-path
+    // gap). Never auto-approved; forces a targeted supplier re-read.
+    const buyer = (opts.buyerGstin ?? '').trim().toUpperCase();
+    if (buyer && gstin && gstin === buyer) {
+      structureConsistent = false;
+      reasons.push('supplier-equals-buyer');
+    }
     // Tax head vs state: same supplier/recipient state => CGST+SGST; different
-    // => IGST. Checked only when both GSTINs were actually read.
-    const recipient = (candidate.recipient_gstin ?? '').trim().toUpperCase();
+    // => IGST. Checked only when both GSTINs were actually read. The known own
+    // GSTIN stands in as the recipient when the page printed no separate one.
+    const printedRecipient = (candidate.recipient_gstin ?? '').trim().toUpperCase();
+    const recipient = printedRecipient || buyer;
     if (gstinOk && GSTIN_RE.test(recipient)) {
       const sameState = gstin.slice(0, 2) === recipient.slice(0, 2);
       if (gstin === recipient) {
-        structureConsistent = false;
-        reasons.push('supplier-equals-recipient');
+        // Identical only flags the READER's own confusion when the invoice itself
+        // printed the duplicate; the own-vs-supplier case is flagged above as
+        // 'supplier-equals-buyer' so a re-read hint names the buyer exactly.
+        if (printedRecipient) {
+          structureConsistent = false;
+          reasons.push('supplier-equals-recipient');
+        }
       } else if (sameState && igst > 0) {
         structureConsistent = false;
         reasons.push('igst-on-intrastate');
@@ -527,6 +596,18 @@ export function evaluateLedger(
       }
     }
   }
+
+  // §P3-16 resolve the printed document type for the stored row. NOTE: this is
+  // INFORMATIONAL here — it deliberately does NOT push a review reason. Forcing a
+  // credit/debit note to review is done in the extraction HANDLER (mirroring the
+  // conflict / image-quality / multi-invoice gates), so the auto-approve path is
+  // blocked for a note while a HUMAN reviewing it in applyInvoiceReview is never
+  // permanently stuck on a reason the shared re-scorer keeps re-adding. A negative
+  // total on a note is STILL a hard review trigger regardless of type.
+  const documentType: DocumentType =
+    candidate.document_type === 'credit_note' || candidate.document_type === 'debit_note'
+      ? candidate.document_type
+      : 'invoice'
 
   const crossChecks = validateInvoiceCrossChecks({
     taxableValue: candidate.taxable_value,
@@ -558,8 +639,21 @@ export function evaluateLedger(
     structureConsistent,
   }) - crossChecks.measuredConfidencePenalty);
   const self = selfConfidence(candidate);
+  // The reported gate value is unchanged: our objective measure, conservatively
+  // downgraded by any genuine source doubt (never raised by it).
   const confidence = self === null ? measuredConfidence : Math.min(measuredConfidence, self);
-  if (confidence < opts.minConfidence) reasons.push(`low-confidence:${confidence.toFixed(2)}`);
+  // §clean-row rule (user #1): a deterministically-valid row is auto-approved. We
+  // flag for review only when OUR OWN objective checks fall below the bar, OR the
+  // model reports genuine doubt (below AI_SELF_CONFIDENCE_FLOOR) on a field it
+  // actually filled. A merely-modest self-report no longer vetoes a clean bill.
+  // Every hard integrity trigger (invalid/missing GSTIN, negative or unreconciled
+  // amounts, buyer/supplier swap, conflicts, credit notes, multi-invoice) is pushed
+  // as a reason earlier and is untouched — precision is preserved, recall improves.
+  if (measuredConfidence < opts.minConfidence) {
+    reasons.push(`low-confidence:${measuredConfidence.toFixed(2)}`);
+  } else if (self !== null && self < AI_SELF_CONFIDENCE_FLOOR) {
+    reasons.push(`low-confidence:source:${self.toFixed(2)}`);
+  }
 
   const row: LedgerRow = {
     invoice_date: parsedDate ?? (candidate.invoice_date ?? '').trim(),
@@ -579,6 +673,8 @@ export function evaluateLedger(
     cgst_rate_percent: ratePercent(candidate.cgst_rate_percent),
     sgst_rate_percent: ratePercent(candidate.sgst_rate_percent),
     igst_rate_percent: ratePercent(candidate.igst_rate_percent),
+    // §P3-16 always set (defaults to 'invoice'), so a stored row is self-describing.
+    document_type: documentType,
   };
 
   return {
@@ -765,7 +861,10 @@ export function selectBestCandidate(
  * simply not on the page is never "fixed" by asking again. Returns null when
  * nothing is worth re-asking.
  */
-export function retryHintFor(reasons: readonly string[]): string | null {
+export function retryHintFor(
+  reasons: readonly string[],
+  opts?: { buyerGstin?: string | null },
+): string | null {
   const lines: string[] = [];
   for (const r of reasons) {
     if (r === 'gstin-checksum-failed' || r === 'gstin-invalid' || r === 'gstin-state-invalid') {
@@ -780,6 +879,9 @@ export function retryHintFor(reasons: readonly string[]): string | null {
       lines.push('invoice_date was missing or implausible; re-read the INVOICE date (not the due, order or delivery date).');
     } else if (r === 'supplier-equals-recipient') {
       lines.push('supplier_gstin and recipient_gstin were identical; the supplier is the seller who issued the invoice.');
+    } else if (r === 'supplier-equals-buyer') {
+      const own = (opts?.buyerGstin ?? '').trim().toUpperCase();
+      lines.push('You returned the buyer\'s OWN GSTIN' + (own ? ` (${own})` : '') + ' as supplier_gstin; that GSTIN belongs to the customer and can NEVER be the supplier. Re-read the SELLER\'s GSTIN from the "Supplier / Sold By / Invoice From" block.');
     } else if (r.startsWith('tax-rate-mismatch:') || r.startsWith('tax-rate-amount-missing:')) {
       lines.push('The printed tax percentage and extracted tax amount did not agree; re-read the taxable value, rate and corresponding tax amount. Do not calculate a replacement unless the printed values support it.');
     } else if (r === 'tax-rate-invalid:cgst' || r === 'tax-rate-invalid:sgst' || r === 'tax-rate-invalid:igst') {

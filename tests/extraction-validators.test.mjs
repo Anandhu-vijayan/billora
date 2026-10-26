@@ -204,6 +204,41 @@ test('buyer GSTIN taken as supplier is never auto-approved; correct supplier is'
   assert.equal(good.review, 'approved')
 })
 
+test('P0-1 supplier equal to the client own_gstin is flagged even with NO printed recipient', () => {
+  // The exact AI-path gap that shipped a buyer GSTIN as the supplier: the model
+  // returned only the buyer's GSTIN in supplier_gstin and printed no recipient
+  // token, so the old supplier==recipient check had nothing to compare against.
+  const base = {
+    invoice_date: '25-09-2026', invoice_number: 'AG/1839/26-27', vendor_name: 'Akkara gold',
+    taxable_value: 558592.93, cgst_amount: 8378.89,
+    sgst_amount: 8378.89, igst_amount: 0, total_amount: 575351, round_off: 0.29,
+  }
+  const bad = ledger.evaluateLedger(
+    { ...base, supplier_gstin: '32ACXPV2326B1ZL' },
+    { minConfidence: 0.8, now: NOW, buyerGstin: '32ACXPV2326B1ZL' },
+  )
+  assert.equal(bad.review, 'needs_review', 'a buyer-as-supplier row can never auto-approve')
+  assert.ok(bad.reasons.includes('supplier-equals-buyer'), 'names the buyer-vs-supplier collision specifically')
+  assert.ok(!bad.reasons.includes('supplier-equals-recipient'), 'no duplicate reason when recipient was not printed')
+  const good = ledger.evaluateLedger(
+    { ...base, supplier_gstin: '32ADRPJ8730C1ZN' },
+    { minConfidence: 0.8, now: NOW, buyerGstin: '32ACXPV2326B1ZL' },
+  )
+  assert.equal(good.review, 'approved', 'the real supplier still approves with the buyer known')
+  // Back-compat: with no own_gstin supplied, nothing new is flagged.
+  const neutral = ledger.evaluateLedger(
+    { ...base, supplier_gstin: '32ADRPJ8730C1ZN' }, { minConfidence: 0.8, now: NOW },
+  )
+  assert.equal(neutral.review, 'approved')
+  assert.ok(!neutral.reasons.includes('supplier-equals-buyer'))
+})
+
+test('P0-1 the re-read hint names the exact buyer GSTIN when supplier equals own_gstin', () => {
+  const hint = ledger.retryHintFor(['supplier-equals-buyer'], { buyerGstin: '32ACXPV2326B1ZL' })
+  assert.ok(hint && /32ACXPV2326B1ZL/.test(hint), 'the hint cites the exact buyer GSTIN')
+  assert.ok(hint && /NEVER be the supplier/i.test(hint), 'the hint forbids the buyer as supplier')
+})
+
 test('GSTIN printed with a space after the state code is still found', async () => {
   const gstin = await importTs('lib/ocr/gstin.ts')
   const hits = gstin.findAllGstins('GSTIN: 32 ADRPJ8730C1ZN\nGSTIN 32ACXPV2326B1ZL')

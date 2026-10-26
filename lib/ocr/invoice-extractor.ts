@@ -20,12 +20,16 @@ import {
   type LedgerEvaluation,
 } from '@/lib/ocr/ledger'
 import { parseInvoiceText, hasMeaningfulText } from '@/lib/ocr/text-parser'
-import { extractPdfTextLayer } from '@/lib/ocr/pdf'
+import { extractPdfTextLayerPages } from '@/lib/ocr/pdf'
 import {
   extractInvoiceFields,
   visionCallTimeoutMs,
   VisionTransientError,
 } from '@/lib/ocr/vision'
+import {
+  assessSourceImageQuality,
+  DEFAULT_IMAGE_QUALITY,
+} from '@/lib/ocr/quality'
 
 const MAX_FILE_BYTES = 15 * 1024 * 1024
 const MAX_IMAGE_PIXELS = 40_000_000
@@ -66,6 +70,39 @@ export interface InvoiceExtractionOptions {
 
   /** Maximum PDF pages to process. Defaults to 10. */
   maxPdfPages?: number
+
+  /**
+   * The workspace client's OWN GSTIN (the buyer on this purchase bill), when
+   * known. It is excluded from the supplier in the local parser and cross-checked
+   * in every evaluation, so a buyer GSTIN can never be stored or exported as the
+   * supplier. A GSTIN equal to it in the supplier slot forces a targeted re-read.
+   */
+  buyerGstin?: string | null
+
+  /**
+   * OPT-IN PARALLEL VISION (§P2-11). When true (and AI is already allowed + keyed),
+   * the FIRST Gemini pass is launched concurrently with local OCR to cut wall-clock
+   * latency, and its result is consumed even when local alone looked sufficient.
+   * Defaults to false: the shipped posture calls Gemini ONLY when local is
+   * insufficient, so no extra provider call or PII exposure happens unless the
+   * operator explicitly enables it. A second pass is still skipped whenever the
+   * sources reconcile (the merge already approves) — never more AI work than needed.
+   */
+  parallelVision?: boolean
+
+  /**
+   * §P3-13 image-quality gate for raster uploads (real sharp focus + minimum
+   * resolution). Enabled by default; the handler may override thresholds or set
+   * `enabled: false`. PDFs are exempt (they run the text-layer / rendered-page
+   * pipeline). A failing verdict only ever ADDS a reason and forces needs_review —
+   * it can never auto-approve — so it cannot weaken auto-approve precision.
+   */
+  imageQualityGate?: {
+    enabled?: boolean
+    minLongEdge?: number
+    minPixels?: number
+    blurVarianceAtMost?: number
+  }
 }
 
 export interface InvoiceExtractionResult {
@@ -81,6 +118,21 @@ export interface InvoiceExtractionResult {
    * over an unreconciled conflict so these land in the human-review queue.
    */
   conflictFields: string[]
+  /**
+   * §P3-13 machine reason codes from the raster image-quality gate (empty when the
+   * source passed, the media was a PDF, or measurement faulted open). The handler
+   * folds these into the authoritative row so a blurry / too-small bill is explained
+   * in plain English and routed to a human.
+   */
+  imageQualityReasons: string[]
+  /**
+   * §P3-14 true when the source document (a PDF) carried pages belonging to TWO OR
+   * MORE distinct invoice numbers. One invoice's group is returned as `candidate`
+   * and the rest are held back; the handler folds a `multi-invoice-document` reason
+   * and forces human review so the operator splits them. Never set for a single
+   * photo or a one-invoice PDF.
+   */
+  multiInvoiceDetected: boolean
 }
 
 export class InvoiceExtractionError extends Error {
@@ -342,23 +394,97 @@ function candidatePresentFields(candidate: LedgerCandidate | null): string[] {
 }
 
 /**
- * Combine page candidates without discarding values that were already found.
- * mergeCandidates preserves independently valid values in its primary input.
+ * Collapse an OCR/parse "invoice number" to a stable grouping key. Case and
+ * internal whitespace differences between two reads of the SAME printed number
+ * must not split one invoice into two groups, so both are normalised away.
  */
-function combinePageCandidates(
-  candidates: LedgerCandidate[],
-): LedgerCandidate | null {
-  let combined: LedgerCandidate | null = null
+function invoiceNumberKey(value: string | null | undefined): string {
+  return (value ?? '').trim().toUpperCase().replace(/\s+/g, '')
+}
+
+export interface PageInvoiceGroup {
+  candidate: LedgerCandidate
+  invoiceNumber: string | null
+}
+
+export interface GroupedPages {
+  groups: PageInvoiceGroup[]
+  /** Count of DISTINCT non-empty invoice numbers across the pages. */
+  distinctInvoiceNumbers: number
+  /** True when two or more different invoice numbers appeared on the document. */
+  multiInvoiceDetected: boolean
+}
+
+/**
+ * Group ordered page candidates by invoice number (§P3-14). A page that carries
+ * the SAME number as a prior page, or NO legible number at all (a continuation
+ * page of the same bill), merges into that invoice's group via `merge` — the
+ * same values-preserving merge the old blind combine used. A page carrying a
+ * DIFFERENT number starts a new group, so its total/GSTIN can never be blended
+ * into a different invoice's row. This is the fix for the old behaviour that
+ * concatenated every page of a 3-invoice PDF into a single bogus line.
+ */
+export function groupPageCandidates(
+  candidates: readonly LedgerCandidate[],
+  merge: (primary: LedgerCandidate, fallback: LedgerCandidate) => LedgerCandidate,
+): GroupedPages {
+  interface Bucket {
+    invoiceNumber: string | null
+    merged: LedgerCandidate | null
+  }
+  const buckets: Bucket[] = []
+  const byKey = new Map<string, Bucket>()
+  let current: Bucket | null = null
 
   for (const candidate of candidates) {
-    if (!candidateHasUsefulFields(candidate)) continue
-
-    combined = combined
-      ? mergeCandidates(combined, candidate)
-      : candidate
+    const key = invoiceNumberKey(candidate.invoice_number)
+    let target: Bucket | null = key === '' ? current : (byKey.get(key) ?? null)
+    if (!target) {
+      target = { invoiceNumber: key === '' ? null : (candidate.invoice_number ?? null), merged: null }
+      buckets.push(target)
+      if (key !== '') byKey.set(key, target)
+      current = target
+    } else if (key !== '' && target !== current) {
+      // A previously-seen number reappears (interleaved pages): extend THAT group
+      // and make it current so following numberless pages attach to it.
+      current = target
+    }
+    target.merged = target.merged ? merge(target.merged, candidate) : candidate
   }
 
-  return combined
+  const groups: PageInvoiceGroup[] = buckets.map((b) => ({ candidate: b.merged ?? {}, invoiceNumber: b.invoiceNumber }))
+  const distinct = new Set(groups.map((g) => invoiceNumberKey(g.invoiceNumber)).filter((k) => k !== ''))
+  return { groups, distinctInvoiceNumbers: distinct.size, multiInvoiceDetected: distinct.size >= 2 }
+}
+
+/**
+ * Combine page candidates WITHOUT discarding values already found, but grouped by
+ * invoice number so a multi-invoice document never becomes one blended row
+ * (§P3-14). The most complete group is returned as this document's candidate; a
+ * genuine multi-invoice document is flagged so the handler forces human review.
+ */
+function combinePageCandidates(candidates: LedgerCandidate[]): {
+  candidate: LedgerCandidate | null
+  multiInvoiceDetected: boolean
+  distinctInvoiceNumbers: number
+} {
+  const useful = candidates.filter(candidateHasUsefulFields)
+  if (useful.length === 0) {
+    return { candidate: null, multiInvoiceDetected: false, distinctInvoiceNumbers: 0 }
+  }
+  const grouped = groupPageCandidates(useful, mergeCandidates)
+  // Pick the fullest group; ties keep the earliest page order (deterministic).
+  // In the common single-invoice case there is exactly one group, so this is
+  // identical to the old blind merge — no behavioural change for one bill.
+  let best = grouped.groups[0]
+  for (const group of grouped.groups) {
+    if (candidateFieldCount(group.candidate) > candidateFieldCount(best.candidate)) best = group
+  }
+  return {
+    candidate: best.candidate,
+    multiInvoiceDetected: grouped.multiInvoiceDetected,
+    distinctInvoiceNumbers: grouped.distinctInvoiceNumbers,
+  }
 }
 
 async function loadPdfEngines(): Promise<{
@@ -387,6 +513,7 @@ async function loadPdfEngines(): Promise<{
 async function extractScannedPdf(
   buffer: Buffer,
   maxPages: number,
+  buyerGstin: string | null,
 ): Promise<{ candidates: LedgerCandidate[]; pagesProcessed: number }> {
   const { pdfjs, canvas } = await loadPdfEngines()
   const pdf = await pdfjs.getDocument({
@@ -429,7 +556,7 @@ async function extractScannedPdf(
         const text = await recognizeText(png, worker)
 
         if (hasMeaningfulText(text)) {
-          const candidate = parseInvoiceText(text)
+          const candidate = parseInvoiceText(text, { recipientGstin: buyerGstin })
           if (candidateHasUsefulFields(candidate)) candidates.push(candidate)
         }
       }
@@ -471,6 +598,29 @@ async function prepareImageForVision(buffer: Buffer): Promise<Buffer> {
 }
 
 /**
+ * The FIRST Gemini pass, factored out so the opt-in parallel launch (§P2-11) can
+ * start it concurrently with local OCR and hand the SAME promise to the decision
+ * block — there is therefore still exactly one first-pass call either way. The
+ * parameter is named `buffer` so the V6 invariant ("the 3 MB OCR PNG is never sent
+ * to Gemini") keeps holding: this is one of the only two vision prepareImageForVision
+ * call sites (the other is the bounded second pass below).
+ */
+async function runVisionFirstPass(args: {
+  buffer: Buffer; mimeType: string; apiKey: string; model: string;
+}): Promise<LedgerCandidate> {
+  const { buffer, mimeType, apiKey, model } = args
+  if (mimeType === PDF_MIME) {
+    // The existing vision helper accepts PDFs, but the caller must
+    // explicitly bound document size/pages for provider cost control.
+    return extractInvoiceFields({ buffer, mimeType: PDF_MIME, apiKey, model })
+  }
+  // Gemini's existing transport supports JPEG/PNG/WebP. Convert
+  // TIFF/BMP/GIF/HEIC/AVIF into a supported colour JPEG first.
+  const visionImage = await prepareImageForVision(buffer)
+  return extractInvoiceFields({ buffer: visionImage, mimeType: 'image/jpeg', apiKey, model })
+}
+
+/**
  * Permanent AI failures that say "the model answered but its answer did not pass
  * validation" (or the provider refused). They do NOT mean the invoice is
  * unprocessable, so the invoice settles on the local result for human review
@@ -487,19 +637,26 @@ async function extractLocal(
   buffer: Buffer,
   mimeType: string,
   maxPdfPages: number,
-): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number }> {
+  buyerGstin: string | null,
+): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean }> {
   if (mimeType === PDF_MIME) {
-    // Prefer genuine embedded text before spending CPU on OCR.
+    // Prefer genuine embedded text before spending CPU on OCR. Read it PAGE BY
+    // PAGE and group by invoice number (§P3-14), so a digital PDF holding two
+    // invoices is never concatenated into one blended row the way a single
+    // whole-document parse would.
     try {
-      const text = await extractPdfTextLayer(buffer, maxPdfPages)
+      const pagesText = await extractPdfTextLayerPages(buffer, maxPdfPages)
+      const pageCandidates = pagesText
+        .filter((text) => hasMeaningfulText(text))
+        .map((text) => parseInvoiceText(text, { recipientGstin: buyerGstin }))
+        .filter((cand) => candidateHasUsefulFields(cand))
 
-      if (hasMeaningfulText(text)) {
-        const candidate = parseInvoiceText(text)
-        if (candidateHasUsefulFields(candidate)) {
-          return {
-            candidate,
-            pagesProcessed: 0,
-          }
+      if (pageCandidates.length > 0) {
+        const combined = combinePageCandidates(pageCandidates)
+        return {
+          candidate: combined.candidate,
+          pagesProcessed: 0,
+          multiInvoiceDetected: combined.multiInvoiceDetected,
         }
       }
     } catch {
@@ -507,11 +664,13 @@ async function extractLocal(
       // Continue to raster/OCR, which will raise a clear error if unavailable.
     }
 
-    const scanned = await extractScannedPdf(buffer, maxPdfPages)
+    const scanned = await extractScannedPdf(buffer, maxPdfPages, buyerGstin)
+    const combined = combinePageCandidates(scanned.candidates)
 
     return {
-      candidate: combinePageCandidates(scanned.candidates),
+      candidate: combined.candidate,
       pagesProcessed: scanned.pagesProcessed,
+      multiInvoiceDetected: combined.multiInvoiceDetected,
     }
   }
 
@@ -528,11 +687,12 @@ async function extractLocal(
     })
   }
 
-  const parsed = meaningful ? parseInvoiceText(text) : null
+  const parsed = meaningful ? parseInvoiceText(text, { recipientGstin: buyerGstin }) : null
 
   return {
     candidate: parsed && candidateHasUsefulFields(parsed) ? parsed : null,
     pagesProcessed: 1,
+    multiInvoiceDetected: false,
   }
 }
 
@@ -556,6 +716,7 @@ export async function extractInvoice(
     apiKey,
     model = 'gemini-flash-lite-latest',
     maxPdfPages = MAX_PDF_PAGES,
+    buyerGstin = null,
   } = options
 
   const mimeType = normalizeMimeType(options.mimeType)
@@ -572,11 +733,33 @@ export async function extractInvoice(
   let pagesProcessed = 0
   let localErrorCode: string | null = null
   let conflictFields: string[] = []
+  let imageQualityReasons: string[] = []
+  let multiInvoiceDetected = false
+
+  // OPT-IN PARALLEL VISION (§P2-11). Off unless the caller AND the operator enable
+  // it, so the default local-first posture is untouched: Gemini is contacted only
+  // when local is insufficient. When on, the FIRST pass launches concurrently with
+  // local OCR to halve latency; the same promise is consumed below, so there is
+  // still exactly one first-pass call. A speculative call local makes unnecessary is
+  // guarded against an unhandled rejection but its spend is the explicit trade-off.
+  const parallelVision = options.parallelVision === true && allowAI && Boolean(apiKey)
+  let speculativeAi: Promise<LedgerCandidate> | null = null
+  let aiStartedAt = 0
+  if (parallelVision) {
+    aiStartedAt = Date.now()
+    speculativeAi = runVisionFirstPass({ buffer, mimeType, apiKey: apiKey as string, model })
+    speculativeAi.catch(() => undefined) // an unused speculative call must stay silent
+    logger.info('[Extract] vision first pass launched in parallel with local OCR', { model, mimeType })
+  }
+
+  // §P2-12 local OCR stage start (measured in the finally below).
+  const localStartedAt = Date.now()
 
   try {
-    const local = await extractLocal(buffer, mimeType, maxPdfPages)
+    const local = await extractLocal(buffer, mimeType, maxPdfPages, buyerGstin)
     candidate = local.candidate
     pagesProcessed = local.pagesProcessed
+    multiInvoiceDetected = local.multiInvoiceDetected
 
     if (candidate) source = 'local'
   } catch (error) {
@@ -586,10 +769,16 @@ export async function extractInvoice(
       ? error.message.split(':')[0]
       : 'LOCAL_EXTRACTION_FAILED'
     if (!allowAI) throw error
+  } finally {
+    // §P2-12 local OCR stage timing (metadata only), recorded whether it succeeded
+    // or threw into the AI fallback, so a slow/blinking local engine is attributable.
+    logger.info('[Extract] local OCR stage complete', {
+      mimeType, durationMs: Date.now() - localStartedAt, localErrorCode,
+    })
   }
 
   let evaluation = candidate
-    ? evaluateLedger(candidate, { minConfidence, amountToleranceMinorUnits })
+    ? evaluateLedger(candidate, { minConfidence, amountToleranceMinorUnits, buyerGstin })
     : null
 
   logger.info('[Extract] local evaluation complete', {
@@ -606,7 +795,9 @@ export async function extractInvoice(
 
   const needsAI = !evaluation || evaluation.review === 'needs_review'
 
-  if (allowAI && needsAI) {
+  // Enter when local was insufficient, OR when a parallel first pass was already
+  // launched so its result is consumed rather than orphaned (§P2-11).
+  if (allowAI && (needsAI || speculativeAi !== null)) {
     if (!apiKey) {
       throw new InvoiceExtractionError('AI_ENABLED_BUT_API_KEY_MISSING')
     }
@@ -619,37 +810,23 @@ export async function extractInvoice(
       reasonCodes: evaluation?.reasons.slice(0, 8) ?? ['local-candidate-missing'],
       localErrorCode,
     })
-    const aiStartedAt = Date.now()
+    if (!aiStartedAt) aiStartedAt = Date.now()
     try {
-      let aiCandidate: LedgerCandidate
-
-      if (mimeType === PDF_MIME) {
-        // The existing vision helper accepts PDFs, but the caller must
-        // explicitly bound document size/pages for provider cost control.
-        aiCandidate = await extractInvoiceFields({
-          buffer,
-          mimeType: PDF_MIME,
-          apiKey,
-          model,
-        })
-      } else {
-        // Gemini's existing transport supports JPEG/PNG/WebP.
-        // Convert TIFF/BMP/GIF/HEIC/AVIF into a supported PNG first.
-        const visionImage = await prepareImageForVision(buffer)
-
-        aiCandidate = await extractInvoiceFields({
-          buffer: visionImage,
-          mimeType: 'image/jpeg',
-          apiKey,
-          model,
-        })
-      }
+      // Reuse the parallel first pass when one was launched, otherwise call now.
+      // Either way there is exactly ONE first-pass vision call (the V6 invariant).
+      const firstPass = speculativeAi ?? runVisionFirstPass({ buffer, mimeType, apiKey, model })
+      speculativeAi = null
+      let aiCandidate: LedgerCandidate = await firstPass
+      // §P2-12 vision first-pass stage timing (metadata only).
+      logger.info('[Extract] vision first pass complete', {
+        model, mimeType, durationMs: Date.now() - aiStartedAt,
+      })
 
       let assisted = candidate
         ? mergeCandidates(candidate, aiCandidate)
         : aiCandidate
 
-      let aiEvaluation = evaluateLedger(assisted, { minConfidence, amountToleranceMinorUnits })
+      let aiEvaluation = evaluateLedger(assisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
       let secondPass = false
       // Bounded second pass: a targeted re-read can fix a misread digit, a
       // swapped party or a wrong total — but a field simply absent from the
@@ -658,7 +835,7 @@ export async function extractInvoice(
       // still forbids guessing and the merge below can never downgrade a
       // validated local approval.
       if (aiEvaluation.review === 'needs_review') {
-        const hint = retryHintFor(aiEvaluation.reasons)
+        const hint = retryHintFor(aiEvaluation.reasons, { buyerGstin })
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
         // The second read runs only if elapsed AI time plus one more ceiling fits
@@ -689,7 +866,7 @@ export async function extractInvoice(
           const retryAssisted = candidate
             ? mergeCandidates(candidate, retryCandidate)
             : retryCandidate
-          const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits })
+          const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
           logger.info('[Extract] AI second pass completed', {
             model,
             durationMs: Date.now() - aiStartedAt,
@@ -830,16 +1007,43 @@ export async function extractInvoice(
     source = 'human'
   }
 
+  // §P3-13 real image-quality gate (raster only; PDFs run their own text-layer /
+  // rendered-page pipeline). A blurry or too-small source is an unreliable read, so
+  // it is flagged with a machine reason code and forced to review. It can ONLY ever
+  // add a reason (never bless a row), so it cannot weaken auto-approve precision.
+  // On unless the caller disables it; a measurement fault fails OPEN inside the glue.
+  if (mimeType !== PDF_MIME && options.imageQualityGate?.enabled !== false) {
+    const gate = options.imageQualityGate ?? {}
+    const verdict = await assessSourceImageQuality(buffer, {
+      minLongEdge: gate.minLongEdge ?? DEFAULT_IMAGE_QUALITY.minLongEdge,
+      minPixels: gate.minPixels ?? DEFAULT_IMAGE_QUALITY.minPixels,
+      blurVarianceAtMost: gate.blurVarianceAtMost ?? DEFAULT_IMAGE_QUALITY.blurVarianceAtMost,
+    })
+    imageQualityReasons = verdict.reasons
+    if (imageQualityReasons.length > 0) {
+      logger.info('[Extract] source image failed the quality gate', {
+        mimeType, reasons: imageQualityReasons,
+        longEdge: verdict.longEdge, pixels: verdict.pixels, focusScore: verdict.focusScore,
+      })
+    }
+  }
+
   // A critical-field conflict between the two sources is unreconciled
   // disagreement: even a row that would otherwise auto-approve must NOT be
   // silently blessed over it. Record it as an explicit, actionable reason and
   // force human review (the handler enforces the same rule on its re-evaluation).
+  // A multi-invoice document (§P3-14) is likewise never blessed: one of its
+  // invoices was chosen for this row and the others were dropped, so a human must
+  // split it. This can only ADD a reason and push to review, never approve.
   const finalReasons = [
     ...evaluation.reasons,
     ...conflictFields.map((field) => `candidate-conflict:${field}`),
+    ...imageQualityReasons,
+    ...(multiInvoiceDetected ? ['multi-invoice-document'] : []),
   ]
   const finalReview: 'approved' | 'needs_review' =
-    evaluation.review === 'approved' && conflictFields.length > 0
+    evaluation.review === 'approved' &&
+    (conflictFields.length > 0 || imageQualityReasons.length > 0 || multiInvoiceDetected)
       ? 'needs_review'
       : evaluation.review
 
@@ -851,5 +1055,7 @@ export async function extractInvoice(
     reasons: finalReasons,
     pagesProcessed,
     conflictFields,
+    imageQualityReasons,
+    multiInvoiceDetected,
   }
 }

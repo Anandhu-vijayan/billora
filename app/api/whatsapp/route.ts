@@ -11,12 +11,12 @@ import { downloadWhatsAppMedia, isPermanentMediaFailure, type DownloadedMedia } 
 import { senderHmac, senderLabel } from '@/lib/whatsapp/identity';
 import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
-import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState } from '@/lib/whatsapp/sessions';
-import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, sendReviewEditList, type SendOutcome } from '@/lib/whatsapp/send';
+import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState, claimUploadAck } from '@/lib/whatsapp/sessions';
+import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, type SendOutcome } from '@/lib/whatsapp/send';
 import { composeReviewEditorMessage, REVIEW_EDIT_HELP } from '@/lib/whatsapp/review-edit';
 import {
   ensureIndividualWorkspace, ensureOrganizationWorkspace,
-  listClients, createClient, verifyClientInWorkspace,
+  listClients, createClient, verifyClientInWorkspace, setClientOwnGstin,
 } from '@/lib/whatsapp/provision';
 import {
   claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed,
@@ -27,7 +27,14 @@ import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
   composeConfirmResultMessage, type ConfirmOutcome,
 } from '@/lib/whatsapp/finalize';
-import { listPendingReview, confirmInvoice, listEditableInvoices, loadInvoiceForEdit, applyInvoiceEdit } from '@/lib/whatsapp/review-confirm';
+import { listPendingReviewPage, confirmInvoice, approveAllPending, loadInvoiceForEdit, applyInvoiceEdit } from '@/lib/whatsapp/review-confirm';
+// Opt-in proactive delivery (§P1-6). The pure gate reads the flag/key/window; the
+// store seals/clears the owner's wa_id under the SEPARATE proactive key. Consent is
+// only ever persisted when BOTH the feature flag AND the key are configured, and the
+// raw number is never logged on any path.
+import { proactiveDeliveryEnabled, proactiveKeyConfigured } from '@/lib/whatsapp/proactive';
+import { setProactiveConsent } from '@/lib/whatsapp/proactive-store';
+import { suggestOwnGstin } from '@/lib/invoices/own-gstin-suggest';
 import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
 
 export async function GET(req: Request) {
@@ -63,6 +70,16 @@ function describeFieldErrors(label: string, errors: Array<{ field: string; code:
             : 'was not accepted';
   return `I could not save that change — ${label} ${reason(errors[0]?.code ?? '')}.`;
 }
+
+/**
+ * How long a sent upload acknowledgment suppresses further acks (§user: one
+ * confirmation per burst, not one per file). A multi-file send arrives as
+ * several near-simultaneous webhooks; the atomic claim in sessions.claimUploadAck
+ * lets only the first through, and this window re-arms the slot so a genuinely
+ * later batch still gets exactly one ack. Five minutes comfortably spans a burst
+ * of forwarded PDFs without going quiet for a fresh working session.
+ */
+const UPLOAD_ACK_COALESCE_MS = 5 * 60 * 1000;
 
 interface IncomingMedia { id?: string; mime_type?: string; caption?: string; filename?: string }
 interface InteractiveReply { id?: string; title?: string }
@@ -105,6 +122,15 @@ async function handleOnboardingSideEffects(
   // Computed during side effects (which run BEFORE persist+send) so a DB write is
   // never reordered ahead of its persistence guard.
   let editReplyBody: string | null = null;
+  // The reply for an optional own-GSTIN capture turn (§P0-1b), computed in the
+  // side-effects block after the tenant-scoped, migration-safe write attempt.
+  let gstinReplyBody: string | null = null;
+  // The reply for a proactive opt-in/opt-out turn (§P1-6), computed in the
+  // side-effects block after the consent write (which seals/clears the wa_id).
+  let proactiveReplyBody: string | null = null;
+  // The reply for a bulk "approve all" turn (§P1-7): the honest counts of what was
+  // filed vs. what still needs a specific correction (never a forced approval).
+  let approveAllSummary: string | null = null;
 
   // ---- provisioning + pending resolution (may rewrite nextState) ----
   if (result.note === 'individual-selected') {
@@ -145,6 +171,50 @@ async function handleOnboardingSideEffects(
   } else if (result.note === 'pending-confirm-no') {
     // Client stays active for FUTURE uploads; held files are NOT reassigned.
     pendingClientId = null;
+  } else if (result.note.startsWith('gstin-set:') || result.note === 'gstin-clear') {
+    // Optional own-GSTIN capture (§P0-1b). Persist to the ACTIVE client, tenant-
+    // scoped and migration-safe, and never change the state (this is a side note,
+    // not a conversation turn). A near-miss value never reaches here: the pure
+    // parser only emits `gstin-set:<VALUE>` for a checksum-valid GSTIN.
+    const isSet = result.note.startsWith('gstin-set:')
+    const value = isSet ? result.note.slice('gstin-set:'.length) : null
+    if (!workspaceId || !clientId) {
+      gstinReplyBody = 'Select a client first (send Change client), then send "My GSTIN <number>" so I attach it to the right client.'
+    } else {
+      const r = await setClientOwnGstin(db, workspaceId, clientId, value)
+      gstinReplyBody = r.ok
+        ? (isSet
+            ? `Saved. I will now treat ${value} as your own (buyer) GSTIN and never file it as a supplier.`
+            : 'Cleared — no own GSTIN is saved for this client.')
+        : r.reason === 'NOT_MIGRATED'
+          ? 'I could not save that GSTIN yet — this workspace needs a one-time update first. Your invoices are still processed, just without the own-GSTIN cross-check.'
+          : r.reason === 'NOT_FOUND'
+            ? 'That client is no longer available — send Change client to pick one, then retry.'
+            : 'I could not save that GSTIN right now — please try again in a moment.'
+    }
+    result.note = isSet ? 'gstin-set' : 'gstin-clear'
+  } else if (result.note === 'proactive-enable' || result.note === 'proactive-disable') {
+    // Opt-in proactive delivery (§P1-6). A side note — never changes state. Consent
+    // is only ACTED ON (the number sealed + stored) when the operator has switched
+    // the feature on AND configured the separate key; otherwise we acknowledge the
+    // intent and store NOTHING. Opting out always clears consent + the sealed value.
+    const enable = result.note === 'proactive-enable';
+    if (!workspaceId) {
+      proactiveReplyBody = 'Finish setup first — send Hi, then reply "Proactive on".';
+    } else if (enable && !(proactiveDeliveryEnabled() && proactiveKeyConfigured())) {
+      proactiveReplyBody = 'Proactive delivery is not switched on for this workspace yet, so I can only send your register when you message. Nothing was stored — reply "Proactive on" once it is enabled.';
+    } else {
+      const r = await setProactiveConsent(db, hmac, { enabled: enable, waId: enable ? to : null });
+      proactiveReplyBody = r.ok
+        ? (enable
+            ? 'Done — I can now push your finished register to this number without waiting for you to message (only while WhatsApp\'s 24-hour delivery window is open). Reply "Proactive off" anytime to stop.'
+            : 'OK — I have turned off proactive delivery and removed your number from the push list. Your register will be sent when you message. Reply "Proactive on" to allow pushes again anytime.')
+        : r.reason === 'NOT_MIGRATED'
+          ? 'I noted that, but proactive delivery needs a one-time update here before it can work — for now I\'ll still send your register when you message.'
+          : r.reason === 'NO_KEY'
+            ? 'Proactive delivery is on but not fully configured, so I can\'t store your number safely yet. For now I\'ll send your register when you message.'
+            : 'I could not update proactive delivery right now — please try again in a moment.';
+    }
   } else if (result.note === 'review-confirm' && result.invoiceId) {
     // A tapped Confirm row on the Review list: approve that invoice through the
     // SHARED review path, scoped to the sender's own workspace. The action runs
@@ -160,6 +230,28 @@ async function handleOnboardingSideEffects(
           sender: label, error: e instanceof Error ? e.message : String(e),
         });
         confirmOutcome = { ok: false, error: 'FAULT' };
+      }
+    }
+  } else if (result.note === 'review-approve-all') {
+    // Bulk approval (§P1-7). Every row goes through confirmInvoice — the SAME shared,
+    // re-validating path a single tap uses — so "approve all" never bypasses a
+    // validator: an invoice that still fails to reconcile stays needs_review and is
+    // reported honestly, never force-filed. Bounded + idempotent (safe on redelivery).
+    if (!workspaceId) {
+      approveAllSummary = "You're not set up yet — send Hi to begin, then Review to approve invoices.";
+    } else {
+      try {
+        const r = await approveAllPending(db, workspaceId, 25);
+        const parts: string[] = [];
+        if (r.approved > 0) parts.push(`${r.approved} invoice(s) approved for the register.`);
+        if (r.stillPending > 0) parts.push(`${r.stillPending} still need attention — a value did not add up, so nothing was forced through.`);
+        if (r.failed > 0) parts.push(`${r.failed} could not be processed right now — please try again in a moment.`);
+        approveAllSummary = parts.length > 0
+          ? `Approve all: ${parts.join(' ')} Your register is sent here automatically once everything is filed.`
+          : 'Nothing was ready for bulk approval — every flagged invoice still needs a specific correction. Reply Review to see the list.';
+      } catch (e) {
+        logger.warn('[WhatsApp] approve-all failed', { sender: label, error: e instanceof Error ? e.message : String(e) });
+        approveAllSummary = 'I could not complete the bulk approval right now — please try again in a moment.';
       }
     }
   } else if (result.note.startsWith('review-edit')) {
@@ -179,7 +271,7 @@ async function handleOnboardingSideEffects(
         // ENTER the editor (tapped an Edit row): read-only, shows the stored row.
         editInvoiceId = invoiceId;
         const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
-        if (load.ok) editReplyBody = composeReviewEditorMessage(load.row);
+        if (load.ok) editReplyBody = composeReviewEditorMessage(load.row, { reasons: load.reasons });
         else if (load.error === 'NOT_PENDING') editReplyBody = 'That invoice is no longer pending review — send Review to see the current list.';
         else if (load.error === 'NOT_FOUND') editReplyBody = 'That invoice was not found — send Review to see the current list.';
         else editReplyBody = 'I could not open that invoice right now — please try again in a moment.';
@@ -189,7 +281,7 @@ async function handleOnboardingSideEffects(
           const note = outcome.approvable
             ? 'Saved. Everything checks out now — reply APPROVE to file it for the register.'
             : 'Saved. It is still flagged because something does not add up — correct another field, or reply APPROVE only if you are sure.';
-          editReplyBody = composeReviewEditorMessage(outcome.row, { note });
+          editReplyBody = composeReviewEditorMessage(outcome.row, { note, reasons: outcome.reasons });
         } else if (outcome.fieldErrors && outcome.fieldErrors.length > 0) {
           // Never silently drop a malformed value: name the field + why.
           editReplyBody = `${describeFieldErrors(cmd.field.label, outcome.fieldErrors)}\n\n${REVIEW_EDIT_HELP}`;
@@ -217,7 +309,7 @@ async function handleOnboardingSideEffects(
           // Not approvable yet: stay in the editor and re-show it truthfully.
           const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
           if (load.ok) {
-            editReplyBody += '\n\n' + composeReviewEditorMessage(load.row, { header: 'Still needs a fix before it can be approved:', note: 'Correct a field above, or reply CANCEL to leave it flagged.' });
+            editReplyBody += '\n\n' + composeReviewEditorMessage(load.row, { header: 'Still needs a fix before it can be approved:', note: 'Correct a field above, or reply CANCEL to leave it flagged.', reasons: load.reasons });
           } else {
             editInvoiceId = null; result.nextState = 'collecting';
           }
@@ -301,6 +393,28 @@ async function handleOnboardingSideEffects(
     await updateSessionDeliveryState(db, hmac, { last_reply_error_code: o });
     await deliverText(menuText({ ...snapshot, workspaceId: workspace ? (workspaceId ?? snapshot.workspaceId) : null }));
   };
+  // §P1-7: send ONE page of the confirmable review list, carrying an "Approve all"
+  // control and a "Next" row when more remain. Read-only + best-effort: a failure
+  // leaves the truthful text guidance as the only reply (never a broken list send).
+  // The page is sized (REVIEW_PAGE_SIZE) so items + the two controls stay <= 10 rows.
+  const sendReviewPage = async (page: number): Promise<void> => {
+    if (!workspaceId) return;
+    try {
+      const pg = await listPendingReviewPage(db, workspaceId, page);
+      if (pg.items.length === 0) return;
+      const remaining = Math.max(0, pg.total - pg.page * pg.pageSize);
+      const nextCount = pg.hasMore ? Math.min(pg.pageSize, remaining) : 0;
+      const outcome = await sendReviewList(to, pg.items, { approveAllCount: pg.total, page: pg.page, nextCount });
+      if (outcome !== 'ok') {
+        logger.warn('[WhatsApp] review confirm list send failed', { sender: label, outcome });
+      }
+      track(outcome);
+    } catch (e) {
+      logger.warn('[WhatsApp] review confirm list unavailable', {
+        sender: label, error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
   const countNeedsReview = async (): Promise<number> => {
     if (!workspaceId) return 0;
     const { count } = await db.from('invoices').select('id', { count: 'exact', head: true })
@@ -349,12 +463,20 @@ async function handleOnboardingSideEffects(
       || result.note === 'change-client-requested') {
       if (workspaceId) track(await sendClientList(to, await listClients(db, workspaceId)));
     } else if (result.note.startsWith('client-name:')) {
-      await deliverText('Client saved. Send invoice PDFs or photos here.');
+      await deliverText('Client saved. Send invoice PDFs or photos here. Optional: send "My GSTIN <number>" so I never mistake your own GSTIN for a supplier\'s.');
     } else if (result.note === 'client-selected') {
-      await deliverText('Client selected. Send invoice PDFs or photos here.');
+      await deliverText('Client selected. Send invoice PDFs or photos here. Optional: send "My GSTIN <number>" so I never mistake your own GSTIN for a supplier\'s.');
     } else if (result.note === 'client-selection-rejected') {
       await deliverText('That client is not available. Choose from the list below.');
       if (workspaceId) track(await sendClientList(to, await listClients(db, workspaceId)));
+    } else if (result.note === 'gstin-set' || result.note === 'gstin-clear') {
+      // Own-GSTIN capture reply (§P0-1b). The set/clear note is normalised by the
+      // side-effects block, and the write already happened before this send.
+      await deliverText(gstinReplyBody ?? 'Done.');
+    } else if (result.note === 'proactive-enable' || result.note === 'proactive-disable') {
+      // Proactive opt-in/opt-out reply (§P1-6). Consent was persisted (or softly
+      // declined) in the side-effects block before this send.
+      await deliverText(proactiveReplyBody ?? 'Done.');
     } else if (result.note === 'awaiting-pending-confirm' || result.note === 'pending-confirm-stale') {
       // noop: handled by the confirm branch below / generic text.
     } else if (result.note === 'pending-confirm-yes') {
@@ -394,47 +516,45 @@ async function handleOnboardingSideEffects(
             : 'Nothing needs your attention right now — keep sending invoices.';
         }
       }
+      // §P0-1c: when the active client never set its own (buyer) GSTIN, a
+      // recipient GSTIN recurring on >=3 of their bills is a strong candidate —
+      // but a machine must NEVER silently rewrite a fact that drives the
+      // supplier==buyer guard. Surface a plain-English SUGGESTION and let the
+      // reviewer confirm it (reply `My GSTIN <value>`). Best-effort: a missing
+      // key, read or decrypt failure leaves the truthful reply untouched.
+      if (workspaceId && clientId) {
+        try {
+          const { masterKeyHex: suggestKey } = resolveFileKeyConfig();
+          const hint = await suggestOwnGstin(db, { workspaceId, clientId, masterKeyHex: suggestKey, minCount: 3 });
+          if (hint.suggestion) {
+            body += `\n\nAlso: ${hint.suggestion} looks like it might be your own GSTIN — it appears as the recipient on ${hint.count} of your invoices. If that's right, reply "My GSTIN ${hint.suggestion}" and I'll never file it as a supplier. If not, just ignore this.`;
+          }
+        } catch { /* suggestion is a bonus; never break the review reply */ }
+      }
       const held = waiting > 0 ? ` Also: ${waiting} file(s) are held for a client — send Change client to assign them.` : '';
       await deliverText(body + held);
-      // Offer tappable confirmations for pending invoices that can be approved
-      // as-is. Best-effort: missing keys or a read failure leaves the truthful
-      // text guidance above as the only reply (never a broken interactive send).
+      // §P1-7: one confirmable page (with an "Approve all" control + a "Next" row
+      // when more remain) instead of a single unbounded 10-row list. Best-effort.
+      // §user #2: ONE combined Review & edit screen. The list rows now carry
+      // `billora:review:edit:<id>` ids, so tapping any invoice OPENS the combined
+      // editor (view every field, correct any field, then reply APPROVE) — the
+      // separate edit picker is gone. `listPendingReviewPage` widens its eligibility
+      // to cover EVERY needs_review invoice (including unbatched / numberless ones
+      // whose only problem is a missing date or number), so nothing becomes
+      // unreachable now that the second list is removed. Best-effort: a read/send
+      // failure leaves the truthful text guidance above as the only reply.
       if (workspaceId) {
-        try {
-          const pending = await listPendingReview(db, workspaceId);
-          if (pending.length > 0) {
-            const outcome = await sendReviewList(to, pending);
-            if (outcome !== 'ok') {
-              logger.warn('[WhatsApp] review confirm list send failed', { sender: label, outcome });
-            }
-            track(outcome);
-          }
-        } catch (e) {
-          // Interactive confirm unavailable; the truthful text guidance above was
-          // already sent. Log so a query/decrypt regression is never silent.
-          logger.warn('[WhatsApp] review confirm list unavailable', {
-            sender: label, error: e instanceof Error ? e.message : String(e),
-          });
-        }
-        // Then offer the EDIT picker over ALL needs_review invoices (including
-        // unbatched ones whose only problem is a missing date/number, which the
-        // confirm list deliberately omits). Best-effort: a read/send failure leaves
-        // the text guidance above as the reply — never a broken interactive send.
-        try {
-          const editable = await listEditableInvoices(db, workspaceId);
-          if (editable.length > 0) {
-            const outcome = await sendReviewEditList(to, editable);
-            if (outcome !== 'ok') {
-              logger.warn('[WhatsApp] review edit list send failed', { sender: label, outcome });
-            }
-            track(outcome);
-          }
-        } catch (e) {
-          logger.warn('[WhatsApp] review edit list unavailable', {
-            sender: label, error: e instanceof Error ? e.message : String(e),
-          });
-        }
+        await sendReviewPage(1);
       }
+    } else if (result.note === 'review-page') {
+      // §P1-7: page through a review list longer than the 10-row cap. No re-summary
+      // (the reviewer already saw it on the first Review) — just the requested page.
+      await sendReviewPage(result.page ?? 2);
+    } else if (result.note === 'review-approve-all') {
+      // §P1-7: bulk approval already ran (with re-validation) in the side-effects
+      // block; deliver the honest counts, then re-show any row that stayed flagged.
+      await deliverText(approveAllSummary ?? 'Done.');
+      await sendReviewPage(1);
     } else if (result.note === 'review-confirm') {
       await deliverText(composeConfirmResultMessage(confirmOutcome ?? { ok: false, error: 'FAULT' }));
     } else if (result.note === 'review-confirm-invalid') {
@@ -640,37 +760,46 @@ async function resendPendingReply(db: Db, hmac: string, to: string): Promise<voi
       .eq('sender_hmac', hmac).maybeSingle();
     const rawBody = (data?.pending_reply_body as string | null) ?? null;
     if (!rawBody) return;
-    // A register handoff carries its workbook id in a leading [[deliver:<uuid>]]
-    // token (or, for a body written before that marker, an embedded download
-    // link). Deliver the decrypted file itself into the chat — the web link is
-    // unreachable for a WhatsApp-only owner (no login exists). Strip the internal
-    // token so any text fallback shows only human copy, and fall back to the text
-    // link only if document delivery is not possible.
-    const token = /^\[\[deliver:([0-9a-f-]{36})\]\]\s*/i.exec(rawBody);
-    const workbookId = token?.[1]
-      ?? /\/api\/exports\/([0-9a-f-]{36})\/download/i.exec(rawBody)?.[1];
-    const body = token ? rawBody.slice(token[0].length) : rawBody;
-    if (workbookId) {
-      const r = await deliverWorkbookToWhatsApp(db, { workbookId, to });
-      if (r.delivered) {
-        await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
-        logger.info('[WhatsApp] deferred register delivered as document', { workbookId });
+    // A register handoff carries one or more leading [[deliver:<uuid>]] tokens —
+    // one per ready workbook that finished since the last inbound (a multi-month
+    // burst can queue several). Deliver EACH decrypted file into the chat; the web
+    // link is unreachable for a WhatsApp-only owner (no login exists). Strip every
+    // internal token so any text fallback shows only human copy, and fall back to
+    // the text link only if document delivery is not possible.
+    const workbookIds = [...rawBody.matchAll(/\[\[deliver:([0-9a-f-]{36})\]\]/gi)].map((m) => m[1]);
+    const body = rawBody.replace(/\s*\[\[deliver:[0-9a-f-]{36}\]\]/gi, '').trim();
+    if (workbookIds.length > 0) {
+      const outstanding: string[] = [];
+      let deliveredCount = 0;
+      for (const workbookId of workbookIds) {
+        const r = await deliverWorkbookToWhatsApp(db, { workbookId, to });
+        if (r.delivered) { deliveredCount += 1; continue }
+        // NOT yet in the chat but could succeed later: keep THIS handoff so the
+        // next inbound retries the document. Falling through here would send the
+        // reassuring "I'll send the Excel" text and, on a successful text send,
+        // clear the slot — stranding a 'ready' workbook forever with the file
+        // never arriving. A 'skipped' (gone/expired/not-ready) workbook has nothing
+        // to retry, so it is simply dropped from the set below.
+        if (r.outcome === 'transient' || r.outcome === 'blocked') outstanding.push(workbookId);
+      }
+      if (outstanding.length > 0) {
+        // Re-arm the slot with ONLY the still-outstanding tokens and stay silent;
+        // the current message is still handled normally, and these retry next time.
+        const kept = outstanding.map((id) => `[[deliver:${id}]]`).join('\n');
+        await updateSessionDeliveryState(db, hmac, { pending_reply_body: `${kept}\n${body}`.trim(), last_reply_error_code: null });
+        logger.warn('[WhatsApp] some deferred registers still pending; retrying next inbound', { outstanding: outstanding.length });
         return;
       }
-      // The file is NOT yet in the chat. A transient/blocked send must KEEP the
-      // handoff so the next inbound retries the document. Falling through here
-      // would send the reassuring "I'll send the Excel" text, and a successful
-      // text send clears the slot — stranding a 'ready' workbook forever with
-      // the file never arriving. Stay silent on this inbound; the current message
-      // is still handled normally below, and the register retries next time.
-      if (r.outcome === 'transient' || r.outcome === 'blocked') {
-        logger.warn('[WhatsApp] deferred register still pending; retrying next inbound', { workbookId, outcome: r.outcome });
+      // Every register landed or is gone. When at least one file arrived, the
+      // document IS the reply — clear the handoff and say nothing further.
+      await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
+      if (deliveredCount > 0) {
+        logger.info('[WhatsApp] deferred register(s) delivered as document', { count: deliveredCount });
         return;
       }
-      // 'skipped': the workbook is gone/expired/not-ready — nothing left to retry,
-      // so fall through and send the text once, then clear the handoff.
+      // All were 'skipped' (nothing landed): fall through to the one-time text.
     }
-    const o = await sendText(to, body, workbookId ? { workbookId } : undefined);
+    const o = await sendText(to, body, workbookIds[0] ? { workbookId: workbookIds[0] } : undefined);
     if (o === 'ok') {
       await updateSessionDeliveryState(db, hmac, { pending_reply_body: null, last_reply_error_code: null });
       logger.info('[WhatsApp] deferred reply resent');
@@ -873,15 +1002,20 @@ async function processMessage(
   // Acknowledge a freshly-filed invoice so a clean upload is never silent
   // (rule 5: send is best-effort — a delivery failure never rewinds the
   // accepted intake). A webhook redelivery dedups to the same invoice/job and
-  // stays quiet, so Meta retries never double-ping the sender. After the FIRST
-  // ack in a session, subsequent clean uploads are silent (no repetitive nag).
-  const alreadyAcked = !!mSession.upload_ack_sent_at;
-  if (!deduped && !alreadyAcked) {
-    const held = waiting > 0 && clientId
-      ? ` Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them.`
-      : '';
-    const o = await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
-    if (o === 'ok') await updateSessionDeliveryState(db, mHmac, { upload_ack_sent_at: new Date().toISOString() });
+  // stays quiet, so Meta retries never double-ping the sender. §user: a burst of
+  // files uploaded together arrives as separate near-simultaneous webhooks, so a
+  // plain session read would let EVERY worker ack — the claim is an atomic
+  // conditional update (sessions.claimUploadAck) so exactly ONE webhook in the
+  // burst sends the confirmation and the rest stay silent. The slot re-arms after
+  // the coalesce window so a genuinely later batch still gets one ack.
+  if (!deduped) {
+    const wonAck = await claimUploadAck(db, mHmac, UPLOAD_ACK_COALESCE_MS);
+    if (wonAck) {
+      const held = waiting > 0 && clientId
+        ? ` Note: ${waiting} earlier file(s) are still held for a client — send Change client to assign them.`
+        : '';
+      await sendText(message.from, `Invoice received and queued for processing.${held} Send more anytime, or type Done / Menu.`);
+    }
   }
 }
 

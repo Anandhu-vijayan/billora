@@ -305,7 +305,7 @@ test('review guard: an approval requires the reviewer to confirm the invoice num
 test('route wiring: WhatsApp confirm list + confirm handler are connected', () => {
   const s = readSrc('app/api/whatsapp/route.ts')
   assert.match(s, /confirmInvoice\(/)
-  assert.match(s, /listPendingReview\(/)
+  assert.match(s, /listPendingReview/, 'the route lists confirmable pending invoices (§P1-7 pages them)')
   assert.match(s, /sendReviewList\(/)
   assert.match(s, /composeConfirmResultMessage\(/)
 })

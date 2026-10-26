@@ -89,3 +89,34 @@ export async function verifyClientInWorkspace(db: SupabaseClient, workspaceId: s
   if (error) throw new Error(`CLIENT_VERIFY_ERROR: ${error.message}`)
   return !!data
 }
+
+export type OwnGstinResult = { ok: true } | { ok: false; reason: 'NOT_MIGRATED' | 'NOT_FOUND' | 'FAULT' }
+
+/**
+ * Persist (or clear, when `gstin` is null) the buyer's OWN GSTIN for one client,
+ * tenant-scoped (§P0-1b). Fail-SOFT and migration-safe: if the additive
+ * own_gstin migration has not been applied yet the write hits PGRST204 and we
+ * return NOT_MIGRATED instead of throwing — the optional capture must never break
+ * the chat the way an unknown-column write would (see the session-save regression
+ * and the same `select('*')` resilience in the extract/review paths). The value is
+ * assumed already checksum-validated by the conversation layer; a null clears it.
+ */
+export async function setClientOwnGstin(
+  db: SupabaseClient, workspaceId: string, clientId: string, gstin: string | null,
+): Promise<OwnGstinResult> {
+  const value = (gstin ?? '').trim().toUpperCase() || null
+  const { data, error } = await db
+    .from('clients')
+    .update({ own_gstin: value })
+    .eq('workspace_id', workspaceId)
+    .eq('id', clientId)
+    .select('id')
+  if (error) {
+    if (error.code === 'PGRST204' || /schema cache|own_gstin/i.test(error.message ?? '')) {
+      return { ok: false, reason: 'NOT_MIGRATED' }
+    }
+    return { ok: false, reason: 'FAULT' }
+  }
+  if (!data || data.length === 0) return { ok: false, reason: 'NOT_FOUND' }
+  return { ok: true }
+}

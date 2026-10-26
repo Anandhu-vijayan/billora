@@ -12,8 +12,19 @@
 // module is deliberately dependency-light (only an erased SupabaseClient type)
 // so the pure message composer is unit-testable in-process.
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { monthLabel, workbookFileName } from '../exports/naming'
+import { wakeWorker } from '../jobs/wake'
 
 type Db = SupabaseClient
+
+/** One ready month in the bulk summary (§P1-5): its label, file name, invoice count. */
+export interface ReadyMonth {
+  workbookId: string
+  /** 'Oct 2026' or null when the batch carries no resolvable period. */
+  monthLabel: string | null
+  fileName: string
+  invoiceCount: number
+}
 
 export interface FinalizeCounts {
   /** invoice_extraction jobs still queued/processing for this workspace. */
@@ -28,6 +39,8 @@ export interface FinalizeCounts {
   readyWorkbooks: number
   /** Ids of the verified-ready workbooks (newest first as returned). */
   readyWorkbookIds: string[]
+  /** Per-month breakdown of the ready registers (§P1-5); optional for legacy callers. */
+  readyMonths?: ReadyMonth[]
 }
 
 /**
@@ -48,6 +61,22 @@ const attentionNote = (c: FinalizeCounts): string => {
   return parts.length === 0 ? '' : ` ${parts.join(' and ')}.`
 }
 
+/**
+ * Pure (§P1-5): a per-month breakdown for a MULTI-month bulk delivery. Returns ''
+ * for fewer than two ready months so the single-register wording (and its tests)
+ * is untouched. Each line names the month, the exact downloadable file, and how
+ * many filed invoices it holds — so an accountant sees what they are getting.
+ */
+export function renderMonthBreakdown(months: ReadyMonth[] | undefined): string {
+  if (!months || months.length < 2) return ''
+  const lines = months.map((m) => {
+    const label = m.monthLabel ?? 'Undated'
+    const count = m.invoiceCount > 0 ? ` — ${m.invoiceCount} invoice(s)` : ''
+    return `• ${label}: ${m.fileName}${count}`
+  })
+  return `\n${lines.join('\n')}\n`
+}
+
 export function composeDoneMessage(
   c: FinalizeCounts,
   opts?: { link?: string | null; delivered?: boolean },
@@ -62,10 +91,11 @@ export function composeDoneMessage(
   }
   if (c.readyWorkbooks > 0) {
     const n = c.readyWorkbooks
+    const breakdown = renderMonthBreakdown(c.readyMonths)
     const suffix = opts?.delivered
       ? ' I have attached the Excel file(s) here in this chat.'
       : (opts?.link ? ` Secure download (sign in required): ${opts.link}` : '')
-    return `Done — your register is ready (${n} workbook${n === 1 ? '' : 's'}).${suffix}${attentionNote(c)}`
+    return `Done — your register is ready (${n} workbook${n === 1 ? '' : 's'}).${breakdown}${suffix}${attentionNote(c)}`
   }
   if (attention > 0) {
     return `Done — but nothing is ready to export yet: ${attentionNote(c).trim()}. I won't guess a month, so they're held for you to correct.`
@@ -91,11 +121,12 @@ export function composeReviewMessage(
     if (c.needsReview > 0) parts.push(`${c.needsReview} invoice(s) still need review`)
     if (c.missingDate > 0) parts.push(`${c.missingDate} have no clear date`)
     const note = parts.length > 0 ? ` ${parts.join(' and ')} and are NOT in it yet.` : ''
+    const breakdown = renderMonthBreakdown(c.readyMonths)
     if (opts?.delivered) {
-      return `Your register is ready — I have attached the Excel file here in this chat.${note}`
+      return `Your register is ready — I have attached the Excel file here in this chat.${breakdown}${note}`
     }
     const link = opts?.link ? opts.link : 'your signed-in workspace'
-    return `Your register is ready — download (sign in required): ${link}.${note}`
+    return `Your register is ready — download (sign in required): ${link}.${breakdown}${note}`
   }
   if (c.outstanding > 0) {
     return `Still processing ${c.outstanding} invoice(s). I'll tell you here once they're resolved.${attention > 0 ? ` ${attention} already need your review.` : ''}`
@@ -208,6 +239,10 @@ export async function ensureBatchRegisters(db: Db, workspaceId: string): Promise
     if (insErr && insErr.code !== '23505') throw new Error(`FINALIZE_ENQUEUE_ERROR: ${insErr.message}`)
     scheduled += 1
   }
+  // Newly-scheduled register work deserves an immediate best-effort tick so the
+  // rebuilt workbook is ready in seconds, not on the next cron (§P2-9). No-op when
+  // nothing was scheduled or the deployment is unconfigured; the cron is the backstop.
+  if (scheduled > 0) wakeWorker()
   return scheduled
 }
 
@@ -229,13 +264,44 @@ export async function collectFinalizeState(db: Db, workspaceId: string): Promise
   // (that row is inserted solely after a successful encrypted upload) and it has
   // not lapsed. The download route re-checks expiry + membership regardless.
   const { data: readyRows, error: readyErr } = await db
-    .from('generated_workbooks').select('id,file_object_path,expires_at')
+    .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at')
     .eq('workspace_id', workspaceId).eq('status', 'ready').not('file_object_path', 'is', null)
     .order('created_at', { ascending: false })
   if (readyErr) throw new Error(`FINALIZE_READY_ERROR: ${readyErr.message}`)
   const now = Date.now()
-  const usable = (readyRows ?? [] as Array<{ id: string; file_object_path: string | null; expires_at: string | null }>)
+  const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null }>)
     .filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now)
+
+  // Per-month breakdown (§P1-5): resolve each ready batch's own accounting period
+  // and count its filed invoices. These reads are a DISPLAY nicety — a failure
+  // here must never regress the truthful ready count, so errors leave the maps
+  // empty and each month falls back to a generic name / zero count.
+  const batchIds = [...new Set(usable.map((r) => r.batch_id).filter((b): b is string => !!b))]
+  const periodByBatch = new Map<string, string | null>()
+  const countByBatch = new Map<string, number>()
+  if (batchIds.length > 0) {
+    const { data: batches } = await db
+      .from('invoice_batches').select('id,period_start')
+      .eq('workspace_id', workspaceId).in('id', batchIds)
+    for (const b of (batches ?? [] as Array<{ id: string; period_start: string | null }>)) {
+      periodByBatch.set(b.id, b.period_start ?? null)
+    }
+    const { data: filed } = await db
+      .from('invoices').select('batch_id')
+      .eq('workspace_id', workspaceId).eq('status', 'completed').in('batch_id', batchIds)
+    for (const v of (filed ?? [] as Array<{ batch_id: string | null }>)) {
+      if (v.batch_id) countByBatch.set(v.batch_id, (countByBatch.get(v.batch_id) ?? 0) + 1)
+    }
+  }
+  const readyMonths: ReadyMonth[] = usable.map((r) => {
+    const period = r.batch_id ? periodByBatch.get(r.batch_id) ?? null : null
+    return {
+      workbookId: r.id,
+      monthLabel: monthLabel(period),
+      fileName: workbookFileName(period),
+      invoiceCount: r.batch_id ? countByBatch.get(r.batch_id) ?? 0 : 0,
+    }
+  })
 
   return {
     outstanding,
@@ -244,5 +310,6 @@ export async function collectFinalizeState(db: Db, workspaceId: string): Promise
     missingDate: missingDate ?? 0,
     readyWorkbooks: usable.length,
     readyWorkbookIds: usable.map((r) => r.id),
+    readyMonths,
   }
 }

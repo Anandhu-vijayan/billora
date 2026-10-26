@@ -19,16 +19,17 @@ import { bucketFor } from '@/lib/supabase/server'
 import { decryptFile, resolveFileKeyConfig } from '@/lib/encryption/files'
 import { uploadWhatsAppMedia, isPermanentMediaFailure } from '@/lib/whatsapp/media'
 import { sendDocument, type SendOutcome } from '@/lib/whatsapp/send'
+import { workbookFileName } from '@/lib/exports/naming'
 import { logger } from '@/lib/logger'
 
 type Db = SupabaseClient
 
 const SPREADSHEET_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const FILENAME = 'billora-register.xlsx'
 
 interface WorkbookRow {
   workspace_id: string
+  batch_id: string | null
   status: string
   expires_at: string | null
   file_object_path: string
@@ -57,7 +58,7 @@ export async function deliverWorkbookToWhatsApp(
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,status,expires_at,file_object_path,file_encryption_key_version')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version')
     .eq('id', workbookId)
     .maybeSingle()
   if (readErr || !row) {
@@ -88,9 +89,21 @@ export async function deliverWorkbookToWhatsApp(
       expectedKeyVersion: wb.file_encryption_key_version ?? undefined,
     })
 
+    // The in-chat file is named by its REAL accounting month (Billora_YYYY-MM.xlsx,
+    // §P1-5), read from the batch's own period_start. An unresolvable period keeps
+    // the stable generic name — we never stamp a guessed month on the download.
+    let periodStart: string | null = null
+    if (wb.batch_id) {
+      const { data: batchRow } = await db
+        .from('invoice_batches').select('period_start')
+        .eq('workspace_id', wb.workspace_id).eq('id', wb.batch_id).maybeSingle()
+      periodStart = (batchRow as { period_start?: string | null } | null)?.period_start ?? null
+    }
+    const filename = workbookFileName(periodStart)
+
     let mediaId: string
     try {
-      mediaId = await uploadWhatsAppMedia({ buffer: plain, mimeType: SPREADSHEET_MIME, filename: FILENAME })
+      mediaId = await uploadWhatsAppMedia({ buffer: plain, mimeType: SPREADSHEET_MIME, filename })
     } catch (e) {
       if (isPermanentMediaFailure(e)) {
         logger.error('[Deliver] media upload blocked (credential)', { code: 'DELIVER_UPLOAD_BLOCKED' })
@@ -104,7 +117,7 @@ export async function deliverWorkbookToWhatsApp(
       to,
       {
         mediaId,
-        filename: FILENAME,
+        filename,
         caption: args.caption ?? 'Your Billora invoice register. Each invoice is filed under its own invoice month.',
       },
       { workbookId },
