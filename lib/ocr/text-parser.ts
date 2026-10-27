@@ -19,6 +19,7 @@
 // Alias-free + import-only-types so the test harness (transpiles one file, no
 // `@/` resolution) can exercise the REAL parser in-process.
 import type { LedgerCandidate } from './ledger'
+import type { InvoiceTaxSlice } from './tax-slices'
 import { pickSupplierGstin } from './gstin'
 import { parseIndianAmountWords } from './validators/amount-words'
 
@@ -222,6 +223,75 @@ export function detectDocumentType(
 }
 
 /**
+ * §multi-rate: parse a printed RATE-WISE TAX SUMMARY into slices, conservatively.
+ *
+ * Many Indian GST invoices print a summary table that groups the taxable value and
+ * the tax amounts BY rate, e.g.
+ *     5.00%    10,000.00     250.00     250.00
+ *     18.00%   20,000.00   1,800.00   1,800.00
+ * We read ONLY lines that LEAD with a `NN%` rate token and then capture the numbers
+ * that follow on the SAME line. This is deliberately narrow so a lone "CGST @ 9%"
+ * header or a single-rate bill never gains a spurious breakdown:
+ *   * a row with THREE following amounts is intra-state (taxable, CGST, SGST);
+ *   * a row with TWO following amounts is interstate (taxable, IGST);
+ *   * any other shape is ignored (never guessed).
+ * Rows sharing a rate are summed. A breakdown is returned ONLY when TWO OR MORE
+ * distinct rates were evidenced — a single-rate invoice keeps the historical
+ * no-slice path untouched. The slices are then validated/reconciled downstream in
+ * ledger.ts; a bad parse can only force review, never fabricate a value here.
+ */
+export function parseRateWiseSummary(text: string): InvoiceTaxSlice[] | null {
+  const numTokens = (s: string): number[] =>
+    (s.match(/\d[\d,]*(?:\.\d{1,2})?/g) ?? [])
+      .map((t) => Number(t.replace(/[\s,]/g, '')))
+      .filter((n) => Number.isFinite(n) && n >= 0)
+  const rateLead = /^\s*(\d{1,3}(?:\.\d{1,2})?)\s*%/i
+
+  interface Agg { rate: number; taxable: number; cgst: number; sgst: number; igst: number; treatment: 'local' | 'interstate' }
+  const byRate = new Map<number, Agg>()
+  for (const rawLine of (text ?? '').replace(/\r/g, '').split('\n')) {
+    const m = rateLead.exec(rawLine)
+    if (!m) continue
+    const rate = Number(m[1])
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) continue
+    const nums = numTokens(rawLine.slice(m[0].length))
+    let treatment: 'local' | 'interstate'
+    let taxable: number; let a: number; let b: number; let igst: number
+    if (nums.length >= 3) { treatment = 'local'; taxable = nums[0]; a = nums[1]; b = nums[2]; igst = 0 }
+    else if (nums.length === 2) { treatment = 'interstate'; taxable = nums[0]; a = 0; b = 0; igst = nums[1] }
+    else continue
+    const key = Number(rate.toFixed(2))
+    const agg = byRate.get(key) ?? { rate: key, taxable: 0, cgst: 0, sgst: 0, igst: 0, treatment }
+    agg.taxable += taxable
+    agg.cgst += a
+    agg.sgst += b
+    agg.igst += igst
+    // A later row for the same rate with a different treatment means the summary is
+    // ambiguous; keep the FIRST reading (deterministic) rather than blend heads.
+    byRate.set(key, agg)
+  }
+
+  if (byRate.size < 2) return null
+  const slices: InvoiceTaxSlice[] = [...byRate.values()]
+    .sort((x, y) => x.rate - y.rate)
+    .map((agg): InvoiceTaxSlice => ({
+      rate_percent: agg.rate,
+      taxable_value: round2(agg.taxable),
+      cgst_amount: agg.treatment === 'local' ? round2(agg.cgst) : null,
+      sgst_amount: agg.treatment === 'local' ? round2(agg.sgst) : null,
+      igst_amount: agg.treatment === 'interstate' ? round2(agg.igst) : null,
+      cess_amount: null,
+      treatment: agg.treatment,
+      provenance: 'printed-summary',
+      confidence: CONF_STRONG,
+      validation_status: 'unvalidated',
+    }))
+  return slices
+}
+
+const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100
+
+/**
  * Parse an invoice text layer into a candidate. Every field is optional: only
  * values we can actually locate are populated. When nothing usable is present
  * (e.g. a scanned PDF with no text layer) the caller gets an essentially empty
@@ -322,6 +392,12 @@ export function parseInvoiceText(
   // unset so stored payloads stay as lean as before for the common case.
   const docType = detectDocumentType(normalized)
   if (docType !== 'invoice') candidate.document_type = docType
+
+  // §multi-rate: attach a printed rate-wise breakdown ONLY when the summary clearly
+  // evidenced two or more distinct rates. A single-rate bill yields null here and
+  // behaves exactly as before.
+  const summarySlices = parseRateWiseSummary(normalized)
+  if (summarySlices) candidate.tax_slices = summarySlices
 
   return candidate
 }

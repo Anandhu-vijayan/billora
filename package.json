@@ -14,7 +14,7 @@
     "worker:poll": "node scripts/worker-poll.mjs",
     "eval": "node scripts/eval.mjs",
     "reencrypt:legacy": "node scripts/reencrypt-legacy.mjs",
-    "test": "node --test tests/onboarding.test.mjs tests/vision-api.test.mjs tests/extraction-validators.test.mjs tests/invoice-calc.test.mjs"
+    "test": "node --test tests/onboarding.test.mjs tests/vision-api.test.mjs tests/extraction-validators.test.mjs tests/invoice-calc.test.mjs tests/multi-gst-rate.test.mjs"
   },
   "engines": {
     "node": ">=22.0.0"

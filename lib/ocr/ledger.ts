@@ -17,6 +17,15 @@ import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
 import { parseIndianAmountWords, validateInvoiceCrossChecks } from './validators'
 import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
 import { reconcileInvoiceTotal } from './calc/reconcile'
+import {
+  MIXED_GST_REASONS,
+  deriveSlicesFromInvoiceHeads,
+  distinctTaxRates,
+  mergeSlices,
+  normalizeSlices,
+  validateTaxSlices,
+  type InvoiceTaxSlice,
+} from './tax-slices'
 
 /**
  * §P3-16 The kind of source document, read from its printed TITLE (never from an
@@ -54,6 +63,13 @@ export interface LedgerRow {
    * 'invoice' (backward compatible). A credit/debit note can never be auto-approved.
    */
   document_type?: DocumentType;
+  /**
+   * The optional rate-wise tax breakdown. ABSENT on every legacy payload and on a
+   * invoice the source gave no multi-rate evidence for, which is read as "no
+   * breakdown", never "zero". When present each slice is one GST rate/treatment
+   * line. The invoice stays ONE register row; this only carries its detail.
+   */
+  tax_slices?: InvoiceTaxSlice[] | null;
 }
 
 /** A raw extraction candidate: values plus an optional per-field confidence. */
@@ -96,6 +112,13 @@ export interface LedgerCandidate {
    * local/AI merge and forces human review for a credit/debit note.
    */
   document_type?: DocumentType;
+  /**
+   * Rate-wise tax slices a source (a printed rate-wise summary, an item-level read
+   * or a human correction) produced. Optional; absence means NO breakdown was
+   * evidenced, which is never coerced to zero. `evaluateLedger` validates these
+   * and only then attaches a reliable breakdown to the canonical row.
+   */
+  tax_slices?: InvoiceTaxSlice[] | null;
   confidence?: Record<string, number> | null;
 }
 
@@ -120,6 +143,13 @@ export interface LedgerEvaluation {
    * `total-from-words`). Empty when the candidate was scored exactly as given.
    */
   repairs?: string[];
+  /**
+   * True only when the invoice evidenced a MULTI-rate breakdown AND every slice
+   * reconciled to the invoice-level heads. A single-rate invoice is `null` (no
+   * separate breakdown to validate), distinguishing "extraction succeeded" from
+   * "the rate-wise tax breakdown actually passed validation".
+   */
+  breakdownValidated?: boolean | null;
 }
 
 /**
@@ -391,6 +421,11 @@ export function mergeCandidates(
   // merge with an AI candidate that reports nothing. Prefer the primary (local) read.
   const docType = primary.document_type ?? fallback?.document_type
   if (docType) merged.document_type = docType
+  // Rate-wise slices are preserved WITHOUT flattening: the primary (local/human)
+  // breakdown wins, and the merge never silently discards a slice either side
+  // printed. A conflicting rate is left for evaluateLedger's validation to flag.
+  const mergedSlices = mergeSlices(primary.tax_slices, fallback?.tax_slices)
+  if (mergedSlices) merged.tax_slices = mergedSlices
   merged.confidence = confidence
   return merged
 }
@@ -677,6 +712,46 @@ export function evaluateLedger(
     document_type: documentType,
   };
 
+  // ---- rate-wise tax breakdown (multi-GST-rate) ------------------------------
+  // ADDITIVE ONLY: this block can attach slices and raise `mixed-gst-*` review
+  // reasons, but it NEVER clears a reason raised above and NEVER approves a row on
+  // its own. A single-rate invoice carries no explicit multi-rate evidence, so it
+  // is left exactly as before (one derived slice at most, no new reasons) — every
+  // pre-existing test keeps its outcome. Only a genuine MULTI-rate bill (two or
+  // more distinct rates in explicit parsed/human slices) is validated here.
+  const explicitSlices = normalizeSlices(candidate.tax_slices)
+  const derivedSlices = deriveSlicesFromInvoiceHeads(row)
+  const candidateSlices = explicitSlices ?? derivedSlices
+  let breakdownValidated: boolean | null = null
+  if (candidateSlices && candidateSlices.length > 0) {
+    const tolMinor = BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101)))
+    const mixed = explicitSlices !== null && distinctTaxRates(explicitSlices).length >= 2
+    if (mixed) {
+      const result = validateTaxSlices(explicitSlices, {
+        taxable_value: row.taxable_value,
+        cgst_amount: row.cgst_amount,
+        sgst_amount: row.sgst_amount,
+        igst_amount: row.igst_amount,
+        total_amount: row.total_amount,
+      }, tolMinor)
+      breakdownValidated = result.breakdownValidated
+      row.tax_slices = result.slices
+      if (!result.breakdownValidated) {
+        // A mixed-rate bill whose breakdown is incomplete or self-contradictory can
+        // never be silently approved: name every gap and force review.
+        for (const r of result.reasons) reasons.push(r)
+        if (!reasons.includes(MIXED_GST_REASONS.breakdownMissing)) {
+          reasons.push(MIXED_GST_REASONS.breakdownMissing)
+        }
+      }
+    } else {
+      // Single (or zero) rate: keep a reliable slice for the breakdown sheet, but
+      // run no additional gating so historical single-rate behaviour is untouched.
+      row.tax_slices = candidateSlices
+      breakdownValidated = null
+    }
+  }
+
   return {
     row,
     review: reasons.length === 0 ? 'approved' : 'needs_review',
@@ -685,6 +760,7 @@ export function evaluateLedger(
     measuredConfidence,
     invoiceDateResolved: iso !== null,
     repairs,
+    breakdownValidated,
   };
 }
 

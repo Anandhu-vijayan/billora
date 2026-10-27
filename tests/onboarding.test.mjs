@@ -2348,8 +2348,13 @@ test('P15 engine + handler wiring: ranking-based selection, conflict provenance,
   const reg = registerSrc()
   assert.ok(reg.includes("eq('review_status', 'approved')"), 'the workbook exports ONLY approved rows')
   assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
-  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildTallyImportWorkbook'),
+  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildRegisterWorkbook'),
     'an all-review batch is a no-op that never reaches workbook generation/delivery')
+  // §multi-rate: the register is the THREE-sheet workbook; mixed-rate import
+  // expansion is gated on a reconciled breakdown, never on raw slices alone.
+  assert.ok(reg.includes('normalizeSlices(row.tax_slices)'), 'approved rows feed their persisted rate-wise breakdown')
+  assert.ok(reg.includes('deriveSlicesFromInvoiceHeads(row)'), 'a clean single-rate head still yields one derived slice (legacy payloads)')
+  assert.ok(reg.includes('breakdownValidated') && reg.includes('sliceImportLines'), 'per-slice import lines only from a VALIDATED breakdown')
 })
 
 // ---- Workbook integrity gate: never persist/deliver a non-openable .xlsx ----
@@ -2448,12 +2453,17 @@ test('T6 the integrity gate reopens a good workbook and fails CLOSED on truncate
 
 test('T7 the register validates the workbook AFTER build and BEFORE encrypt/upload', () => {
   const reg = registerSrc()
-  assert.ok(reg.includes('validateTallyWorkbook(workbook'), 'the integrity gate is wired into the handler')
-  const gen = reg.indexOf('await buildTallyImportWorkbook')
-  const validate = reg.indexOf('await validateTallyWorkbook(workbook')
+  assert.ok(reg.includes('validateRegisterWorkbook(workbook'), 'the three-sheet integrity gate is wired into the handler')
+  const gen = reg.indexOf('await buildRegisterWorkbook')
+  const validate = reg.indexOf('await validateRegisterWorkbook(workbook')
   const encrypt = reg.indexOf('encryptFile(workbook')
   assert.ok(gen > -1 && gen < validate && validate < encrypt,
     'generate -> validate -> encrypt: a malformed buffer can never be stored or delivered')
+  // The delivered register carries ALL THREE sheets: one row per invoice stays
+  // the primary contract even when the Purchase Import expands per rate slice.
+  assert.ok(reg.includes('invoiceCount: invoices.length'), 'Purchase Register row count is asserted per INVOICE, not per import line')
+  assert.ok(reg.includes('taxBreakdownRowCount: expectedTaxBreakdownRowCount(invoices)'), 'Tax Breakdown row count is validated')
+  assert.ok(reg.includes('importRowCount'), 'Purchase Import line count is validated')
 })
 
 // ---- Ledger mapping: never fabricate a classification ----

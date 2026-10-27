@@ -282,6 +282,40 @@ export function parseVisionJson(text: string): LedgerCandidate {
     if (value === undefined) { candidate[field] = null; continue }
     if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) candidate[field] = null
   }
+  // §multi-rate: a rate-wise breakdown is OPTIONAL AI evidence. Preserve it when
+  // the model returns a well-formed array of slice objects, but NEVER fail the
+  // whole invoice over a malformed one (that would be a permanent job failure over
+  // metadata drift). Absent/invalid simply means "no breakdown from AI", which the
+  // deterministic parser + invoice-heads derivation still cover. It is never given
+  // a confidence key and never overrides stronger validated local evidence — the
+  // merge in ledger.ts keeps the local slices and only fills rates local omitted.
+  if (Array.isArray(candidate.tax_slices)) {
+    const slices = (candidate.tax_slices as unknown[])
+      .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object' && !Array.isArray(s))
+      .map((s) => {
+        const money = (v: unknown): number | null =>
+          typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+        const rate = typeof s.rate_percent === 'number' && Number.isFinite(s.rate_percent)
+          && s.rate_percent >= 0 && s.rate_percent <= 100 ? s.rate_percent : null
+        const treat = s.treatment === 'interstate' ? 'interstate'
+          : s.treatment === 'local' ? 'local' : 'unknown'
+        return {
+          rate_percent: rate,
+          taxable_value: money(s.taxable_value),
+          cgst_amount: money(s.cgst_amount),
+          sgst_amount: money(s.sgst_amount),
+          igst_amount: money(s.igst_amount),
+          cess_amount: money(s.cess_amount),
+          treatment: treat,
+          provenance: 'item-level',
+          confidence: null,
+          validation_status: 'unvalidated',
+        }
+      })
+    candidate.tax_slices = slices.length > 0 ? slices : null
+  } else {
+    delete candidate.tax_slices
+  }
   if (!candidate.confidence || typeof candidate.confidence !== 'object' || Array.isArray(candidate.confidence)) {
     throw new VisionPermanentError('VISION_CONFIDENCE_INVALID')
   }

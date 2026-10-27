@@ -22,6 +22,7 @@
 //     never back-computed from the tax/taxable amounts (that could hide an OCR
 //     error and would overwrite the source's own printed figure).
 import type { LedgerRow } from '../ocr/ledger'
+import type { InvoiceTaxSlice } from '../ocr/tax-slices'
 
 /** How a purchase invoice's tax is structured, from which heads are non-zero. */
 export type TaxTreatment = 'local' | 'interstate' | 'unknown'
@@ -154,5 +155,31 @@ export function resolveLedgerName(
   }
   // Rate/treatment are known but the workspace has not mapped a ledger for them:
   // this is MISSING CONFIGURATION, not an extraction failure.
+  return { ledgerName: null, status: 'mapping-required', rateClassKey: key, gstRatePercent, treatment }
+}
+
+/**
+ * §multi-rate: resolve the ledger for ONE rate/treatment slice. A mixed-rate
+ * invoice must NOT be forced onto a single invoice-wide ledger for every rate —
+ * each slice carries its own printed rate and treatment, so the same never-fabricate
+ * lookup is applied per slice. A slice with no evidenced rate/treatment resolves
+ * to `unresolved-rate` (blank ledger), never a guessed classification.
+ */
+export function resolveSliceLedgerName(
+  slice: Pick<InvoiceTaxSlice, 'rate_percent' | 'treatment'>,
+  mappings: readonly TallyLedgerMapping[],
+): TallyLedgerResolution {
+  const treatment: TaxTreatment =
+    slice.treatment === 'interstate' ? 'interstate'
+      : slice.treatment === 'local' ? 'local' : 'unknown'
+  const gstRatePercent = typeof slice.rate_percent === 'number' && Number.isFinite(slice.rate_percent)
+    ? slice.rate_percent
+    : null
+  const key = rateClassKey(treatment, gstRatePercent)
+  if (key === 'unresolved') {
+    return { ledgerName: null, status: 'unresolved-rate', rateClassKey: key, gstRatePercent, treatment }
+  }
+  const hit = mappings.find((m) => m.rate_class_key === key)
+  if (hit) return { ledgerName: hit.ledger_name, status: 'mapped', rateClassKey: key, gstRatePercent, treatment }
   return { ledgerName: null, status: 'mapping-required', rateClassKey: key, gstRatePercent, treatment }
 }

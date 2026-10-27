@@ -22,8 +22,16 @@ import { PermanentJobError } from '@/lib/jobs/queue'
 import type { JobContext } from '@/lib/jobs/worker'
 import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
-import { buildTallyImportWorkbook, validateTallyWorkbook, type TallyImportRowInput } from '@/lib/excel/generator'
-import { resolveLedgerName, tallyDefaultLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
+import {
+  buildRegisterWorkbook,
+  validateRegisterWorkbook,
+  expectedTaxBreakdownRowCount,
+  type RegisterInvoiceInput,
+  type RegisterSliceCell,
+  type TallyImportRowInput,
+} from '@/lib/excel/generator'
+import { resolveLedgerName, resolveSliceLedgerName, tallyDefaultLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
+import { deriveSlicesFromInvoiceHeads, isMixedRate, normalizeSlices, validateTaxSlices, type InvoiceTaxSlice } from '@/lib/ocr/tax-slices'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
 // Opt-in proactive delivery (§P1-6): when the owner consented AND the feature flag +
 // separate key are set AND the send is inside Meta's 24h window, push the workbook
@@ -97,6 +105,104 @@ async function loadLedgerMappings(db: Db, workspaceId: string): Promise<TallyLed
     return []
   }
   return (data ?? []) as TallyLedgerMapping[]
+}
+
+/** Render one validated slice as a register/breakdown cell payload. */
+function toSliceCell(s: InvoiceTaxSlice): RegisterSliceCell {
+  return {
+    rate_percent: s.rate_percent,
+    taxable_value: s.taxable_value,
+    cgst_amount: s.cgst_amount,
+    sgst_amount: s.sgst_amount,
+    igst_amount: s.igst_amount,
+    cess_amount: s.cess_amount ?? null,
+    treatment: s.treatment ?? null,
+    provenance: s.provenance ?? null,
+    confidence: s.confidence ?? null,
+    validation_status: s.validation_status ?? null,
+  }
+}
+
+const sumMoney = (...vals: Array<number | null | undefined>): number =>
+  vals.reduce<number>((a, v) => a + (typeof v === 'number' && Number.isFinite(v) ? v : 0), 0)
+const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100
+
+/**
+ * §multi-rate: resolve ONE import line per invoice from its own totals. This is
+ * the historical behaviour and stays the fallback whenever a rate-wise breakdown
+ * is absent, single-rate, or does not reconcile to the invoice heads — an
+ * invoice-level row that merely carries slices is never expanded on unvalidated
+ * evidence.
+ */
+function invoiceLevelImportLine(
+  row: LedgerRow,
+  res: ReturnType<typeof resolveLedgerName>,
+): TallyImportRowInput {
+  return {
+    invoice_date: row.invoice_date || null,
+    invoice_number: row.invoice_number || null,
+    vendor_name: row.vendor_name || null,
+    supplier_gstin: row.supplier_gstin || null,
+    // §user #4b: with no workspace mapping configured the cell used to render
+    // blank, which an accountant reads as a broken register. We now write a
+    // conventional `Purchase @ <rate>%` display name (a plain `Purchase` when the
+    // rate is unestablished) so the sheet is always populated. This NEVER touches
+    // an amount and NEVER overrides a real mapping — a configured ledger name
+    // (`res.ledgerName`) always wins; the default only fills the gap.
+    ledger_name: res.ledgerName ?? tallyDefaultLedgerName(res.gstRatePercent),
+    taxable_value: row.taxable_value,
+    gst_rate_percent: res.gstRatePercent,
+    cgst_amount: row.cgst_amount,
+    sgst_amount: row.sgst_amount,
+    igst_amount: row.igst_amount,
+    round_off: row.round_off ?? null,
+    gross_total: row.total_amount,
+  }
+}
+
+/**
+ * §multi-rate: expand a VALIDATED mixed-rate breakdown into one 12-column import
+ * line per rate slice, each mapped to its own per-slice ledger. The invoice-level
+ * round-off rides ONLY on the last line (never duplicated), and each line's gross
+ * is its own taxable+tax (the last adds the round-off), so the expanded lines sum
+ * back to the invoice total exactly — no double-counted grand total.
+ */
+function sliceImportLines(
+  row: LedgerRow,
+  slices: readonly InvoiceTaxSlice[],
+  mappings: readonly TallyLedgerMapping[],
+): { lines: TallyImportRowInput[]; mapped: number; mappingRequired: number; unresolvedRate: number } {
+  let mapped = 0
+  let mappingRequired = 0
+  let unresolvedRate = 0
+  const roundOff = typeof row.round_off === 'number' && Number.isFinite(row.round_off) ? row.round_off : null
+  const lines = slices.map((s, i) => {
+    const res = resolveSliceLedgerName(s, mappings)
+    if (res.status === 'mapped') mapped += 1
+    else if (res.status === 'mapping-required') mappingRequired += 1
+    else unresolvedRate += 1
+    const tax = sumMoney(s.cgst_amount, s.sgst_amount, s.igst_amount)
+    const isLast = i === slices.length - 1
+    const gross = round2(sumMoney(s.taxable_value, tax) + (isLast ? roundOff ?? 0 : 0))
+    return {
+      invoice_date: row.invoice_date || null,
+      invoice_number: row.invoice_number || null,
+      vendor_name: row.vendor_name || null,
+      supplier_gstin: row.supplier_gstin || null,
+      ledger_name: res.ledgerName ?? tallyDefaultLedgerName(res.gstRatePercent),
+      taxable_value: s.taxable_value,
+      gst_rate_percent: s.rate_percent,
+      cgst_amount: s.cgst_amount,
+      sgst_amount: s.sgst_amount,
+      igst_amount: s.igst_amount,
+      // Round-off is an invoice-level figure: it appears once, on the LAST slice
+      // line, so the Tally importer sees the invoice's true gross without ever
+      // counting the rounding adjustment twice.
+      round_off: isLast ? roundOff : null,
+      gross_total: gross,
+    }
+  })
+  return { lines, mapped, mappingRequired, unresolvedRate }
 }
 
 export async function buildRegister(ctx: JobContext): Promise<void> {
@@ -198,47 +304,86 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   // mappings configured yet", which leaves every line explicitly mapping-required
   // rather than fabricating a ledger — the register still generates, blank-safe.
   const mappings = await loadLedgerMappings(db, workspaceId)
-  const lines: TallyImportRowInput[] = []
+  const invoices: RegisterInvoiceInput[] = []
   let mapped = 0
   let mappingRequired = 0
   let unresolvedRate = 0
   for (const row of rows) {
+    // §multi-rate: the canonical row already carries a reliable breakdown when
+    // the source evidenced one (evaluateLedger attaches validated explicit slices
+    // or a single-rate derived slice). Normalise what is on the row; otherwise
+    // derive ONLY from a cleanly evidenced single-rate invoice head — never
+    // fabricate a breakdown a stored payload does not have.
+    const slices = normalizeSlices(row.tax_slices) ?? deriveSlicesFromInvoiceHeads(row) ?? []
     const res = resolveLedgerName(row, mappings)
-    if (res.status === 'mapped') mapped += 1
-    else if (res.status === 'mapping-required') mappingRequired += 1
-    else unresolvedRate += 1
-    lines.push({
+    const mixed = isMixedRate(slices)
+    // A mixed-rate import expansion is allowed ONLY when the breakdown reconciles
+    // to the invoice heads under the shared tolerance; anything else keeps the
+    // safe invoice-level line (and the review status says so truthfully).
+    const breakdownValidated = mixed
+      ? validateTaxSlices(slices, {
+        taxable_value: row.taxable_value,
+        cgst_amount: row.cgst_amount,
+        sgst_amount: row.sgst_amount,
+        igst_amount: row.igst_amount,
+        total_amount: row.total_amount,
+      }, BigInt(Math.max(0, Math.trunc(101)))).breakdownValidated
+      : false
+    const importRows: TallyImportRowInput[] = (mixed && breakdownValidated)
+      ? (() => {
+        const exp = sliceImportLines(row, slices, mappings)
+        mapped += exp.mapped
+        mappingRequired += exp.mappingRequired
+        unresolvedRate += exp.unresolvedRate
+        return exp.lines
+      })()
+      : (() => {
+        if (res.status === 'mapped') mapped += 1
+        else if (res.status === 'mapping-required') mappingRequired += 1
+        else unresolvedRate += 1
+        return [invoiceLevelImportLine(row, res)]
+      })()
+    invoices.push({
       invoice_date: row.invoice_date || null,
       invoice_number: row.invoice_number || null,
       vendor_name: row.vendor_name || null,
       supplier_gstin: row.supplier_gstin || null,
-      // §user #4b: with no workspace mapping configured the cell used to render
-      // blank, which an accountant reads as a broken register. We now write a
-      // conventional `Purchase @ <rate>%` display name (a plain `Purchase` when the
-      // rate is unestablished) so the sheet is always populated. This NEVER touches
-      // an amount and NEVER overrides a real mapping — a configured ledger name
-      // (`res.ledgerName`) always wins; the default only fills the gap.
-      ledger_name: res.ledgerName ?? tallyDefaultLedgerName(res.gstRatePercent),
-      taxable_value: row.taxable_value,
-      gst_rate_percent: res.gstRatePercent,
-      cgst_amount: row.cgst_amount,
-      sgst_amount: row.sgst_amount,
-      igst_amount: row.igst_amount,
+      place_of_supply: null,
+      document_type: row.document_type ?? null,
+      total_taxable_value: row.taxable_value,
+      total_cgst: row.cgst_amount,
+      total_sgst: row.sgst_amount,
+      total_igst: row.igst_amount,
+      total_cess: null,
+      other_charges: null,
+      discount: null,
       round_off: row.round_off ?? null,
-      gross_total: row.total_amount,
+      grand_total: row.total_amount,
+      // Only APPROVED rows ever reach the register; say so truthfully, and mark a
+      // mixed-rate bill whose breakdown could not be validated for the accountant.
+      review_status: mixed && !breakdownValidated ? 'approved (rate-wise breakdown unvalidated)' : 'approved',
+      slices: slices.map(toSliceCell),
+      importRows,
     })
   }
+  const importRowCount = invoices.reduce((n, inv) => n + inv.importRows.length, 0)
   logger.info('[Register] ledger mapping resolved', {
     batchId, jobId: job.id, mapped, mappingRequired, unresolvedRate,
   })
-  const workbook = await buildTallyImportWorkbook(lines)
+  const workbook = await buildRegisterWorkbook(invoices)
   // Integrity gate BEFORE anything is persisted: reopen the buffer and prove it
-  // is a genuine, openable .xlsx with the exact 12 Tally headers and precisely
-  // one row per line (a stray summary row would import as a phantom voucher and
-  // is rejected here). A truncated/partial write or an ExcelJS regression throws
-  // (the job requeues) instead of encrypting, storing, and later "delivering" a
-  // register the accountant cannot import. No row data is logged.
-  await validateTallyWorkbook(workbook, lines.length)
+  // is a genuine, openable .xlsx with all three sheets, the exact 12 Tally
+  // headers on Purchase Import, EXACTLY one Purchase Register row per invoice,
+  // one Tax Breakdown row per slice (>=1 per invoice) and precisely the resolved
+  // number of import rows (a stray summary row would import as a phantom voucher
+  // and is rejected here). A truncated/partial write or an ExcelJS regression
+  // throws (the job requeues) instead of encrypting, storing, and later
+  // "delivering" a register the accountant cannot import. No row data is logged.
+  await validateRegisterWorkbook(workbook, {
+    invoiceCount: invoices.length,
+    taxBreakdownRowCount: expectedTaxBreakdownRowCount(invoices),
+    importRowCount,
+  })
   logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')
