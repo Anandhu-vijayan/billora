@@ -208,6 +208,29 @@ export async function validateTallyWorkbook(buf: Buffer, expectedRowCount?: numb
 export const PURCHASE_REGISTER_SHEET_NAME = 'Purchase Register';
 export const TAX_BREAKDOWN_SHEET_NAME = 'Tax Breakdown';
 
+// §Part-2b: the register splits into ONE sheet per accounting category. The
+// primary sheet keeps its historical name (it is the required sheet the whole
+// delivery + integrity contract keys on); every other category rides its own
+// clearly-labelled sheet. Ordering is deterministic so a rebuild is byte-stable
+// and an accountant always finds purchases first.
+const REGISTER_CATEGORY_ORDER = ['purchase', 'expense', 'service', 'fixed_asset', 'other', 'unknown'] as const;
+const REGISTER_CATEGORY_SHEET: Record<string, string> = {
+  purchase: PURCHASE_REGISTER_SHEET_NAME,
+  expense: 'Expense Register',
+  service: 'Service Register',
+  fixed_asset: 'Fixed Asset Register',
+  other: 'Other Register',
+  unknown: 'Uncategorised Register',
+};
+/** A missing/unknown category is the historical default: the primary purchase sheet. */
+function normalizeRegisterCategory(value: string | null | undefined): string {
+  return value && REGISTER_CATEGORY_SHEET[value] ? value : 'purchase';
+}
+/** True for any per-category register sheet (all end in " Register"), false for Tax Breakdown / Purchase Import. */
+function isRegisterSheetName(name: string): boolean {
+  return /\sRegister$/.test(name);
+}
+
 /** One rate/treatment slice as the register renders it (every money is number|null). */
 export interface RegisterSliceCell {
   rate_percent: number | null;
@@ -231,6 +254,15 @@ export interface RegisterInvoiceInput {
   supplier_gstin: string | null;
   place_of_supply?: string | null;
   document_type?: string | null;
+  /**
+   * §Part-2b the accounting category this invoice was classified into, so the
+   * register can split into one sheet per category. Absent/null is treated as
+   * 'purchase' — the historical single-sheet behaviour is the default, and a
+   * legacy row (or any row with no machine classification) never lands anywhere
+   * but the primary Purchase Register. This only chooses a SHEET; it never
+   * touches an amount, a ledger mapping, or the aggregate Tax Breakdown / import.
+   */
+  accountingCategory?: string | null;
   total_taxable_value: number | null;
   total_cgst: number | null;
   total_sgst: number | null;
@@ -320,19 +352,21 @@ function sliceSumForRate(slices: readonly RegisterSliceCell[], rate: number | nu
 const r2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
 
 /**
- * Build the accountant's three-sheet register. All three sheets are derived from
- * the SAME validated invoice set, so the Purchase Register (one row/invoice), the
- * Tax Breakdown (one row/slice) and the Purchase Import (resolved rows) can never
- * disagree with one another or double-count an invoice.
+ * §Part-2b: render ONE per-category register sheet with the workbook-wide shared
+ * column schema. Extracted from `buildRegisterWorkbook` so every category sheet is
+ * structurally identical (same headers, widths, styles, freeze + autofilter) and a
+ * per-rate column can never shift between categories. An empty category still gets
+ * a header row (rowCount 1) so the required primary sheet always exists.
  */
-export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): Promise<Buffer> {
-  const workbook = new ExcelJS.Workbook();
-  const coreFont = { name: 'Segoe UI' };
-  const rates = rateColumnSchema(invoices);
-  const nilColumn = hasUnratedTaxable(invoices);
-
-  // ---- Sheet 1: Purchase Register (one row per invoice) ----------------------
-  const ws = workbook.addWorksheet(PURCHASE_REGISTER_SHEET_NAME);
+function renderRegisterSheet(
+  workbook: ExcelJS.Workbook,
+  sheetName: string,
+  invoices: readonly RegisterInvoiceInput[],
+  rates: readonly number[],
+  nilColumn: boolean,
+  coreFont: { name: string },
+): void {
+  const ws = workbook.addWorksheet(sheetName);
   const dynHeaders = registerDynamicHeaders(rates);
   const headers = [...REGISTER_FIXED_HEADERS, ...dynHeaders,
     ...(nilColumn ? ['Exempt/Nil/Non-GST Taxable'] : []), ...REGISTER_TOTAL_HEADERS];
@@ -342,7 +376,6 @@ export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): P
     cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F4E78' } };
     cell.alignment = { horizontal: 'center', vertical: 'middle' };
   });
-
   for (const inv of invoices) {
     const row = ws.addRow([]);
     let c = 1;
@@ -377,6 +410,44 @@ export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): P
   }
   ws.views = [{ showGridLines: true, state: 'frozen', xSplit: 2, ySplit: 1 }];
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
+}
+
+/**
+ * Build the accountant's register. Its detail sheets are derived from the SAME
+ * validated invoice set, so the Purchase Register (one row/invoice, split per
+ * accounting category — §Part-2b), the Tax Breakdown (one row/slice) and the
+ * Purchase Import (resolved rows) can never disagree with one another or
+ * double-count an invoice. The per-category split is DISPLAY only: every invoice
+ * still appears exactly once across the register sheets, and the Tax Breakdown
+ * and 12-column Purchase Import stay aggregate so the Tally import contract is
+ * byte-for-byte unchanged.
+ */
+export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const coreFont = { name: 'Segoe UI' };
+  const rates = rateColumnSchema(invoices);
+  const nilColumn = hasUnratedTaxable(invoices);
+
+  // ---- Sheet(s) 1: one register sheet per accounting category ----------------
+  // §Part-2b: purchases stay on the primary "Purchase Register"; each other
+  // present category rides its own clearly-named sheet. The primary sheet ALWAYS
+  // exists (the integrity + delivery contract requires it), even for a batch that
+  // happens to hold no purchase-category row. The shared `rates`/`nilColumn` keep
+  // every register sheet on one identical column schema.
+  const byCategory = new Map<string, RegisterInvoiceInput[]>();
+  for (const inv of invoices) {
+    const cat = normalizeRegisterCategory(inv.accountingCategory);
+    const bucket = byCategory.get(cat);
+    if (bucket) bucket.push(inv); else byCategory.set(cat, [inv]);
+  }
+  renderRegisterSheet(workbook, PURCHASE_REGISTER_SHEET_NAME, byCategory.get('purchase') ?? [], rates, nilColumn, coreFont);
+  for (const cat of REGISTER_CATEGORY_ORDER) {
+    if (cat === 'purchase') continue;
+    const bucket = byCategory.get(cat);
+    if (bucket && bucket.length > 0) {
+      renderRegisterSheet(workbook, REGISTER_CATEGORY_SHEET[cat], bucket, rates, nilColumn, coreFont);
+    }
+  }
 
   // ---- Sheet 2: Tax Breakdown (one row per invoice per slice) ----------------
   const bd = workbook.addWorksheet(TAX_BREAKDOWN_SHEET_NAME);
@@ -460,8 +531,21 @@ export async function validateRegisterWorkbook(buf: Buffer, counts: RegisterWork
   if (String(reg.getRow(1).getCell(1).text).trim() !== 'Invoice Date') {
     throw new Error('WORKBOOK_INVALID: Purchase Register header row did not render');
   }
-  if (reg.rowCount !== counts.invoiceCount + 1) {
-    throw new Error(`WORKBOOK_INVALID: Purchase Register expected ${counts.invoiceCount} invoice row(s), found ${reg.rowCount - 1}`);
+  // §Part-2b: the register may span one sheet per accounting category. Every
+  // invoice must appear EXACTLY once across ALL register sheets (name ends in
+  // " Register") — never lost to a bucket, never duplicated into two. Summing the
+  // data rows across those sheets and comparing to the total invoice count proves
+  // the split is faithful, while the Tax Breakdown / import stay aggregate below.
+  let registerRows = 0;
+  for (const sheet of check.worksheets) {
+    if (!isRegisterSheetName(sheet.name)) continue;
+    if (String(sheet.getRow(1).getCell(1).text).trim() !== 'Invoice Date') {
+      throw new Error(`WORKBOOK_INVALID: "${sheet.name}" header row did not render`);
+    }
+    registerRows += Math.max(0, sheet.rowCount - 1);
+  }
+  if (registerRows !== counts.invoiceCount) {
+    throw new Error(`WORKBOOK_INVALID: register sheets expected ${counts.invoiceCount} invoice row(s) in total, found ${registerRows}`);
   }
   if (bd.rowCount !== counts.taxBreakdownRowCount + 1) {
     throw new Error(`WORKBOOK_INVALID: Tax Breakdown expected ${counts.taxBreakdownRowCount} slice row(s), found ${bd.rowCount - 1}`);

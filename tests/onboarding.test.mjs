@@ -1773,11 +1773,15 @@ test('M5 Done waits for outstanding extraction and reports a truthful outcome (r
 
 test('M5b route.ts Done runs real finalization, not a bare ack', () => {
   const r = routeSrc()
-  assert.ok(r.includes('ensureBatchRegisters(db, workspaceId)'), 'Done re-affirms register jobs')
-  assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Done reads current state')
+  assert.match(r, /ensureBatchRegisters\(db, workspaceId, scope\)/, 'Done re-affirms register jobs for THIS tenant only')
+  assert.match(r, /collectFinalizeState\(db, workspaceId, scope\)/, 'Done reads current state, client-scoped')
   assert.ok(r.includes('composeDoneMessage(counts, { link, delivered: delivered > 0 })'), 'Done sends a truthful result')
   assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Done attaches the register as an in-chat document')
   assert.ok(!r.includes('your uploads are queued for processing. Send more invoices anytime'), 'the old ack-only Done text is gone')
+  // §wrong-month delivery: the summary link is the deterministic latest-period
+  // pick, never an arbitrary first row of a workspace-wide ready list.
+  assert.ok(!r.includes('counts.readyWorkbookIds[0]'), 'no arbitrary [0] workbook selection in the route')
+  assert.match(r, /pickPrimaryWorkbook\(counts\.readyMonths \?\? \[\]\)/, 'the download link names the exact delivered-scope workbook')
 })
 
 test('M6 repeated Done never duplicates register jobs (idempotent, deduped scheduling)', async () => {
@@ -2089,7 +2093,7 @@ test('N8 WhatsApp Review is truthful: delivers a ready workbook now, or states w
   const r = routeSrc()
   assert.ok(r.includes('composeReviewMessage(counts, { link, delivered: delivered > 0 })'), 'the Review command renders the truthful body')
   assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Review attaches the register as an in-chat document')
-  assert.ok(r.includes('collectFinalizeState(db, workspaceId)'), 'Review reads current verified state')
+  assert.match(r, /collectFinalizeState\(db, workspaceId, scope\)/, 'Review reads current verified state, client-scoped')
 })
 
 
@@ -2971,11 +2975,39 @@ test('P0-3 the in-chat editor explains WHY the invoice is flagged (and stays sil
   assert.ok(!none.includes('Why this needs a check'), 'a row with no stored reason shows no phantom cause')
 })
 
+// ---- §UX "what to type" clarity: name the EXACT field for each blocker ----=
+test('UX reasonFixHints names the exact editor field for a fielded blocker', () => {
+  const hints = reviewEdit.reasonFixHints(['gstin-checksum-failed', 'invoice-date-unresolved'])
+  assert.ok(hints.some((h) => /reply 2 \(Supplier GSTIN\)/.test(h) && /checksum/.test(h)), 'GSTIN failure -> field 2')
+  assert.ok(hints.some((h) => /reply 4 \(Invoice date\)/.test(h)), 'unreadable date -> field 4')
+})
+
+test('UX an amount/tax reconciliation error routes to the amounts block, not one arbitrary field', () => {
+  const hints = reviewEdit.reasonFixHints(['tax-rate-mismatch:cgst', 'total-mismatch:100!=200'])
+  assert.ok(hints.every((h) => h.includes('reply 5-9 (the amounts)') || !h.startsWith('reply')), 'money errors point at 5-9')
+  assert.ok(hints.some((h) => /reply 5-9 \(the amounts\)/.test(h)), 'amounts block is named')
+})
+
+test('UX a blocker no single field clears (low-confidence) is an honest general check, never a misleading field pointer', () => {
+  const hints = reviewEdit.reasonFixHints(['low-confidence:0.42'])
+  assert.ok(hints.every((h) => !/reply \d/.test(h)), 'no fabricated field number for a non-field cause')
+  assert.ok(hints.some((h) => /general check/.test(h)), 'surfaced as a general check')
+})
+
+test('UX the editor renders the how-to-fix block only when a reason exists (and keeps the one-line why)', () => {
+  const withReason = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, { reasons: ['gstin-checksum-failed'] })
+  assert.match(withReason, /To fix, reply with the number shown/)
+  assert.match(withReason, /reply 2 \(Supplier GSTIN\)/)
+  assert.match(withReason, /Why this needs a check:.*checksum/, 'the P0-3 one-line why is still present')
+  const noReason = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, {})
+  assert.ok(!noReason.includes('To fix, reply with the number shown'), 'no phantom fix block when nothing is flagged')
+})
+
 test('P0-3 the machine reason codes ride in the encrypted payload and reach the list + editor', () => {
   const r = reviewSrc()
   assert.ok(/const REASONS_KEY = '_reviewReasons'/.test(r), 'one sibling key name carries the codes')
-  assert.ok(/encodeRow\(evaluation\.row, audit, reasons\)/.test(r), 'approval persists the current reasons')
-  assert.ok(/encodeRow\(evaluation\.row, audit, evaluation\.reasons\)/.test(r), 'correction persists the re-scored reasons')
+  assert.ok(/encodeRow\(evaluation\.row, nextAudit, reasons, nextClassification\)/.test(r), 'approval persists the current reasons AND classification')
+  assert.ok(/encodeRow\(evaluation\.row, nextAudit, evaluation\.reasons, nextClassification\)/.test(r), 'correction persists the re-scored reasons AND classification')
   assert.ok(/\[REASONS_KEY\]: reasonsRaw/.test(r) && /\.\.\.candidate/.test(r),
     'splitAudit strips the sibling so it never becomes a candidate field or reaches the export')
   const e = extractHandlerSrc()

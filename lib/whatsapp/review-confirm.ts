@@ -21,7 +21,7 @@ import { decryptExtractedPayload } from '@/lib/encryption'
 import { resolveFileKeyConfig } from '@/lib/encryption/files'
 import type { LedgerCandidate, LedgerRow } from '@/lib/ocr/ledger'
 import { applyInvoiceReview, applyInvoiceCorrection, parseReviewCorrections } from '@/lib/invoices/review'
-import { summarizeReasons } from '@/lib/whatsapp/review-edit'
+import { summarizeReasons, reasonFixHints } from '@/lib/whatsapp/review-edit'
 import { monthLabel } from '@/lib/exports/naming'
 import type { ConfirmOutcome } from '@/lib/whatsapp/finalize'
 
@@ -49,6 +49,9 @@ interface StoredRow {
   // Absent on pre-P0-3 rows; readers treat that as "no stored reason" and show a
   // generic prompt rather than guessing a cause.
   _reviewReasons?: string[]
+  // §Part-2 the encrypted classification sibling (document type + accounting
+  // category). Absent on pre-Part-2 rows; shown to the reviewer read-only.
+  _classification?: { documentType?: string; accountingCategory?: string } | null
 }
 
 /** The stored reason codes for a row, defensively read (never throws on shape). */
@@ -244,6 +247,11 @@ export interface ApproveAllResult {
   approved: number
   stillPending: number
   failed: number
+  /** §UX: distinct, field-specific "what to fix" hints aggregated from the rows
+   *  that stayed pending, so "approve all" can tell the reviewer exactly WHICH
+   *  field blocked filing instead of a vague "still needs attention". Descriptive
+   *  only — it never changes an approval decision or force-files anything. */
+  blockers: string[]
 }
 
 /**
@@ -259,13 +267,23 @@ export async function approveAllPending(
 ): Promise<ApproveAllResult> {
   const items = await listPendingReview(db, workspaceId) // first (up to 10) confirmable
   let approved = 0; let stillPending = 0; let failed = 0
+  const pendingReasons: string[] = []
   for (const item of items.slice(0, Math.max(0, cap))) {
     const r = await confirmInvoice(db, { workspaceId, invoiceId: item.invoiceId })
     if (!r.ok) { failed += 1; continue }
+    // Collect WHY a row stayed flagged (deduped by base code) so the summary can
+    // name the exact field to correct (§UX). Purely descriptive — it never changes
+    // the approve/hold decision made below.
+    if (r.review !== 'approved') {
+      for (const reason of r.reasons ?? []) {
+        const base = reason.split(':')[0]
+        if (!pendingReasons.some((x) => x.split(':')[0] === base)) pendingReasons.push(reason)
+      }
+    }
     if (r.review === 'approved') approved += 1
     else stillPending += 1 // re-validated but still flagged — never force-approved
   }
-  return { approved, stillPending, failed }
+  return { approved, stillPending, failed, blockers: reasonFixHints(pendingReasons, 3) }
 }
 
 // ---- WhatsApp-native editable review (correct a field, then approve) --------
@@ -277,7 +295,7 @@ export async function approveAllPending(
 // approve (confirmInvoice) files the invoice.
 
 export type InvoiceEditLoad =
-  | { ok: true; row: LedgerRow; reasons: string[] }
+  | { ok: true; row: LedgerRow; reasons: string[]; classification: { documentType: string; accountingCategory: string } | null }
   | { ok: false; error: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT' }
 
 /**
@@ -306,7 +324,11 @@ export async function loadInvoiceForEdit(
     const parsed = JSON.parse(
       decryptExtractedPayload(byteaToBuffer((rec as { encrypted_payload: unknown }).encrypted_payload), masterKeyHex),
     ) as StoredRow
-    return { ok: true, row: parsed as unknown as LedgerRow, reasons: storedReasons(parsed) }
+    const cls = parsed._classification
+    const classification = cls && typeof cls.documentType === 'string' && typeof cls.accountingCategory === 'string'
+      ? { documentType: cls.documentType, accountingCategory: cls.accountingCategory }
+      : null
+    return { ok: true, row: parsed as unknown as LedgerRow, reasons: storedReasons(parsed), classification }
   } catch {
     return { ok: false, error: 'FAULT' }
   }
@@ -321,6 +343,8 @@ export interface InvoiceEditOutcome {
   row?: LedgerRow
   /** True when the corrected row now validates clean + dated: a later APPROVE files it. */
   approvable?: boolean
+  /** §Part-2 the classification after this edit, for the read-only editor line. */
+  classification?: { documentType: string; accountingCategory: string } | null
   error?: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT'
 }
 
@@ -349,7 +373,12 @@ export async function applyInvoiceEdit(
 
   try {
     const res = await applyInvoiceCorrection(db, { workspaceId, invoiceId, corrections, masterKeyHex })
-    return { ok: true, review: res.review, reasons: res.reasons, row: res.row, approvable: res.approvable }
+    return {
+      ok: true, review: res.review, reasons: res.reasons, row: res.row, approvable: res.approvable,
+      classification: res.classification
+        ? { documentType: res.classification.documentType, accountingCategory: res.classification.accountingCategory }
+        : null,
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     if (/CORRECTION_INVOICE_NOT_FOUND/.test(msg)) return { ok: false, error: 'NOT_FOUND' }

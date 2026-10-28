@@ -133,6 +133,15 @@ export interface InvoiceExtractionResult {
    * photo or a one-invoice PDF.
    */
   multiInvoiceDetected: boolean
+  /**
+   * §Part-2 the raw text the LOCAL engine read (OCR output for raster, the text
+   * layer / rendered-page OCR for PDF). The classification engine reads the
+   * document's OWN headings from this; it is NEVER the AI structured read (which
+   * carries no page text), so an AI-sourced result yields '' and classification
+   * falls back to the deterministic candidate signals. In-memory only: this is
+   * raw OCR output, never persisted, never logged.
+   */
+  rawText?: string
 }
 
 export class InvoiceExtractionError extends Error {
@@ -514,7 +523,7 @@ async function extractScannedPdf(
   buffer: Buffer,
   maxPages: number,
   buyerGstin: string | null,
-): Promise<{ candidates: LedgerCandidate[]; pagesProcessed: number }> {
+): Promise<{ candidates: LedgerCandidate[]; pagesProcessed: number; text: string }> {
   const { pdfjs, canvas } = await loadPdfEngines()
   const pdf = await pdfjs.getDocument({
     data: new Uint8Array(buffer),
@@ -524,6 +533,7 @@ async function extractScannedPdf(
   }).promise
 
   const candidates: LedgerCandidate[] = []
+  const texts: string[] = []
   const pageCount = Math.min(pdf.numPages, maxPages)
 
   try {
@@ -556,6 +566,7 @@ async function extractScannedPdf(
         const text = await recognizeText(png, worker)
 
         if (hasMeaningfulText(text)) {
+          texts.push(text)
           const candidate = parseInvoiceText(text, { recipientGstin: buyerGstin })
           if (candidateHasUsefulFields(candidate)) candidates.push(candidate)
         }
@@ -568,7 +579,7 @@ async function extractScannedPdf(
     await pdf.destroy?.().catch(() => undefined)
   }
 
-  return { candidates, pagesProcessed: pageCount }
+  return { candidates, pagesProcessed: pageCount, text: texts.join('\n') }
 }
 
 /**
@@ -638,7 +649,7 @@ async function extractLocal(
   mimeType: string,
   maxPdfPages: number,
   buyerGstin: string | null,
-): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean }> {
+): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean; text: string }> {
   if (mimeType === PDF_MIME) {
     // Prefer genuine embedded text before spending CPU on OCR. Read it PAGE BY
     // PAGE and group by invoice number (§P3-14), so a digital PDF holding two
@@ -646,17 +657,21 @@ async function extractLocal(
     // whole-document parse would.
     try {
       const pagesText = await extractPdfTextLayerPages(buffer, maxPdfPages)
-      const pageCandidates = pagesText
-        .filter((text) => hasMeaningfulText(text))
+      const meaningfulPages = pagesText.filter((text) => hasMeaningfulText(text))
+      const pageCandidates = meaningfulPages
         .map((text) => parseInvoiceText(text, { recipientGstin: buyerGstin }))
         .filter((cand) => candidateHasUsefulFields(cand))
 
       if (pageCandidates.length > 0) {
         const combined = combinePageCandidates(pageCandidates)
+        // Carry the source text so the classification engine can read the
+        // document's OWN headings (§Part-2). A multi-invoice PDF is already
+        // forced to review, so a joined heading region is only ever advisory.
         return {
           candidate: combined.candidate,
           pagesProcessed: 0,
           multiInvoiceDetected: combined.multiInvoiceDetected,
+          text: meaningfulPages.join('\n'),
         }
       }
     } catch {
@@ -671,6 +686,7 @@ async function extractLocal(
       candidate: combined.candidate,
       pagesProcessed: scanned.pagesProcessed,
       multiInvoiceDetected: combined.multiInvoiceDetected,
+      text: scanned.text,
     }
   }
 
@@ -693,6 +709,7 @@ async function extractLocal(
     candidate: parsed && candidateHasUsefulFields(parsed) ? parsed : null,
     pagesProcessed: 1,
     multiInvoiceDetected: false,
+    text: meaningful ? text : '',
   }
 }
 
@@ -735,6 +752,9 @@ export async function extractInvoice(
   let conflictFields: string[] = []
   let imageQualityReasons: string[] = []
   let multiInvoiceDetected = false
+  // §Part-2 the local raw text (heading evidence for classification). Empty when
+  // local OCR produced nothing usable or the read came only from the AI path.
+  let localText = ''
 
   // OPT-IN PARALLEL VISION (§P2-11). Off unless the caller AND the operator enable
   // it, so the default local-first posture is untouched: Gemini is contacted only
@@ -760,6 +780,7 @@ export async function extractInvoice(
     candidate = local.candidate
     pagesProcessed = local.pagesProcessed
     multiInvoiceDetected = local.multiInvoiceDetected
+    localText = local.text
 
     if (candidate) source = 'local'
   } catch (error) {
@@ -1057,5 +1078,6 @@ export async function extractInvoice(
     conflictFields,
     imageQualityReasons,
     multiInvoiceDetected,
+    rawText: localText,
   }
 }

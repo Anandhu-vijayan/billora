@@ -6,6 +6,7 @@
 // Only `accepted` suppresses reprocessing. Retries are idempotent.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { IntakeStatus } from '@/lib/statuses'
+import { logger } from '../logger'
 import { wakeWorker } from '../jobs/wake'
 
 export type { IntakeStatus } from '@/lib/statuses'
@@ -211,6 +212,52 @@ export async function isDailyIntakeLimitReached(
     .neq('file_object_path', args.objectPath)
   if (error) throw new Error(`INTAKE_LIMIT_COUNT_ERROR: ${error.message}`)
   return (count ?? 0) >= args.limit
+}
+
+/**
+ * Layer 1 of duplicate prevention: is the EXACT SAME FILE (identical SHA-256)
+ * already filed as a LIVE invoice for this (workspace, client)? A byte-for-byte
+ * resend under a NEW provider media id slips past webhook idempotency (which is
+ * keyed on object path) and would otherwise become a second register row, so we
+ * check the stored `invoices.file_sha256` before uploading/queueing and skip it.
+ *
+ * Deliberately FAIL-OPEN: a lookup error (or the column being unreadable) must
+ * NEVER block a legitimate invoice — we return null and the normal intake path
+ * proceeds, deduping downstream as before. Only a genuinely matched live row
+ * (status <> 'deleted') short-circuits. Tenant-scoped: an organization matches
+ * within its own client; an individual (null client_id) matches null-client rows.
+ *
+ * Returns the matching invoice id, or null when there is no live duplicate.
+ */
+export async function findLiveInvoiceByFileHash(
+  db: Db,
+  args: { workspaceId: string; clientId: string | null; fileSha256Hex: string },
+): Promise<string | null> {
+  if (!args.fileSha256Hex) return null
+  try {
+    let query = db
+      .from('invoices')
+      .select('id')
+      .eq('workspace_id', args.workspaceId)
+      .eq('file_sha256', `\\x${args.fileSha256Hex}`)
+      .neq('status', 'deleted')
+      .limit(1)
+    query = args.clientId
+      ? (query.eq('client_id', args.clientId) as typeof query)
+      : (query.is('client_id', null) as typeof query)
+    const { data, error } = await (query as unknown as {
+      maybeSingle: () => Promise<{ data: { id: string } | null; error: { message: string } | null }>
+    }).maybeSingle()
+    if (error) {
+      logger.warn('[Intake] exact-file duplicate lookup failed; proceeding (fail-open)', { code: error.message.slice(0, 80) })
+      return null
+    }
+    return data?.id ?? null
+  } catch (e) {
+    // Any unexpected throw still must not lose a real invoice.
+    logger.warn('[Intake] exact-file duplicate lookup threw; proceeding (fail-open)', { error: e instanceof Error ? e.message : String(e) })
+    return null
+  }
 }
 
 // ---- Pending uploads ("receive first, ask later") -------------------------

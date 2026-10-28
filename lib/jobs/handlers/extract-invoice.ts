@@ -27,7 +27,11 @@ import {
 } from '@/lib/encryption/files'
 import { encryptExtractedPayload } from '@/lib/encryption'
 import { evaluateLedger } from '@/lib/ocr/ledger'
+import { classifyDocument, headingRegion } from '@/lib/ocr/classify'
 import { resolveInvoiceBatch } from '@/lib/invoices/batch'
+import {
+  computeIdentityKey, identityKeyToBytea, DUPLICATE_IDENTITY_REASON,
+} from '@/lib/invoices/dedup'
 import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
 import {
   extractInvoice as runExtraction,
@@ -238,6 +242,75 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       })
     }
 
+    // §Part-2 classify the document's TYPE (what it IS) separately from its
+    // accounting CATEGORY (how it books), from the document's OWN printed headings
+    // — never a filename and never a single generic keyword. Only a POSITIVE
+    // signal adds a review reason here: two competing titles, or a document that
+    // is clearly NOT invoice-shaped (a receipt / payment voucher / delivery
+    // challan / proforma). An ABSENT heading never blocks, so the historical
+    // purchase-register default and its recall are preserved. Like the conflict /
+    // quality / multi-invoice / note gates this can ONLY add a reason and push to
+    // review (never approve). The full metadata is carried as an encrypted sibling
+    // (`_classification`), never overwriting the original OCR row (§2.3).
+    const classification = classifyDocument({
+      structuralNoteType: documentType,
+      headingText: headingRegion(result.rawText ?? ''),
+      fullText: result.rawText ?? '',
+    })
+    if (classification.needsReview) {
+      if (evaluation.review === 'approved') evaluation.review = 'needs_review'
+      for (const reason of classification.reviewReasons) {
+        if (!evaluation.reasons.includes(reason)) {
+          evaluation.reasons = [...evaluation.reasons, reason]
+        }
+      }
+      logger.info('[Extract] classification forced review', {
+        invoiceId, jobId: job.id,
+        documentType: classification.documentType,
+        accountingCategory: classification.accountingCategory,
+        reasonCodes: classification.reviewReasons,
+      })
+    }
+
+    // §Part-5 Layer 2 (invoice-identity duplicate detection). Distinct from the
+    // exact-file Layer 1: a re-scan of the SAME physical bill (a photo and a PDF
+    // of one invoice) has different bytes yet the same identity. We build a blind
+    // index (HMAC of the canonical invoice number + supplier + date under the
+    // file master key — never the plaintext) and look for a PRIOR live invoice in
+    // this (workspace, client) sharing it. A hit only ADDS a reason and pushes to
+    // review (NEVER auto-drops, NEVER approves, NEVER deletes either row) — a
+    // human confirms. The key is computed fail-soft and persisted as a separate
+    // best-effort write below, so extraction is completely unaffected when the
+    // additive `identity_key` migration has not been applied yet.
+    let identityKeyHex: string | null = null
+    try {
+      identityKeyHex = computeIdentityKey(
+        {
+          invoiceNumber: evaluation.row.invoice_number,
+          supplierGstin: evaluation.row.supplier_gstin,
+          vendorName: evaluation.row.vendor_name,
+          invoiceDate: evaluation.row.invoice_date,
+        },
+        masterKeyHex,
+      )
+    } catch {
+      identityKeyHex = null
+    }
+    if (identityKeyHex) {
+      const priorId = await findPriorDuplicateIdentity(db, {
+        workspaceId, clientId: invoice.client_id, identityKeyHex, excludeInvoiceId: invoiceId,
+      })
+      if (priorId) {
+        if (evaluation.review === 'approved') evaluation.review = 'needs_review'
+        if (!evaluation.reasons.includes(DUPLICATE_IDENTITY_REASON)) {
+          evaluation.reasons = [...evaluation.reasons, DUPLICATE_IDENTITY_REASON]
+        }
+        logger.info('[Extract] possible duplicate identity flagged for review', {
+          invoiceId, jobId: job.id, priorInvoiceId: priorId.slice(0, 8),
+        })
+      }
+    }
+
     // Say WHY nothing could read the file: a silent empty review row was previously
     // indistinguishable from a model failure in the logs.
     if (confidenceSource === 'human' && evaluation.review === 'needs_review') {
@@ -263,6 +336,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         ...evaluation.row,
         _reviewReasons: evaluation.reasons,
         _recipientGstin: result.candidate.recipient_gstin ?? null,
+        _classification: classification,
       }),
       masterKeyHex,
     )
@@ -324,6 +398,22 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       .eq('workspace_id', workspaceId).eq('id', invoiceId)
     if (stErr) throw new Error(`INVOICE_STATUS_ERROR: ${stErr.message}`)
 
+    // §Part-5: persist the identity blind index as a SEPARATE best-effort write.
+    // Kept apart from the status update on purpose — if the additive
+    // `identity_key` migration has not been applied, this update fails SOFT (a
+    // logged warning) and the invoice is still correctly routed to review above;
+    // the whole feature stays inactive until the operator applies the migration.
+    if (identityKeyHex) {
+      const { error: idErr } = await db.from('invoices')
+        .update({ identity_key: identityKeyToBytea(identityKeyHex) })
+        .eq('workspace_id', workspaceId).eq('id', invoiceId)
+      if (idErr) {
+        logger.warn('[Extract] identity_key write skipped (migration not applied?); duplicate detection inactive', {
+          invoiceId, jobId: job.id, code: idErr.code ?? 'unknown',
+        })
+      }
+    }
+
     // Batch + register scheduling is NOT restricted to approved invoices: a
     // needs_review invoice with a reliably parsed date still belongs in its real
     // (client, month) batch so the register can account for outstanding review
@@ -369,6 +459,52 @@ function imageQualityGateFromEnv(env: ReturnType<typeof getEnv>): {
     ...(typeof env.IMAGE_BLUR_VARIANCE_MAX === 'number' ? { blurVarianceAtMost: env.IMAGE_BLUR_VARIANCE_MAX } : {}),
     ...(typeof env.IMAGE_MIN_LONG_EDGE === 'number' ? { minLongEdge: env.IMAGE_MIN_LONG_EDGE } : {}),
     ...(typeof env.IMAGE_MIN_PIXELS === 'number' ? { minPixels: env.IMAGE_MIN_PIXELS } : {}),
+  }
+}
+
+/**
+ * §Part-5 Layer 2 lookup: is there a PRIOR LIVE invoice in this (workspace,
+ * client) whose identity blind index equals `identityKeyHex`? Excludes the
+ * invoice currently being extracted and any soft-deleted row. Tenant-scoped, and
+ * a null client (individual) is matched with an `is client_id null` filter so two
+ * organizations never see each other's keys.
+ *
+ * Deliberately FAIL-SOFT: if the additive `identity_key` column has not been
+ * created yet (migration unapplied) the read errors — we log and return null so
+ * extraction proceeds with duplicate detection simply inactive, exactly the way
+ * the optional `own_gstin` read degrades. A lookup must never break a real bill.
+ */
+async function findPriorDuplicateIdentity(
+  db: Db,
+  args: { workspaceId: string; clientId: string | null; identityKeyHex: string; excludeInvoiceId: string },
+): Promise<string | null> {
+  try {
+    let query = db
+      .from('invoices')
+      .select('id')
+      .eq('workspace_id', args.workspaceId)
+      .eq('identity_key', identityKeyToBytea(args.identityKeyHex))
+      .neq('id', args.excludeInvoiceId)
+      .neq('status', 'deleted')
+      .limit(1)
+    query = args.clientId
+      ? (query.eq('client_id', args.clientId) as typeof query)
+      : (query.is('client_id', null) as typeof query)
+    const { data, error } = await (query as unknown as {
+      maybeSingle: () => Promise<{ data: { id: string } | null; error: { message: string } | null }>
+    }).maybeSingle()
+    if (error) {
+      logger.warn('[Extract] identity duplicate lookup failed; continuing (fail-soft)', {
+        code: error.message.slice(0, 80),
+      })
+      return null
+    }
+    return data?.id ?? null
+  } catch (e) {
+    logger.warn('[Extract] identity duplicate lookup threw; continuing (fail-soft)', {
+      error: e instanceof Error ? e.message : String(e),
+    })
+    return null
   }
 }
 

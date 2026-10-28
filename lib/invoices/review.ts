@@ -27,6 +27,10 @@ import { logger } from '@/lib/logger'
 import { encryptExtractedPayload, decryptExtractedPayload } from '@/lib/encryption'
 import { deriveKeyVersion } from '@/lib/encryption/files'
 import { evaluateLedger, mergeCandidates, type LedgerCandidate, type LedgerRow } from '@/lib/ocr/ledger'
+import {
+  applyUserClassification, isAccountingCategory, isDocTypeFull, CLASSIFICATION_VERSION,
+  type ClassificationResult,
+} from '@/lib/ocr/classify'
 import { moneyToMinorUnits, minorUnitsToNumber } from '@/lib/ocr/validators/money'
 import { resolveInvoiceBatch } from '@/lib/invoices/batch'
 
@@ -82,7 +86,18 @@ const REASONS_KEY = '_reviewReasons'
 // GSTIN from the recurring buyer token. Stripped here (underscore-prefixed, never
 // a candidate field) so a review merge can never read it as invoice data.
 const RECIPIENT_KEY = '_recipientGstin'
+// §Part-2 the machine classification (document TYPE vs accounting CATEGORY) for
+// this row, carried as its own encrypted sibling exactly like the audit/reasons.
+// It is split OUT of the candidate on read (so it can never be merged as invoice
+// data) and re-attached on write, so a correction/approval never silently drops
+// it. Its `needsReview` guard is re-folded (ADDITIVELY) on every re-score, so a
+// non-invoice document can never be approved by an edit that re-derives reasons
+// from scratch. Never overwrites the original OCR row (§2.3).
+const CLASSIFICATION_KEY = '_classification'
 const AUDIT_HISTORY_CAP = 50
+
+/** A reviewer-confirmed classification change; values are validated as enums. */
+export interface ClassificationPatch { documentType?: unknown; accountingCategory?: unknown }
 
 function decodeStoredRecord(encryptedPayload: unknown, masterKeyHex: string): StoredRecord | null {
   try {
@@ -96,10 +111,10 @@ function decodeStoredRecord(encryptedPayload: unknown, masterKeyHex: string): St
   }
 }
 
-/** Split a stored record into the field candidate, its audit and its reason codes. */
-function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; audit: CorrectionAudit | null; reasons: string[] } {
-  if (!record) return { candidate: {}, audit: null, reasons: [] }
-  const { [AUDIT_KEY]: auditRaw, [REASONS_KEY]: reasonsRaw, ...candidate } = record
+/** Split a stored record into the field candidate, its audit, reason codes and classification. */
+function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; audit: CorrectionAudit | null; reasons: string[]; classification: ClassificationResult | null } {
+  if (!record) return { candidate: {}, audit: null, reasons: [], classification: null }
+  const { [AUDIT_KEY]: auditRaw, [REASONS_KEY]: reasonsRaw, [CLASSIFICATION_KEY]: classRaw, ...candidate } = record
   // Drop the informational recipient sibling (§P0-1c) so a review merge can never
   // read it back as a candidate field; underscore-prefixed keys are never invoice data.
   delete candidate[RECIPIENT_KEY]
@@ -109,13 +124,76 @@ function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; 
   const reasons = Array.isArray(reasonsRaw)
     ? (reasonsRaw as unknown[]).filter((r): r is string => typeof r === 'string')
     : []
-  return { candidate: candidate as LedgerCandidate, audit, reasons }
+  // Defensive: a pre-Part-2 row carries no classification, and a corrupt one is
+  // treated as absent rather than trusted — a human can still set it explicitly.
+  const c = classRaw as Partial<ClassificationResult> | null | undefined
+  const classification = c && typeof c === 'object' && isDocTypeFull(c.documentType) && isAccountingCategory(c.accountingCategory)
+    ? (classRaw as ClassificationResult)
+    : null
+  return { candidate: candidate as LedgerCandidate, audit, reasons, classification }
 }
 
-/** Re-encode a canonical row, preserving its audit and current reason codes. */
-function encodeRow(row: LedgerRow, audit: CorrectionAudit | null, reasons: readonly string[]): string {
+/** Re-encode a canonical row, preserving its audit, current reason codes and classification. */
+function encodeRow(row: LedgerRow, audit: CorrectionAudit | null, reasons: readonly string[], classification: ClassificationResult | null): string {
   const payload: StoredRecord = { ...row, [REASONS_KEY]: [...reasons] }
+  if (classification) payload[CLASSIFICATION_KEY] = classification
   return audit ? JSON.stringify({ ...payload, [AUDIT_KEY]: audit }) : JSON.stringify(payload)
+}
+
+/**
+ * A neutral baseline so a reviewer can confirm a classification on a row extracted
+ * before Part 2 (which stored none). It never invents a type/category: both stay
+ * 'unknown' until the human picks one, and the additive guard below then lifts.
+ */
+function baselineClassification(stored: ClassificationResult | null): ClassificationResult {
+  return stored ?? {
+    documentType: 'unknown', accountingCategory: 'unknown', method: 'rules',
+    confidence: 'low', evidence: ['no machine classification stored for this row'],
+    needsReview: false, reviewReasons: [], originalInvoiceRef: null, version: CLASSIFICATION_VERSION,
+  }
+}
+
+/**
+ * Re-fold the deterministic classification review guard into a freshly re-scored
+ * row. Like every other review gate here this is ADDITIVE ONLY: it can hold a row
+ * in `needs_review` and add its reason codes, but it NEVER approves and NEVER
+ * clears a reason the deterministic engine raised. Without it, a non-invoice
+ * document (a receipt / payment voucher / challan / proforma) that extraction
+ * forced to review would lose that reason on a later edit that re-derives reasons
+ * from scratch and could be silently approved into the purchase register (§2.3).
+ */
+function foldClassificationGuard(
+  review: 'approved' | 'needs_review',
+  reasons: string[],
+  classification: ClassificationResult | null,
+): 'approved' | 'needs_review' {
+  if (classification?.needsReview) {
+    if (review === 'approved') review = 'needs_review'
+    for (const r of classification.reviewReasons ?? []) {
+      if (!reasons.includes(r)) reasons.push(r)
+    }
+  }
+  return review
+}
+
+/** Append the reviewer's classification change to the correction audit, if any. */
+function appendClassificationHistory(
+  audit: CorrectionAudit | null,
+  prior: ClassificationResult | null,
+  next: ClassificationResult | null,
+): CorrectionAudit | null {
+  if (!next) return audit
+  const now = new Date().toISOString()
+  const added: CorrectionHistoryEntry[] = []
+  if (prior?.documentType !== next.documentType) {
+    added.push({ field: 'documentType', from: prior?.documentType ?? null, to: next.documentType, at: now, source: 'human' })
+  }
+  if (prior?.accountingCategory !== next.accountingCategory) {
+    added.push({ field: 'accountingCategory', from: prior?.accountingCategory ?? null, to: next.accountingCategory, at: now, source: 'human' })
+  }
+  if (added.length === 0) return audit
+  const base: CorrectionAudit = audit ?? { originalExtracted: null, history: [] }
+  return { originalExtracted: base.originalExtracted, history: [...base.history, ...added].slice(-AUDIT_HISTORY_CAP) }
 }
 
 function scalarToString(v: unknown): string | null {
@@ -174,6 +252,13 @@ export async function applyInvoiceReview(
     masterKeyHex: string
     /** Override the auto-approve bar (defaults to EXTRACTION_MIN_CONFIDENCE). */
     minConfidence?: number
+    /**
+     * §Part-2 a reviewer-confirmed classification (document type and/or accounting
+     * category). Validated as enums by parseReviewCorrections; applied via
+     * applyUserClassification so provenance becomes 'user' and the machine's
+     * classification review guard lifts ONLY because a human answered the question.
+     */
+    classificationPatch?: ClassificationPatch
   },
 ): Promise<InvoiceReviewResult> {
   const { workspaceId, invoiceId, masterKeyHex } = args
@@ -192,7 +277,7 @@ export async function applyInvoiceReview(
     .select('encrypted_payload')
     .eq('workspace_id', workspaceId).eq('invoice_id', invoiceId).maybeSingle()
   if (recReadErr) throw new Error(`REVIEW_RECORD_READ_ERROR: ${recReadErr.message}`)
-  const { candidate: existing, audit } = splitAudit(
+  const { candidate: existing, audit, classification: storedClassification } = splitAudit(
     rec ? decodeStoredRecord((rec as { encrypted_payload: unknown }).encrypted_payload, masterKeyHex) : null,
   )
 
@@ -226,8 +311,23 @@ export async function applyInvoiceReview(
     reasons.push('review-confirmation-required')
   }
 
+  // §Part-2 resolve the row's classification. A reviewer patch becomes the 'user'
+  // result (and may lift the machine guard); otherwise the stored classification is
+  // preserved unchanged. The additive guard is then re-folded so a non-invoice
+  // document that a fresh re-score no longer names stays held for review until a
+  // human confirms it. It can never approve a row the deterministic engine flagged.
+  let nextClassification = storedClassification
+  let nextAudit = audit
+  if (args.classificationPatch) {
+    nextClassification = applyUserClassification(
+      baselineClassification(storedClassification), args.classificationPatch,
+    )
+    nextAudit = appendClassificationHistory(audit, storedClassification, nextClassification)
+  }
+  review = foldClassificationGuard(review, reasons, nextClassification)
+
   const keyVersion = deriveKeyVersion(masterKeyHex)
-  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit, reasons), masterKeyHex)
+  const payload = encryptExtractedPayload(encodeRow(evaluation.row, nextAudit, reasons, nextClassification), masterKeyHex)
   const { error: recWriteErr } = await db.from('extracted_records').upsert({
     workspace_id: workspaceId,
     invoice_id: invoiceId,
@@ -295,7 +395,7 @@ function parseReviewMoney(v: unknown): number | null {
  * Date VALUE correctness is NOT re-implemented here; the shared date service in
  * evaluateLedger re-scores it and keeps the row in review if unresolved (§4).
  */
-export function parseReviewCorrections(body: unknown): { corrections: LedgerCandidate; errors: ReviewFieldError[] } {
+export function parseReviewCorrections(body: unknown): { corrections: LedgerCandidate; errors: ReviewFieldError[]; classification?: ClassificationPatch } {
   const src = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
   const corrections: LedgerCandidate = {}
   const errors: ReviewFieldError[] = []
@@ -322,7 +422,25 @@ export function parseReviewCorrections(body: unknown): { corrections: LedgerCand
   for (const f of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) readAmount(f, src[f], false)
   for (const f of ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const) readAmount(f, src[f], true)
 
-  return { corrections, errors }
+  // §Part-2 an optional reviewer-confirmed classification (document type and/or
+  // accounting category). Validated against the STRICT enums here and never coerced:
+  // an out-of-enum label is a field error the caller surfaces, so a malformed value
+  // can never silently re-label a document. Absent/blank means "no change".
+  let classification: ClassificationPatch | undefined
+  const cls = src.classification
+  if (cls && typeof cls === 'object' && !Array.isArray(cls)) {
+    const c = cls as Record<string, unknown>
+    if (present(c.documentType)) {
+      if (!isDocTypeFull(c.documentType)) errors.push({ field: 'classification.documentType', code: 'INVALID_ENUM' })
+      else classification = { ...classification, documentType: c.documentType }
+    }
+    if (present(c.accountingCategory)) {
+      if (!isAccountingCategory(c.accountingCategory)) errors.push({ field: 'classification.accountingCategory', code: 'INVALID_ENUM' })
+      else classification = { ...classification, accountingCategory: c.accountingCategory }
+    }
+  }
+
+  return { corrections, errors, classification }
 }
 
 export interface InvoiceCorrectionResult {
@@ -333,6 +451,8 @@ export interface InvoiceCorrectionResult {
   row: LedgerRow
   /** True when the corrected row is fully valid AND dated — i.e. APPROVE would file it. */
   approvable: boolean
+  /** §Part-2 the row's classification after this edit (preserved or user-confirmed). */
+  classification: ClassificationResult | null
 }
 
 /**
@@ -354,6 +474,8 @@ export async function applyInvoiceCorrection(
     /** Already-validated field corrections (see parseReviewCorrections). */
     corrections: LedgerCandidate
     masterKeyHex: string
+    /** §Part-2 an optional reviewer-confirmed classification (validated as enums). */
+    classificationPatch?: ClassificationPatch
   },
 ): Promise<InvoiceCorrectionResult> {
   const { workspaceId, invoiceId, masterKeyHex } = args
@@ -369,7 +491,7 @@ export async function applyInvoiceCorrection(
     .select('encrypted_payload')
     .eq('workspace_id', workspaceId).eq('invoice_id', invoiceId).maybeSingle()
   if (recReadErr) throw new Error(`CORRECTION_RECORD_READ_ERROR: ${recReadErr.message}`)
-  const { candidate: existing, audit: priorAudit } = splitAudit(
+  const { candidate: existing, audit: priorAudit, classification: storedClassification } = splitAudit(
     rec ? decodeStoredRecord((rec as { encrypted_payload: unknown }).encrypted_payload, masterKeyHex) : null,
   )
 
@@ -386,8 +508,23 @@ export async function applyInvoiceCorrection(
   })
 
   const audit = buildCorrectionAudit(priorAudit, existing, args.corrections)
+
+  // §Part-2 preserve (or, when supplied, apply) the row's classification and
+  // re-fold its ADDITIVE review guard, so editing a field on a non-invoice
+  // document can never clear the reason that keeps it out of the register. Only a
+  // reviewer-confirmed classification lifts it, and only because a human answered.
+  let nextClassification = storedClassification
+  let nextAudit = audit
+  if (args.classificationPatch) {
+    nextClassification = applyUserClassification(
+      baselineClassification(storedClassification), args.classificationPatch,
+    )
+    nextAudit = appendClassificationHistory(audit, storedClassification, nextClassification) ?? audit
+  }
+  const review = foldClassificationGuard(evaluation.review, evaluation.reasons, nextClassification)
+
   const keyVersion = deriveKeyVersion(masterKeyHex)
-  const payload = encryptExtractedPayload(encodeRow(evaluation.row, audit, evaluation.reasons), masterKeyHex)
+  const payload = encryptExtractedPayload(encodeRow(evaluation.row, nextAudit, evaluation.reasons, nextClassification), masterKeyHex)
   // review_status stays 'needs_review' on this path: a correction is not an
   // approval. This keeps the invoice discoverable in the pending list so the
   // reviewer can still APPROVE (or keep correcting) it.
@@ -403,10 +540,11 @@ export async function applyInvoiceCorrection(
   if (recWriteErr) throw new Error(`CORRECTION_RECORD_WRITE_ERROR: ${recWriteErr.message}`)
 
   return {
-    review: evaluation.review,
+    review,
     reasons: evaluation.reasons,
     confidence: evaluation.confidence,
     row: evaluation.row,
-    approvable: evaluation.review === 'approved' && evaluation.invoiceDateResolved,
+    approvable: review === 'approved' && evaluation.invoiceDateResolved,
+    classification: nextClassification,
   }
 }

@@ -21,11 +21,11 @@ import {
 import {
   claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed,
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
-  isDailyIntakeLimitReached,
+  isDailyIntakeLimitReached, findLiveInvoiceByFileHash,
 } from '@/lib/whatsapp/intake';
 import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
-  composeConfirmResultMessage, type ConfirmOutcome,
+  composeConfirmResultMessage, pickPrimaryWorkbook, type ConfirmOutcome,
 } from '@/lib/whatsapp/finalize';
 import { listPendingReviewPage, confirmInvoice, approveAllPending, loadInvoiceForEdit, applyInvoiceEdit } from '@/lib/whatsapp/review-confirm';
 // Opt-in proactive delivery (§P1-6). The pure gate reads the flag/key/window; the
@@ -243,12 +243,20 @@ async function handleOnboardingSideEffects(
       try {
         const r = await approveAllPending(db, workspaceId, 25);
         const parts: string[] = [];
-        if (r.approved > 0) parts.push(`${r.approved} invoice(s) approved for the register.`);
-        if (r.stillPending > 0) parts.push(`${r.stillPending} still need attention — a value did not add up, so nothing was forced through.`);
+        if (r.approved > 0) parts.push(`${r.approved} invoice(s) approved and filed for the register.`);
+        if (r.stillPending > 0) {
+          // §UX: name the EXACT field to correct so "approve all" never looks like it
+          // did nothing. Descriptive only — a row that fails a validator is still
+          // never force-filed; the reviewer fixes the field, then replies APPROVE.
+          const fix = r.blockers.length > 0
+            ? ` Tap the invoice below and ${r.blockers.join('; ')}, then reply APPROVE.`
+            : ' Tap an invoice below, fix the flagged field, then reply APPROVE.';
+          parts.push(`${r.stillPending} could NOT be approved as-is — a value did not add up, so nothing was forced through.${fix}`);
+        }
         if (r.failed > 0) parts.push(`${r.failed} could not be processed right now — please try again in a moment.`);
         approveAllSummary = parts.length > 0
-          ? `Approve all: ${parts.join(' ')} Your register is sent here automatically once everything is filed.`
-          : 'Nothing was ready for bulk approval — every flagged invoice still needs a specific correction. Reply Review to see the list.';
+          ? `Approve all: ${parts.join(' ')} Your Excel register is generated and sent here automatically once every invoice is approved — nothing is filed until then.`
+          : 'Nothing was ready for bulk approval — send Review, tap an invoice, fix the field it names, then reply APPROVE.';
       } catch (e) {
         logger.warn('[WhatsApp] approve-all failed', { sender: label, error: e instanceof Error ? e.message : String(e) });
         approveAllSummary = 'I could not complete the bulk approval right now — please try again in a moment.';
@@ -271,7 +279,7 @@ async function handleOnboardingSideEffects(
         // ENTER the editor (tapped an Edit row): read-only, shows the stored row.
         editInvoiceId = invoiceId;
         const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
-        if (load.ok) editReplyBody = composeReviewEditorMessage(load.row, { reasons: load.reasons });
+        if (load.ok) editReplyBody = composeReviewEditorMessage(load.row, { reasons: load.reasons, classification: load.classification });
         else if (load.error === 'NOT_PENDING') editReplyBody = 'That invoice is no longer pending review — send Review to see the current list.';
         else if (load.error === 'NOT_FOUND') editReplyBody = 'That invoice was not found — send Review to see the current list.';
         else editReplyBody = 'I could not open that invoice right now — please try again in a moment.';
@@ -281,7 +289,7 @@ async function handleOnboardingSideEffects(
           const note = outcome.approvable
             ? 'Saved. Everything checks out now — reply APPROVE to file it for the register.'
             : 'Saved. It is still flagged because something does not add up — correct another field, or reply APPROVE only if you are sure.';
-          editReplyBody = composeReviewEditorMessage(outcome.row, { note, reasons: outcome.reasons });
+          editReplyBody = composeReviewEditorMessage(outcome.row, { note, reasons: outcome.reasons, classification: outcome.classification ?? null });
         } else if (outcome.fieldErrors && outcome.fieldErrors.length > 0) {
           // Never silently drop a malformed value: name the field + why.
           editReplyBody = `${describeFieldErrors(cmd.field.label, outcome.fieldErrors)}\n\n${REVIEW_EDIT_HELP}`;
@@ -309,7 +317,7 @@ async function handleOnboardingSideEffects(
           // Not approvable yet: stay in the editor and re-show it truthfully.
           const load = await loadInvoiceForEdit(db, { workspaceId, invoiceId });
           if (load.ok) {
-            editReplyBody += '\n\n' + composeReviewEditorMessage(load.row, { header: 'Still needs a fix before it can be approved:', note: 'Correct a field above, or reply CANCEL to leave it flagged.', reasons: load.reasons });
+            editReplyBody += '\n\n' + composeReviewEditorMessage(load.row, { header: 'Still needs a fix before it can be approved:', note: 'Correct a field above, or reply CANCEL to leave it flagged.', reasons: load.reasons, classification: load.classification });
           } else {
             editInvoiceId = null; result.nextState = 'collecting';
           }
@@ -376,11 +384,14 @@ async function handleOnboardingSideEffects(
   // the promised "sent here" means the file itself. Idempotent: a workbook is
   // only pushed while status='ready' and flips to 'sent' after a confirmed send,
   // so repeated Done/Review never re-sends. Returns how many are in the chat.
+  // Each push gets a correlation log (§delivery audit): which exact workbook
+  // landed for this sender, so a wrong-month report is traceable to one row.
   const deliverRegisterDocuments = async (workbookIds: string[]): Promise<number> => {
     let delivered = 0;
     for (const id of workbookIds.slice(0, 5)) {
       const r = await deliverWorkbookToWhatsApp(db, { workbookId: id, to });
       if (r.delivered) delivered += 1;
+      logger.info('[WhatsApp] register delivery attempt', { sender: label, workbookId: id, outcome: r.outcome });
       if (r.outcome === 'blocked' || r.outcome === 'transient') track(r.outcome);
     }
     return delivered;
@@ -431,13 +442,20 @@ async function handleOnboardingSideEffects(
   // idempotent: scheduling is deduped and the reads never mutate processing state.
   const deliverDone = async (): Promise<void> => {
     if (!workspaceId) { await deliverText('Nothing to finalize yet — send Hi to start, or just send an invoice.'); return; }
+    // Serve ONLY this sender's tenant: individuals see client-less batches,
+    // org senders see their selected client's. An older month still sitting at
+    // 'ready' for another client can then never ride along on this reply.
+    const scope = { clientId: clientId ?? null };
     try {
-      await ensureBatchRegisters(db, workspaceId);
-      const counts = await collectFinalizeState(db, workspaceId);
+      await ensureBatchRegisters(db, workspaceId, scope);
+      const counts = await collectFinalizeState(db, workspaceId, scope);
       const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
       const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
-      const link = base && counts.readyWorkbookIds.length > 0
-        ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
+      // Deterministic link: the LATEST accounting period among the scoped ready
+      // registers — never an arbitrary first row (the wrong-month leak path).
+      const primary = pickPrimaryWorkbook(counts.readyMonths ?? [])?.workbookId ?? null;
+      const link = base && primary
+        ? `${base}/api/exports/${primary}/download`
         : null;
       await deliverText(composeDoneMessage(counts, { link, delivered: delivered > 0 }));
     } catch (e) {
@@ -502,11 +520,15 @@ async function handleOnboardingSideEffects(
         body = "You're not set up yet — send Hi to begin, or just send an invoice.";
       } else {
         try {
-          const counts = await collectFinalizeState(db, workspaceId);
+          // Same tenant scope as Done: a Review reply can only ever carry this
+          // sender's own client's ready registers, latest period first.
+          const scope = { clientId: clientId ?? null };
+          const counts = await collectFinalizeState(db, workspaceId, scope);
           const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
           const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
-          const link = base && counts.readyWorkbookIds.length > 0
-            ? `${base}/api/exports/${counts.readyWorkbookIds[0]}/download`
+          const primary = pickPrimaryWorkbook(counts.readyMonths ?? [])?.workbookId ?? null;
+          const link = base && primary
+            ? `${base}/api/exports/${primary}/download`
             : null;
           body = composeReviewMessage(counts, { link, delivered: delivered > 0 });
         } catch {
@@ -968,6 +990,26 @@ async function processMessage(
   // Assigned path is deterministic too (per provider media id): combined with
   // the invoices.file_object_path unique constraint, a redelivery can never
   // store or queue the same file twice, whatever the retry timing.
+  //
+  // §Part-5 Layer 1 (exact-file duplicate prevention): a byte-for-byte resend
+  // arrives under a NEW provider media id, so it gets a NEW object path and slips
+  // past the object-path idempotency above — it would become a second register
+  // row and spend a second (gated) Gemini extraction. We check the stored
+  // SHA-256 over the plaintext bytes against LIVE invoices for this (workspace,
+  // client) BEFORE uploading/queueing: an exact match is acknowledged and skipped
+  // (nothing is lost — the bytes already exist as a row). The lookup is fail-open,
+  // so an error never blocks a legitimate invoice. An early `return;` mirrors the
+  // daily-limit guard below: the intake still settles accepted exactly once.
+  const duplicateFileInvoiceId = await findLiveInvoiceByFileHash(db, {
+    workspaceId, clientId, fileSha256Hex: sha256Hex,
+  });
+  if (duplicateFileInvoiceId) {
+    logger.info('[WhatsApp] exact-file duplicate skipped at intake', {
+      shortId, invoiceId: duplicateFileInvoiceId.slice(0, 8),
+    });
+    await sendText(message.from, 'I already received that exact file, so I did not add it again — nothing was lost. Send a different invoice anytime, or type Done / Menu.');
+    return;
+  }
   const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
   // Abuse / provider-quota guard, enforced here — before the extraction job is
   // created — because that job is what spends (gated) Gemini quota plus OCR and

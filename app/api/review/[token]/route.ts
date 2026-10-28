@@ -114,7 +114,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ token: string 
     return deny(400, 'INVALID_BODY')
   }
 
-  const { corrections, errors } = parseReviewCorrections(body)
+  const { corrections, errors, classification } = parseReviewCorrections(body)
   if (errors.length > 0) {
     return NextResponse.json(
       { ok: false, error: { code: 'INVALID_FIELDS', fields: errors } },
@@ -124,7 +124,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ token: string 
 
   try {
     const result = await applyInvoiceReview(db, {
-      workspaceId, invoiceId, corrections, masterKeyHex,
+      workspaceId, invoiceId, corrections, classificationPatch: classification, masterKeyHex,
     })
     // Audit: field NAMES only — never values, GSTINs, vendor names, amounts, the
     // token or the key (§11 no-sensitive-content logging).

@@ -77,7 +77,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return deny(400, 'INVALID_BODY')
   }
 
-  const { corrections, errors } = parseReviewCorrections(body)
+  const { corrections, errors, classification } = parseReviewCorrections(body)
   if (errors.length > 0) {
     // Never silently drop a malformed correction: tell the caller exactly which
     // fields were rejected and why, so the UI can surface field-level feedback.
@@ -89,7 +89,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   try {
     const result = await applyInvoiceReview(db, {
-      workspaceId, invoiceId: id, corrections, masterKeyHex,
+      workspaceId, invoiceId: id, corrections, classificationPatch: classification, masterKeyHex,
     })
     // Audit metadata: WHO corrected WHICH fields on WHICH invoice, and the
     // resulting state. Only field NAMES are logged — never their values, GSTINs,

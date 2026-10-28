@@ -275,11 +275,11 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     .eq('workspace_id', workspaceId).eq('review_status', 'approved').in('invoice_id', invoiceIds)
   if (recErr) throw new Error(`RECORDS_READ_ERROR: ${recErr.message}`)
 
-  const rows: LedgerRow[] = []
+  const rows: Array<LedgerRow & { _classification?: { accountingCategory?: unknown } }> = []
   for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
     try {
       const plain = decryptExtractedPayload(byteaToBuffer(rec.encrypted_payload), masterKeyHex)
-      rows.push(JSON.parse(plain) as LedgerRow)
+      rows.push(JSON.parse(plain) as LedgerRow & { _classification?: { accountingCategory?: unknown } })
     } catch (e) {
       // A corrupt stored payload is unexpected, but never emit a partial/garbage
       // workbook: skip that one row and record it. The batch still ships cleanly.
@@ -350,6 +350,15 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
       supplier_gstin: row.supplier_gstin || null,
       place_of_supply: null,
       document_type: row.document_type ?? null,
+      // §Part-2b: register the invoice on its classified accounting-category sheet.
+      // The category lives ONLY on the encrypted `_classification` sibling (added
+      // in Part 2a), never as a DB column; a legacy row without it — or any
+      // non-string — falls through to the generator's 'purchase' default so the
+      // historical single-sheet register is byte-for-byte preserved. This chooses a
+      // SHEET only; it never alters an amount, mapping, or the aggregate import.
+      accountingCategory: typeof row._classification?.accountingCategory === 'string'
+        ? row._classification.accountingCategory
+        : null,
       total_taxable_value: row.taxable_value,
       total_cgst: row.cgst_amount,
       total_sgst: row.sgst_amount,

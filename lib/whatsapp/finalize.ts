@@ -24,6 +24,19 @@ export interface ReadyMonth {
   monthLabel: string | null
   fileName: string
   invoiceCount: number
+  /** The batch's raw period_start ISO date; null when unresolvable. Delivery scope keys on this. */
+  periodStart?: string | null
+}
+
+/**
+ * Delivery scope (§wrong-month fix): the client the finalize reply is served to.
+ * `undefined` = legacy unscoped (workspace-wide) read; `null` = individual (only
+ * batches with no client); a UUID = only that client's batches. Without it, a
+ * Done tap in an org workspace could attach ANOTHER client's — or an older
+ * month's — still-'ready' workbook, which is exactly the wrong-month leak.
+ */
+export interface DeliveryScope {
+  clientId?: string | null
 }
 
 export interface FinalizeCounts {
@@ -214,12 +227,17 @@ async function countJobs(db: Db, workspaceId: string, jobType: string, statuses:
  * alone (the partial unique index would reject a duplicate anyway). Called on
  * Done so a batch whose earlier register ran before a sibling settled is rebuilt.
  */
-export async function ensureBatchRegisters(db: Db, workspaceId: string): Promise<number> {
+export async function ensureBatchRegisters(db: Db, workspaceId: string, scope?: DeliveryScope): Promise<number> {
   const { data: rows, error } = await db
     .from('invoices').select('batch_id')
     .eq('workspace_id', workspaceId).not('batch_id', 'is', null)
   if (error) throw new Error(`FINALIZE_BATCH_LIST_ERROR: ${error.message}`)
-  const batchIds = [...new Set((rows ?? []).map((r) => (r as { batch_id: string }).batch_id))]
+  let batchIds = [...new Set((rows ?? []).map((r) => (r as { batch_id: string }).batch_id))]
+  // Scoped Done must never re-arm another client's batch (individuals own only
+  // client-less batches; org senders own only their selected client's).
+  if (scope?.clientId !== undefined && batchIds.length > 0) {
+    batchIds = await filterBatchesByClient(db, workspaceId, batchIds, scope.clientId)
+  }
   let scheduled = 0
   for (const batchId of batchIds) {
     await db.from('processing_jobs').delete()
@@ -246,8 +264,46 @@ export async function ensureBatchRegisters(db: Db, workspaceId: string): Promise
   return scheduled
 }
 
-/** Read the current, truthful finalize state for a workspace. */
-export async function collectFinalizeState(db: Db, workspaceId: string): Promise<FinalizeCounts> {
+/**
+ * Resolve which of these batches belong to the scope's client. Individuals
+ * (clientId null) own only client-less batches; org senders own only their
+ * selected client's. A read failure narrows to NO batches (fail-closed: wrong-
+ * month/tenant delivery is worse than a silent Done).
+ */
+async function filterBatchesByClient(
+  db: Db, workspaceId: string, batchIds: string[], clientId: string | null,
+): Promise<string[]> {
+  const q = db
+    .from('invoice_batches').select('id,client_id')
+    .eq('workspace_id', workspaceId).in('id', batchIds)
+  const { data, error } = await (clientId === null ? q.is('client_id', null) : q.eq('client_id', clientId))
+  // A read failure narrows to NONE (fail-closed). This module is deliberately
+  // dependency-light (unit-testable in-process), so no logger import here — the
+  // calling route already logs the finalize outcome truthfully.
+  if (error) return []
+  return (data ?? [] as Array<{ id: string }>).map((b) => b.id)
+}
+
+/**
+ * Pure (§wrong-month fix): pick the ONE workbook a summary download link should
+ * point at. Deterministic ordering — latest accounting period first, then the
+ * newest generation, then id — so a stale September register can never win the
+ * link position merely because of row order. Returns null when nothing is ready.
+ */
+export function pickPrimaryWorkbook(months: readonly ReadyMonth[]): ReadyMonth | null {
+  let best: ReadyMonth | null = null
+  for (const m of months) {
+    if (!m || !m.workbookId) continue
+    if (!best) { best = m; continue }
+    const a = `${m.periodStart ?? ''}|${m.workbookId}`
+    const b = `${best.periodStart ?? ''}|${best.workbookId}`
+    if (a > b) best = m
+  }
+  return best
+}
+
+/** Read the current, truthful finalize state for a workspace (optionally scoped to one client's batches). */
+export async function collectFinalizeState(db: Db, workspaceId: string, scope?: DeliveryScope): Promise<FinalizeCounts> {
   const outstanding = await countJobs(db, workspaceId, 'invoice_extraction', ['queued', 'processing'])
   const compiling = await countJobs(db, workspaceId, 'register_generation', ['queued', 'processing'])
 
@@ -263,10 +319,28 @@ export async function collectFinalizeState(db: Db, workspaceId: string): Promise
   // A workbook is "ready" only when its DB row exists with a stored object path
   // (that row is inserted solely after a successful encrypted upload) and it has
   // not lapsed. The download route re-checks expiry + membership regardless.
-  const { data: readyRows, error: readyErr } = await db
+  // When a client scope is supplied, ONLY that tenant's batches qualify — an
+  // older month's still-'ready' workbook from another client is never listed.
+  let scopedBatchIds: string[] | null = null
+  if (scope?.clientId !== undefined) {
+    const { data: invRows, error: invErr } = await db
+      .from('invoices').select('batch_id')
+      .eq('workspace_id', workspaceId).not('batch_id', 'is', null)
+    if (invErr) throw new Error(`FINALIZE_SCOPE_ERROR: ${invErr.message}`)
+    const allBatchIds = [...new Set((invRows ?? []).map((r) => (r as { batch_id: string }).batch_id))]
+    scopedBatchIds = await filterBatchesByClient(db, workspaceId, allBatchIds, scope.clientId)
+    if (scopedBatchIds.length === 0) {
+      return {
+        outstanding, compiling, needsReview: needsReview ?? 0, missingDate: missingDate ?? 0,
+        readyWorkbooks: 0, readyWorkbookIds: [], readyMonths: [],
+      }
+    }
+  }
+  const readyQuery = db
     .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at')
     .eq('workspace_id', workspaceId).eq('status', 'ready').not('file_object_path', 'is', null)
     .order('created_at', { ascending: false })
+  const { data: readyRows, error: readyErr } = await (scopedBatchIds ? readyQuery.in('batch_id', scopedBatchIds) : readyQuery)
   if (readyErr) throw new Error(`FINALIZE_READY_ERROR: ${readyErr.message}`)
   const now = Date.now()
   const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null }>)
@@ -300,6 +374,7 @@ export async function collectFinalizeState(db: Db, workspaceId: string): Promise
       monthLabel: monthLabel(period),
       fileName: workbookFileName(period),
       invoiceCount: r.batch_id ? countByBatch.get(r.batch_id) ?? 0 : 0,
+      periodStart: period,
     }
   })
 

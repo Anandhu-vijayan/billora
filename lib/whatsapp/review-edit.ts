@@ -145,6 +145,16 @@ const REASON_TEXT: Record<string, string> = {
   'image-too-small': 'the image resolution is too low to read reliably',
   'multi-invoice-document': 'this file looks like more than one invoice — only one was read, please split the others out',
   'credit-debit-note': 'this is a credit/debit note (it changes an earlier invoice), so a person must check it before it is used',
+  // §Part-2 classification reasons (from lib/ocr/classify.ts). Descriptive only.
+  'document-heading-conflict': 'the document prints more than one kind of title (for example a bill of supply and a tax invoice), so its type is ambiguous',
+  'payment-evidence-not-an-invoice': 'this looks like a receipt or payment voucher (proof of payment), not a purchase invoice, so a person must check it',
+  'delivery-challan-not-a-tax-invoice': 'this looks like a delivery challan (a goods-movement slip), not a tax invoice, so a person must check it',
+  'proforma-not-a-tax-invoice': 'this looks like a proforma (a quotation), not a final tax invoice, so a person must check it',
+  'category-evidence-conflict': 'the document has wording for more than one kind of accounting category, so its treatment is unclear',
+  'category-could-not-be-determined': 'how this document should be booked could not be determined, so a person must choose its category',
+  // §Part-5 duplicate-prevention reasons. Descriptive only — a possible duplicate
+  // is flagged for a human to confirm, never auto-dropped or auto-approved.
+  'possible-duplicate': 'this looks like the same invoice (same number, supplier and date) as one already filed, so please check it is not a duplicate',
   'review-confirmation-required': 'the invoice number has not been confirmed yet',
 }
 
@@ -154,6 +164,61 @@ export function describeReason(code: string): string {
   if (base === 'low-confidence') return 'the reading was low-confidence'
   if (base === 'total-mismatch') return 'the amounts do not add up to the total'
   return REASON_TEXT[base] ?? 'it needs a manual check'
+}
+
+// Which EDITABLE_FIELDS number a reason code is actually about, so the editor can
+// tell the reviewer exactly WHICH field to fix (§UX). A reason with no single
+// value field (a document-type / duplicate / image / low-confidence check) has NO
+// entry here and is surfaced as a 'general check' instead of pointing at a field
+// that would not clear it — we never send a reviewer to edit a field that is not
+// the real blocker. The 'amounts' sentinel means the money block (fields 5-9).
+const REASON_FIELD: Record<string, number | 'amounts'> = {
+  'invoice-number-missing': 1, 'invoice-number-placeholder': 1, 'review-confirmation-required': 1,
+  'gstin-missing': 2, 'gstin-invalid': 2, 'gstin-state-invalid': 2, 'gstin-checksum-failed': 2,
+  'supplier-equals-buyer': 2, 'supplier-equals-recipient': 2,
+  'vendor-name-missing': 3, 'vendor-name-placeholder': 3,
+  'invoice-date-unresolved': 4, 'invoice-date-future': 4, 'invoice-date-before-gst': 4,
+  'non-finite-amount': 'amounts', 'negative-amount': 'amounts', 'total-zero': 'amounts',
+  'igst-with-cgst-sgst': 'amounts', 'cgst-sgst-unequal': 'amounts', 'igst-on-intrastate': 'amounts',
+  'cgst-sgst-on-interstate': 'amounts', 'tax-rate-mismatch': 'amounts', 'tax-rate-amount-missing': 'amounts',
+  'tax-rate-invalid': 'amounts', 'tax-rate-cgst-sgst-unequal': 'amounts', 'tax-rate-igst-with-cgst-sgst': 'amounts',
+  'amount-words-total-mismatch': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts',
+}
+
+/**
+ * Concrete, field-specific "what to type" hints for the flagged reasons (§UX).
+ * Each line names the exact editor field number(s) that clear the reason, so a
+ * reviewer never stares at a vague "needs review" with no idea which value is
+ * wrong. A reason that no single field can clear becomes one honest 'general
+ * check' line rather than a misleading field pointer. De-duplicated and capped
+ * to keep the message inside the WhatsApp text limits.
+ */
+export function reasonFixHints(codes: readonly string[], maxItems = 3): string[] {
+  const fielded: string[] = []
+  let generalCount = 0
+  const seen = new Set<string>()
+  for (const code of codes) {
+    const base = code.split(':')[0]
+    const target = REASON_FIELD[base]
+    const why = describeReason(code)
+    if (target === undefined) { generalCount += 1; continue }
+    const ref = target === 'amounts'
+      ? `${EDITABLE_FIELDS[4].index}-${EDITABLE_FIELDS[EDITABLE_FIELDS.length - 1].index} (the amounts)`
+      : `${target} (${editableFieldByIndex(target)?.label ?? 'this field'})`
+    const line = `reply ${ref} — ${why}`
+    if (seen.has(line)) continue
+    seen.add(line); fielded.push(line)
+  }
+  const out = fielded.slice(0, maxItems)
+  const hiddenFielded = fielded.length - out.length
+  if (generalCount > 0) {
+    out.push(hiddenFielded > 0
+      ? `plus ${hiddenFielded + generalCount} more check(s) — correct what looks wrong, then reply APPROVE`
+      : `also: ${generalCount} general check(s) no single field clears — fix what looks wrong, then reply APPROVE`)
+  } else if (hiddenFielded > 0) {
+    out.push(`+${hiddenFielded} more field(s) to correct`)
+  }
+  return out
 }
 
 /**
@@ -172,16 +237,35 @@ export function summarizeReasons(codes: readonly string[], maxItems = 2): string
   return unique.length > maxItems ? `${shown}; +${unique.length - maxItems} more` : shown
 }
 
+/** Readable labels for a stored classification, shown to the reviewer as info only. */
+const DOC_TYPE_LABEL: Record<string, string> = {
+  invoice: 'Tax invoice', credit_note: 'Credit note', debit_note: 'Debit note',
+  bill_of_supply: 'Bill of supply', receipt: 'Receipt', payment_voucher: 'Payment voucher',
+  delivery_challan: 'Delivery challan', proforma_invoice: 'Proforma invoice', unknown: 'not recognised',
+}
+const CATEGORY_LABEL: Record<string, string> = {
+  purchase: 'Purchase', expense: 'Expense', service: 'Service',
+  fixed_asset: 'Fixed asset', other: 'Other', unknown: 'not set',
+}
+
 /**
  * Compose the numbered editor body. Shown ONLY to the invoice's own (verified)
  * reviewer in their private chat, so surfacing the extracted values is the whole
  * point of an editable review — this is a display, not a log. `note` carries the
  * result of the last action (e.g. "Saved — amounts still don't add up; correct the
- * total") so the reviewer sees the effect of their edit.
+ * total") so the reviewer sees the effect of their edit. `classification` (§Part-2)
+ * is shown as a read-only line so the reviewer sees the machine's document type
+ * and accounting category; it is descriptive only and never editable via a numbered
+ * field here (a confirmed re-classification goes through the shared review path).
  */
 export function composeReviewEditorMessage(
   row: Partial<LedgerRow>,
-  opts?: { header?: string; note?: string; reasons?: readonly string[] },
+  opts?: {
+    header?: string
+    note?: string
+    reasons?: readonly string[]
+    classification?: { documentType?: string; accountingCategory?: string } | null
+  },
 ): string {
   const header = opts?.header ?? 'Editing this invoice. Reply with a number and the new value.'
   const lines: string[] = [header]
@@ -190,6 +274,19 @@ export function composeReviewEditorMessage(
   // so the reviewer knows which field to fix; purely descriptive, changes nothing.
   if (opts?.reasons && opts.reasons.length > 0) {
     lines.push(`Why this needs a check: ${summarizeReasons(opts.reasons, 3)}`)
+    // §UX: name the EXACT field number that clears each blocker, so "type something"
+    // is never a guess. Descriptive only — it changes no value and approves nothing.
+    const hints = reasonFixHints(opts.reasons)
+    if (hints.length > 0) {
+      lines.push('To fix, reply with the number shown:')
+      for (const h of hints) lines.push(`• ${h}`)
+    }
+  }
+  // §Part-2 read-only classification line (only when a classification is present).
+  if (opts?.classification) {
+    const dt = DOC_TYPE_LABEL[opts.classification.documentType ?? 'unknown'] ?? 'not recognised'
+    const cat = CATEGORY_LABEL[opts.classification.accountingCategory ?? 'unknown'] ?? 'not set'
+    lines.push(`Detected: ${dt} · Category: ${cat}`)
   }
   lines.push('')
   for (const f of EDITABLE_FIELDS) {
