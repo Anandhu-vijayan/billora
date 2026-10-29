@@ -109,9 +109,22 @@ export async function resolveInvoiceBatch(
     row?: DateBearingRow
     invoice?: BatchInvoiceRef
     assertLease?: () => Promise<void>
+    /**
+     * §bulk-approve: when false the invoice is still resolved + linked into its
+     * (client, month) batch, but NO register job is scheduled here. The caller
+     * (approveAllPending) coalesces a single enqueue once every row has committed,
+     * so a rebuild never observes a half-approved batch and ships a partial
+     * workbook. Defaults to true — single approvals and extraction are unchanged.
+     * A cross-month DATE MOVE below still rebuilds both periods immediately:
+     * retiring the abandoned month is a correctness requirement, not a nicety, and
+     * such a move inside a bulk approve is exceptional (the coalesced enqueue for
+     * the destination batch is a deduped no-op against it).
+     */
+    scheduleRegister?: boolean
   },
 ): Promise<string | null> {
   const { workspaceId, invoiceId } = args
+  const schedule = args.scheduleRegister !== false
   let invoice = args.invoice
   if (!invoice) {
     const { data } = await db.from('invoices')
@@ -186,6 +199,9 @@ export async function resolveInvoiceBatch(
 
   // Ensure the batch has a (deduped) register job scheduled. Readiness is
   // re-checked in build_register, so unconditional scheduling here is safe.
-  await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)
+  // Suppressed only for the coalesced bulk-approve caller (see scheduleRegister).
+  if (schedule) {
+    await enqueueRegisterGeneration(db, workspaceId, batchId, args.assertLease)
+  }
   return batchId
 }

@@ -50,6 +50,16 @@ const inv = (n, category, rate = 18, taxable = 1000) => {
   }
 }
 
+// A register invoice that also carries a §3.3 ITC determination.
+const invItc = (n, category, itc) => ({ ...inv(n, category), itcEligibility: itc })
+
+// the header texts of a sheet, in column order
+const headersOfSheet = (ws) => {
+  const h = []
+  ws.getRow(1).eachCell((c, i) => { h[i - 1] = String(c.text).trim() })
+  return h
+}
+
 const countsFor = (list) => ({
   invoiceCount: list.length,
   taxBreakdownRowCount: gen.expectedTaxBreakdownRowCount(list),
@@ -181,7 +191,7 @@ test('2b-validate-throws: a phantom extra register row is rejected (integrity ga
 // ==========================================================================
 test('2b-wire: build-register passes _classification.accountingCategory into the register row (default purchase)', () => {
   const src = registerSrc()
-  assert.match(src, /_classification\?:\s*\{ accountingCategory\?:\s*unknown \}/, 'the decrypted payload type carries the classification sibling')
+  assert.match(src, /_classification\?:\s*\{ accountingCategory\?:\s*unknown(?:;\s*itcEligibility\?:\s*unknown)? \}/, 'the decrypted payload type carries the classification sibling')
   assert.match(
     src,
     /accountingCategory:\s*typeof row\._classification\?\.accountingCategory === 'string'\s*\?\s*row\._classification\.accountingCategory\s*:\s*null/,
@@ -191,4 +201,45 @@ test('2b-wire: build-register passes _classification.accountingCategory into the
   // and the register row count is still asserted per INVOICE across all sheets.
   assert.equal((src.match(/await buildRegisterWorkbook\(/g) ?? []).length, 1, 'still a SINGLE workbook build (no parallel per-category pipeline)')
   assert.match(src, /invoiceCount:\s*invoices\.length/, 'the summed register-row integrity check is keyed on total invoices, not per sheet')
+})
+
+// ==========================================================================
+// §3.3 ITC eligibility: DESCRIPTIVE register column; the Purchase Import
+// (Tally) contract stays byte-for-byte 12 columns; a review-only category
+// set by a human gets its own sheet.
+// ==========================================================================
+test('3.3-itc-column: ITC Eligibility rides the register sheets, never the 12-col Purchase Import', async () => {
+  const list = [invItc(1, 'purchase', 'needs_review'), invItc(2, 'receipt', 'ineligible'), inv(3, 'expense')]
+  const buf = await gen.buildRegisterWorkbook(list)
+  await gen.validateRegisterWorkbook(buf, countsFor(list)) // the extra total column must not break integrity
+  const wb = await loadWorkbook(buf)
+  const reg = wb.getWorksheet('Purchase Register')
+  const idx = headersOfSheet(reg).indexOf('ITC Eligibility')
+  assert.ok(idx >= 0, 'the Purchase Register carries an ITC Eligibility column')
+  assert.equal(String(reg.getRow(2).getCell(idx + 1).text).trim(), 'ITC needs review', 'an invoice-shaped row reads needs_review')
+  // The Tally import contract is untouched: still exactly 12 columns, no ITC column.
+  const imp = wb.getWorksheet('Purchase Import')
+  assert.equal(imp.columnCount, 12, 'the 12-column Tally import sheet is byte-for-byte intact')
+  assert.ok(!headersOfSheet(imp).includes('ITC Eligibility'), 'ITC never leaks into the import contract')
+})
+
+test('3.3-itc-descriptive: a needs_review ITC row is STILL in the register (never filtered, §5)', async () => {
+  const list = [invItc(1, 'purchase', 'needs_review'), invItc(2, 'purchase', 'eligible')]
+  const buf = await gen.buildRegisterWorkbook(list)
+  await gen.validateRegisterWorkbook(buf, countsFor(list))
+  const wb = await loadWorkbook(buf)
+  assert.deepEqual(numbersOn(wb, 'Purchase Register'), ['INV-1', 'INV-2'], 'ITC status never removes a valid approved record from its register')
+})
+
+test('3.3-capital-purchase-sheet: a human-classified capital_purchase gets its own sheet', async () => {
+  const list = [inv(1, 'purchase'), inv(2, 'capital_purchase'), inv(3, 'sales')]
+  const buf = await gen.buildRegisterWorkbook(list)
+  await gen.validateRegisterWorkbook(buf, countsFor(list))
+  const wb = await loadWorkbook(buf)
+  assert.deepEqual(
+    wb.worksheets.filter((w) => / Register$/.test(w.name)).map((w) => w.name),
+    ['Purchase Register', 'Capital Purchase Register', 'Sales Register'],
+  )
+  assert.deepEqual(numbersOn(wb, 'Capital Purchase Register'), ['INV-2'], 'capital_purchase lands on its own sheet, never folded into purchase')
+  assert.deepEqual(numbersOn(wb, 'Sales Register'), ['INV-3'])
 })

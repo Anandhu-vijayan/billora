@@ -314,7 +314,10 @@ test('Purchase Register carries the shared dynamic per-rate columns and the invo
       '18% Taxable Value', '18% CGST', '18% SGST', '18% IGST'],
   )
   assert.equal(headers[0], 'Invoice Date')
-  assert.equal(headers[headers.length - 1], 'Review/Validation Status')
+  // §3.3 ITC Eligibility is the last register column (added AFTER the totals block so
+  // the fixed-header + rate-block layout the tests rely on never shifts).
+  assert.equal(headers[headers.length - 1], 'ITC Eligibility')
+  assert.equal(headers[headers.length - 2], 'Review/Validation Status')
   assert.ok(headers.includes('Total Taxable Value') && headers.includes('Grand Total') && headers.includes('Round Off'))
 
   const mixedRow = reg.getRow(2)

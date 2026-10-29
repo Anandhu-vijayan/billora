@@ -135,6 +135,7 @@ const REASON_TEXT: Record<string, string> = {
   'igst-on-intrastate': 'IGST was used on a within-state bill',
   'cgst-sgst-on-interstate': 'CGST/SGST were used on an inter-state bill',
   'tax-rate-mismatch': 'a printed tax rate and its amount disagree',
+  'tax-rate-advisory': 'a printed tax rate differs from its amount, but the totals still add up (safe to APPROVE)',
   'tax-rate-amount-missing': 'a tax rate is printed but its amount is missing',
   'tax-rate-invalid': 'a printed tax rate could not be read',
   'tax-rate-cgst-sgst-unequal': 'the printed CGST/SGST rates are unequal',
@@ -180,7 +181,7 @@ const REASON_FIELD: Record<string, number | 'amounts'> = {
   'invoice-date-unresolved': 4, 'invoice-date-future': 4, 'invoice-date-before-gst': 4,
   'non-finite-amount': 'amounts', 'negative-amount': 'amounts', 'total-zero': 'amounts',
   'igst-with-cgst-sgst': 'amounts', 'cgst-sgst-unequal': 'amounts', 'igst-on-intrastate': 'amounts',
-  'cgst-sgst-on-interstate': 'amounts', 'tax-rate-mismatch': 'amounts', 'tax-rate-amount-missing': 'amounts',
+  'cgst-sgst-on-interstate': 'amounts', 'tax-rate-mismatch': 'amounts', 'tax-rate-advisory': 'amounts', 'tax-rate-amount-missing': 'amounts',
   'tax-rate-invalid': 'amounts', 'tax-rate-cgst-sgst-unequal': 'amounts', 'tax-rate-igst-with-cgst-sgst': 'amounts',
   'amount-words-total-mismatch': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts',
 }
@@ -202,10 +203,14 @@ export function reasonFixHints(codes: readonly string[], maxItems = 3): string[]
     const target = REASON_FIELD[base]
     const why = describeReason(code)
     if (target === undefined) { generalCount += 1; continue }
+    // §UX: phrase as a FIELD NAME, never a bare "reply 2" — a reviewer who typed the
+    // number alone was told "there is no field 2", which is false and infuriating.
+    // Each line now reads "Field 2 — Supplier GSTIN: <why>"; the standing instruction
+    // under the field list explains the "<number> <value>" reply format.
     const ref = target === 'amounts'
-      ? `${EDITABLE_FIELDS[4].index}-${EDITABLE_FIELDS[EDITABLE_FIELDS.length - 1].index} (the amounts)`
-      : `${target} (${editableFieldByIndex(target)?.label ?? 'this field'})`
-    const line = `reply ${ref} — ${why}`
+      ? `Fields ${EDITABLE_FIELDS[4].index}-${EDITABLE_FIELDS[EDITABLE_FIELDS.length - 1].index} \u2014 the amounts`
+      : `Field ${target} \u2014 ${editableFieldByIndex(target)?.label ?? 'this field'}`
+    const line = `${ref}: ${why}`
     if (seen.has(line)) continue
     seen.add(line); fielded.push(line)
   }
@@ -219,6 +224,26 @@ export function reasonFixHints(codes: readonly string[], maxItems = 3): string[]
     out.push(`+${hiddenFielded} more field(s) to correct`)
   }
   return out
+}
+
+/** Per-field-kind sample value, so the "<number> <value>" shape is always obvious. */
+const FIELD_VALUE_SAMPLE: Record<EditableFieldKind, string> = {
+  text: 'INV-000125', gstin: '27AABCU9603R1ZX', date: '2026-09-18', amount: '118200',
+}
+
+/**
+ * A truthful reply to a bare/incomplete field-number entry (§UX). When a reviewer
+ * types only a number (e.g. "2") we must NOT claim the field does not exist — it
+ * does, they simply omitted the value. For a valid field we echo the exact
+ * "<number> <value>" shape with a sample; only a genuinely out-of-range number is
+ * told there is no such field. Pure string helper — changes no data.
+ */
+export function fieldPromptForIndex(fieldNo: number): string {
+  const field = editableFieldByIndex(fieldNo)
+  if (!field) {
+    return `There is no field ${fieldNo} \u2014 pick a number from the list above (1-${MAX_FIELD_INDEX}).`
+  }
+  return `To change ${field.label} (field ${fieldNo}), reply: ${fieldNo} ${FIELD_VALUE_SAMPLE[field.kind]}`
 }
 
 /**
@@ -245,7 +270,13 @@ const DOC_TYPE_LABEL: Record<string, string> = {
 }
 const CATEGORY_LABEL: Record<string, string> = {
   purchase: 'Purchase', expense: 'Expense', service: 'Service',
-  fixed_asset: 'Fixed asset', other: 'Other', unknown: 'not set',
+  fixed_asset: 'Fixed asset', capital_purchase: 'Capital purchase', sales: 'Sales',
+  other: 'Other', unknown: 'not set',
+}
+// §3.3 ITC eligibility shown read-only. The machine never claims 'eligible'; a
+// reviewer promotes it only through the shared re-classification path.
+const ITC_LABEL: Record<string, string> = {
+  eligible: 'ITC eligible', ineligible: 'ITC ineligible', needs_review: 'ITC needs review',
 }
 
 /**
@@ -264,7 +295,7 @@ export function composeReviewEditorMessage(
     header?: string
     note?: string
     reasons?: readonly string[]
-    classification?: { documentType?: string; accountingCategory?: string } | null
+    classification?: { documentType?: string; accountingCategory?: string; itcEligibility?: string } | null
   },
 ): string {
   const header = opts?.header ?? 'Editing this invoice. Reply with a number and the new value.'
@@ -278,7 +309,7 @@ export function composeReviewEditorMessage(
     // is never a guess. Descriptive only — it changes no value and approves nothing.
     const hints = reasonFixHints(opts.reasons)
     if (hints.length > 0) {
-      lines.push('To fix, reply with the number shown:')
+      lines.push('To fix, reply the field NUMBER and its new value (see the fields below), then reply APPROVE:')
       for (const h of hints) lines.push(`• ${h}`)
     }
   }
@@ -286,7 +317,8 @@ export function composeReviewEditorMessage(
   if (opts?.classification) {
     const dt = DOC_TYPE_LABEL[opts.classification.documentType ?? 'unknown'] ?? 'not recognised'
     const cat = CATEGORY_LABEL[opts.classification.accountingCategory ?? 'unknown'] ?? 'not set'
-    lines.push(`Detected: ${dt} · Category: ${cat}`)
+    const itc = ITC_LABEL[opts.classification.itcEligibility ?? 'needs_review'] ?? 'ITC needs review'
+    lines.push(`Detected: ${dt} · Category: ${cat} · ${itc}`)
   }
   lines.push('')
   for (const f of EDITABLE_FIELDS) {

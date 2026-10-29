@@ -1976,6 +1976,19 @@ test('N1 approved+dated invoice resolves the correct month batch from the invoic
   assert.equal(ops.inserts[0].batch_id, 'BATCH-1')
 })
 
+test('N1b scheduleRegister:false still files the batch but defers the register job (bulk-approve coalescing)', async () => {
+  const { db, ops } = batchHarness()
+  const batchId = await batch.resolveInvoiceBatch(db, {
+    workspaceId: 'ws', invoiceId: 'INV', jobId: 'JOB',
+    row: { invoice_date: '2026-05-17' }, invoice: { client_id: 'C1', batch_id: null },
+    scheduleRegister: false,
+  })
+  assert.equal(batchId, 'BATCH-1', 'the invoice is still resolved into its month batch')
+  assert.equal(ops.rpc.length, 1, 'batch resolved via the RPC as usual')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1' }], 'invoice still linked to its batch')
+  assert.equal(ops.inserts.length, 0, 'NO register job scheduled during the deferred phase (coalesced after the loop)')
+})
+
 test('N2 no reliable invoice date never guesses a month: stays unbatched, no batch, no register job', async () => {
   const { db, ops } = batchHarness()
   const batchId = await batch.resolveInvoiceBatch(db, {
@@ -2671,12 +2684,22 @@ test('P21 financial validation is NOT weakened to raise approvals', () => {
     { ...CLEAN_ROW, total_amount: 1190 }, { minConfidence: 0.8, amountToleranceMinorUnits: 101, now: NOW_17 })
   assert.equal(over.review, 'needs_review')
   assert.ok(over.reasons.some((r) => r.startsWith('total-mismatch')))
-  // A printed rate that contradicts the amount -> flagged; we never derive a rate.
-  const rate = ledger.evaluateLedger(
-    { ...CLEAN_ROW, cgst_amount: 100, sgst_amount: 90, total_amount: 1190, cgst_rate_percent: 5 },
+  // A printed rate that contradicts the amount is ALWAYS flagged at extraction (we
+  // never derive a rate). Split by whether the invoice TOTAL ties:
+  //   total does NOT tie (1000+100+90=1190 != 1180) -> HARD tax-rate-mismatch.
+  const hard = ledger.evaluateLedger(
+    { ...CLEAN_ROW, cgst_amount: 100, sgst_amount: 90, total_amount: 1180, cgst_rate_percent: 5 },
     { minConfidence: 0.8, now: NOW_17 })
-  assert.equal(rate.review, 'needs_review')
-  assert.ok(rate.reasons.some((r) => r.startsWith('tax-rate-mismatch')))
+  assert.equal(hard.review, 'needs_review', 'a non-reconciling rate break is never auto-approved')
+  assert.ok(hard.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'total does not tie -> HARD mismatch')
+  //   total DOES tie (1000+100+100=1200) -> SOFT tax-rate-advisory, but STILL
+  //   needs_review here: precision is unchanged, a rate break is never silently filed.
+  const soft = ledger.evaluateLedger(
+    { ...CLEAN_ROW, cgst_amount: 100, sgst_amount: 100, total_amount: 1200, cgst_rate_percent: 5 },
+    { minConfidence: 0.8, now: NOW_17 })
+  assert.equal(soft.review, 'needs_review', 'a soft advisory is STILL flagged at extraction')
+  assert.ok(soft.reasons.some((r) => r.startsWith('tax-rate-advisory')), 'total ties -> SOFT advisory')
+  assert.ok(!soft.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'no HARD rate flag when the total ties')
 })
 
 test('P22 source contract: ranking puts completeness before failure count; money + month-name support present', () => {
@@ -2975,32 +2998,66 @@ test('P0-3 the in-chat editor explains WHY the invoice is flagged (and stays sil
   assert.ok(!none.includes('Why this needs a check'), 'a row with no stored reason shows no phantom cause')
 })
 
-// ---- §UX "what to type" clarity: name the EXACT field for each blocker ----=
-test('UX reasonFixHints names the exact editor field for a fielded blocker', () => {
+// ---- §UX "what to type" clarity: name the EXACT field for each blocker ----
+test('UX reasonFixHints names the exact editor field by number AND label (never a bare "reply N")', () => {
   const hints = reviewEdit.reasonFixHints(['gstin-checksum-failed', 'invoice-date-unresolved'])
-  assert.ok(hints.some((h) => /reply 2 \(Supplier GSTIN\)/.test(h) && /checksum/.test(h)), 'GSTIN failure -> field 2')
-  assert.ok(hints.some((h) => /reply 4 \(Invoice date\)/.test(h)), 'unreadable date -> field 4')
+  assert.ok(hints.some((h) => /Field 2\b/.test(h) && /Supplier GSTIN/.test(h) && /checksum/.test(h)), 'GSTIN failure -> Field 2 · Supplier GSTIN')
+  assert.ok(hints.some((h) => /Field 4\b/.test(h) && /Invoice date/.test(h)), 'unreadable date -> Field 4 · Invoice date')
+  assert.ok(hints.every((h) => !/^reply \d/.test(h)), 'never phrased as a bare reply-number command')
 })
 
 test('UX an amount/tax reconciliation error routes to the amounts block, not one arbitrary field', () => {
   const hints = reviewEdit.reasonFixHints(['tax-rate-mismatch:cgst', 'total-mismatch:100!=200'])
-  assert.ok(hints.every((h) => h.includes('reply 5-9 (the amounts)') || !h.startsWith('reply')), 'money errors point at 5-9')
-  assert.ok(hints.some((h) => /reply 5-9 \(the amounts\)/.test(h)), 'amounts block is named')
+  assert.ok(hints.some((h) => /Fields 5-9\b.*the amounts/.test(h)), 'amounts block is named')
 })
 
 test('UX a blocker no single field clears (low-confidence) is an honest general check, never a misleading field pointer', () => {
   const hints = reviewEdit.reasonFixHints(['low-confidence:0.42'])
-  assert.ok(hints.every((h) => !/reply \d/.test(h)), 'no fabricated field number for a non-field cause')
+  assert.ok(hints.every((h) => !/Field \d/.test(h)), 'no fabricated field number for a non-field cause')
   assert.ok(hints.some((h) => /general check/.test(h)), 'surfaced as a general check')
 })
 
 test('UX the editor renders the how-to-fix block only when a reason exists (and keeps the one-line why)', () => {
   const withReason = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, { reasons: ['gstin-checksum-failed'] })
-  assert.match(withReason, /To fix, reply with the number shown/)
-  assert.match(withReason, /reply 2 \(Supplier GSTIN\)/)
+  assert.match(withReason, /To fix, reply the field NUMBER/)
+  assert.match(withReason, /Field 2/)
+  assert.match(withReason, /Supplier GSTIN/)
   assert.match(withReason, /Why this needs a check:.*checksum/, 'the P0-3 one-line why is still present')
   const noReason = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, {})
-  assert.ok(!noReason.includes('To fix, reply with the number shown'), 'no phantom fix block when nothing is flagged')
+  assert.ok(!noReason.includes('To fix, reply the field NUMBER'), 'no phantom fix block when nothing is flagged')
+})
+
+test('UX fieldPromptForIndex never tells a REAL field it does not exist; a bare number is re-asked with the value format', () => {
+  const gstin = reviewEdit.fieldPromptForIndex(2)
+  assert.match(gstin, /To change Supplier GSTIN \(field 2\), reply: 2 \S+/, 'valid field -> echoes the "<2> <sample>" format')
+  assert.ok(!/There is no field 2/.test(gstin), 'field 2 exists; must not claim otherwise')
+  assert.match(reviewEdit.fieldPromptForIndex(1), /reply: 1 INV-000125/, 'text sample')
+  assert.match(reviewEdit.fieldPromptForIndex(4), /reply: 4 2026-09-18/, 'date sample')
+  assert.match(reviewEdit.fieldPromptForIndex(5), /reply: 5 118200/, 'amount sample')
+  assert.match(reviewEdit.fieldPromptForIndex(99), /There is no field 99/, 'genuinely out of range -> told so')
+})
+
+test('UX a soft-only bill (low-confidence OR a total-tying tax-rate advisory) may be filed by a human confirm, a hard failure never is', () => {
+  const s = reviewSrc()
+  assert.ok(/function isSoftReviewReason\(code: string\): boolean \{[\s\S]*?return base === 'low-confidence' \|\| base === 'tax-rate-advisory'/.test(s),
+    'ONLY the low-confidence family + the total-tying tax-rate advisory are classified soft')
+  // No genuine integrity family may ever sneak into the soft set.
+  assert.ok(!/base === 'tax-rate-mismatch'|base === 'total-mismatch'|base === 'gstin-/.test(s),
+    'a hard integrity family is never classified soft')
+  const i = s.indexOf('§UX soft-only human override')
+  assert.ok(i > 0, 'the override is documented inline')
+  const block = s.slice(i, i + 1600)
+  assert.ok(/review === 'needs_review'/.test(block) && /reviewerConfirmedInvoiceNumber/.test(block), 'gated on a needs_review row a human confirmed')
+  assert.ok(/reasons\.every\(isSoftReviewReason\)/.test(block), 'files ONLY when EVERY reason is soft — a single hard reason blocks it')
+  assert.ok(/review = 'approved'/.test(block), 'a soft-only confirmed row becomes approved')
+})
+
+test('UX a total-tying tax-rate advisory reads as safe-to-approve and still routes to the amounts block', () => {
+  assert.match(reviewEdit.describeReason('tax-rate-advisory:cgst'), /totals still add up \(safe to APPROVE\)/)
+  const hints = reviewEdit.reasonFixHints(['tax-rate-advisory:cgst'])
+  assert.ok(hints.some((h) => /Fields 5-9\b.*the amounts/.test(h)), 'advisory is named on the amounts block')
+  const editor = reviewEdit.composeReviewEditorMessage({ invoice_number: 'INV-1' }, { reasons: ['tax-rate-advisory:cgst'] })
+  assert.match(editor, /Why this needs a check:.*safe to APPROVE/, 'the one-line why reassures it is approvable')
 })
 
 test('P0-3 the machine reason codes ride in the encrypted payload and reach the list + editor', () => {
@@ -3390,10 +3447,21 @@ test('P1-7 review-confirm: the pending list is offset-paged and carries the batc
 test('P1-7 review-confirm: approve-all reuses the shared confirm path and never force-approves', () => {
   const src = reviewConfirmSrc()
   assert.ok(/export async function approveAllPending/.test(src), 'the bounded bulk-approve exists')
-  assert.ok(/await confirmInvoice\(db, \{ workspaceId, invoiceId: item\.invoiceId \}\)/.test(src), 'every row goes through the SAME re-validating confirm path')
-  assert.ok(/if \(r\.review === 'approved'\) approved \+= 1/.test(src), 'a row is only counted approved when it truly validated')
+  assert.ok(/await confirmInvoice\(db, \{ workspaceId, invoiceId: item\.invoiceId, deferRegister: true \}\)/.test(src), 'every row goes through the SAME re-validating confirm path, with the register rebuild deferred')
+  assert.ok(/if \(r\.review === 'approved'\) \{ approved \+= 1; if \(r\.batchId\) touchedBatches\.add\(r\.batchId\) \}/.test(src), 'a row is only counted approved when it truly validated, and its batch is recorded for coalescing')
   assert.ok(/else stillPending \+= 1/.test(src), 'a still-flagging row is reported honestly, never forced through')
   assert.ok(/\.slice\(0, Math\.max\(0, cap\)\)/.test(src), 'the fan-out is bounded by a cap (cost + 24h window)')
+})
+
+test('P1-7 review-confirm: approve-all coalesces ONE register rebuild per batch AFTER the loop (no partial workbook)', () => {
+  const src = reviewConfirmSrc()
+  assert.ok(/const touchedBatches = new Set<string>\(\)/.test(src), 'affected batches are collected during the approve loop')
+  // The single enqueue must run AFTER the for-of loop closes, not inside it.
+  const loopEnd = src.indexOf('else stillPending += 1')
+  const enqueueCall = src.indexOf('await enqueueRegisterGeneration(db, workspaceId, batchId)')
+  assert.ok(enqueueCall > loopEnd, 'the coalesced enqueue is placed after the approval loop, so the rebuild never sees a half-approved batch')
+  assert.ok(/for \(const batchId of touchedBatches\)/.test(src), 'one deduped enqueue per distinct batch')
+  assert.ok(/import \{ enqueueRegisterGeneration \} from '@\/lib\/invoices\/batch'/.test(src), 'scheduling reuses the shared batch module (never diverges from single-approve)')
 })
 
 test('P1-7 send: the review list adds Approve-all + Next controls and the month, staying <=10 rows', () => {

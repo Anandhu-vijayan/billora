@@ -153,6 +153,46 @@ test('rate or amount-words contradictions route to review and never auto-correct
   assert.match(ledger.retryHintFor(result.reasons), /total in words disagrees/)
 })
 
+test('§UX a rate/amount break is HARD when the total does not tie, SOFT advisory when it ties', () => {
+  // Total does NOT tie (1000 + 100 + 90 = 1190 != printed 1180): stays a HARD
+  // integrity break — a genuinely unreconciled bill is never softened.
+  const hard = ledger.evaluateLedger(
+    { ...BASE, cgst_amount: 100, sgst_amount: 90, total_amount: 1180, cgst_rate_percent: 5 },
+    { minConfidence: 0.8, now: NOW })
+  assert.equal(hard.review, 'needs_review')
+  assert.ok(hard.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'non-reconciling total keeps the HARD flag')
+  // Total ties (1000 + 100 + 100 = 1200): the SAME rate break is a SOFT advisory —
+  // STILL needs_review at extraction (never silently auto-approved), but coded so a
+  // human one-tap confirm can file it.
+  const soft = ledger.evaluateLedger(
+    { ...BASE, cgst_amount: 100, sgst_amount: 100, total_amount: 1200, cgst_rate_percent: 5 },
+    { minConfidence: 0.8, now: NOW })
+  assert.equal(soft.review, 'needs_review', 'a soft advisory is still flagged, never auto-approved at extraction')
+  assert.ok(soft.reasons.some((r) => r.startsWith('tax-rate-advisory')), 'reconciling total downgrades to SOFT advisory')
+  assert.ok(!soft.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'no HARD rate flag when the total ties')
+})
+
+test('§UX tax-rate-advisory never counts as a hard integrity failure (one-tap approvable)', () => {
+  assert.equal(ledger.hardValidationFailureCount(['tax-rate-mismatch:cgst']), 1, 'a real mismatch counts hard')
+  assert.equal(ledger.hardValidationFailureCount(['tax-rate-advisory:cgst']), 0, 'an advisory never counts hard')
+})
+
+test('§UX a genuine multi-rate bill skips the single-rate cross-check (no false rate flag)', () => {
+  // Explicit slices with two distinct rates (5% + 18%); a single flat per-head rate
+  // cannot reproduce the summed CGST, so the flat rate check must be skipped entirely.
+  const multi = ledger.evaluateLedger({
+    ...BASE,
+    taxable_value: 1000, cgst_amount: 115, sgst_amount: 115, igst_amount: 0, total_amount: 1230,
+    cgst_rate_percent: 5, sgst_rate_percent: 5,
+    tax_slices: [
+      { rate_percent: 5, taxable_value: 400, cgst_amount: 10, sgst_amount: 10 },
+      { rate_percent: 18, taxable_value: 600, cgst_amount: 105, sgst_amount: 105 },
+    ],
+  }, { minConfidence: 0.8, now: NOW })
+  assert.ok(!multi.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'multi-rate never flags a flat-rate mismatch')
+  assert.ok(!multi.reasons.some((r) => r.startsWith('tax-rate-advisory')), 'multi-rate never emits a flat-rate advisory')
+})
+
 test('amount-in-words tolerates "Indian Rupee only" and paise-before-word format', () => {
   assert.equal(
     words.parseIndianAmountWords('Five Lakh Seventy Five Thousand Three Hundred and Fifty One Indian Rupee only.'),

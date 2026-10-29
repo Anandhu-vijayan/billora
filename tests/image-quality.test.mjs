@@ -144,7 +144,7 @@ test('P3-13 the extractor runs the gate on rasters only and folds reasons withou
   // `|| multiInvoiceDetected` to the same approve-veto disjunction — still a
   // downgrade-only gate, so this invariant must keep holding with the new term.)
   assert.match(e, /evaluation\.review === 'approved' &&\s*\(conflictFields\.length > 0 \|\| imageQualityReasons\.length > 0 \|\| multiInvoiceDetected\)\s*\?\s*'needs_review'/, 'a quality failure downgrades approve -> review only')
-  assert.match(e, /imageQualityReasons,\n\s*multiInvoiceDetected,\n  \}/, 'imageQualityReasons (+ the §P3-14 flag) is returned for the handler')
+  assert.match(e, /imageQualityReasons,\n\s*multiInvoiceDetected,/, 'imageQualityReasons (+ the §P3-14 flag) is returned for the handler')
 })
 
 test('P3-13 the handler folds the verdict into the authoritative re-evaluated row', () => {

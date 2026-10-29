@@ -308,6 +308,32 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         logger.info('[Extract] possible duplicate identity flagged for review', {
           invoiceId, jobId: job.id, priorInvoiceId: priorId.slice(0, 8),
         })
+        // §3.5 record a durable, machine-'pending' duplicate-review DECISION row so a
+        // human can later resolve the pair (confirmed_duplicate / distinct / resolved).
+        // Kept SEPARATE and best-effort exactly like the identity_key write below: until
+        // the additive `duplicate_reviews` migration is applied this upsert FAILS SOFT
+        // (logged, swallowed) and detection still works purely through the encrypted
+        // `_reviewReasons` path — no invoice is blocked, lost, or auto-approved. The
+        // machine only ever writes 'pending'; it NEVER self-resolves a duplicate.
+        // match_evidence is the SAME non-reversible blind index, never plaintext.
+        try {
+          const { error: drErr } = await db.from('duplicate_reviews').upsert({
+            workspace_id: workspaceId,
+            incoming_invoice_id: invoiceId,
+            canonical_invoice_id: priorId,
+            match_layer: 'identity',
+            match_evidence: identityKeyToBytea(identityKeyHex),
+            review_status: 'pending',
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'workspace_id,incoming_invoice_id,canonical_invoice_id' })
+          if (drErr) {
+            logger.warn('[Extract] duplicate_reviews write skipped (migration not applied?); decision record inactive', {
+              invoiceId, jobId: job.id, code: drErr.code ?? 'unknown',
+            })
+          }
+        } catch {
+          // A missing table must NEVER fail a real bill's extraction.
+        }
       }
     }
 

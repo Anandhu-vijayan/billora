@@ -14,8 +14,9 @@ const classify = await importTs('lib/ocr/classify.ts')
 
 const {
   DOC_TYPES, ACCOUNTING_CATEGORIES, CLASSIFICATION_METHODS, CLASSIFICATION_VERSION,
+  ITC_ELIGIBILITY, MACHINE_FORBIDDEN_CATEGORIES,
   isDocTypeFull, isAccountingCategory, headingRegion, decideDocType,
-  decideAccountingCategory, classifyDocument, acceptAiClassification, applyUserClassification,
+  decideAccountingCategory, decideItcEligibility, classifyDocument, acceptAiClassification, applyUserClassification,
 } = classify
 
 // --- helpers ---------------------------------------------------------------
@@ -33,7 +34,8 @@ test('CL-enums: strict document-type and category vocabularies are exposed', () 
     'invoice', 'credit_note', 'debit_note', 'bill_of_supply',
     'receipt', 'payment_voucher', 'delivery_challan', 'proforma_invoice', 'unknown',
   ])
-  assert.deepEqual(ACCOUNTING_CATEGORIES, ['purchase', 'expense', 'service', 'fixed_asset', 'other', 'unknown'])
+  assert.deepEqual(ACCOUNTING_CATEGORIES, ['purchase', 'expense', 'service', 'fixed_asset', 'capital_purchase', 'sales', 'other', 'unknown'])
+  assert.deepEqual(ITC_ELIGIBILITY, ['eligible', 'ineligible', 'needs_review'])
   assert.deepEqual(CLASSIFICATION_METHODS, ['rules', 'ai', 'user'])
   assert.equal(CLASSIFICATION_VERSION, 1)
   assert.equal(isDocTypeFull('bill_of_supply'), true)
@@ -41,6 +43,62 @@ test('CL-enums: strict document-type and category vocabularies are exposed', () 
   assert.equal(isDocTypeFull('invoice '), false)
   assert.equal(isAccountingCategory('fixed_asset'), true)
   assert.equal(isAccountingCategory('asset'), false)
+})
+
+// ===========================================================================
+// §3.3 ITC eligibility — a third, descriptive dimension; machine never 'eligible'.
+// ===========================================================================
+test('CL-itc: the machine NEVER claims ITC-eligible, only needs_review or ineligible', () => {
+  // A genuine tax invoice: we cannot make a legal §17(5) determination, so needs_review.
+  assert.equal(decideItcEligibility('invoice').eligibility, 'needs_review')
+  assert.equal(decideItcEligibility('bill_of_supply').eligibility, 'needs_review')
+  assert.equal(decideItcEligibility('credit_note').eligibility, 'needs_review')
+  assert.equal(decideItcEligibility('unknown').eligibility, 'needs_review')
+  // A document that is categorically NOT a tax invoice is honestly ineligible.
+  for (const dt of ['receipt', 'payment_voucher', 'delivery_challan', 'proforma_invoice']) {
+    assert.equal(decideItcEligibility(dt).eligibility, 'ineligible', `${dt} cannot support ITC`)
+    assert.ok(decideItcEligibility(dt).reason.length > 0, 'ineligible carries a reason')
+  }
+})
+
+test('CL-itc: classifyDocument reports ITC but it NEVER adds a blocking review reason (§5)', () => {
+  const r = classifyDoc('TAX INVOICE\nInvoice No: 1\nSupplier GSTIN 27AAPFU0939F1ZV\nTaxable 1000 CGST 90 SGST 90 Total 1180')
+  assert.equal(r.documentType, 'invoice')
+  assert.equal(r.itcEligibility, 'needs_review')
+  // Descriptive only: no reviewReasons entry is derived from ITC.
+  assert.ok(!r.reviewReasons.some((x) => /itc|input-tax/i.test(x)), 'ITC contributes no blocking reason')
+})
+
+test('CL-itc: only a HUMAN may promote ITC to eligible via applyUserClassification', () => {
+  const rules = classifyDoc('TAX INVOICE\nInvoice No: 2\nTotal 500')
+  assert.equal(rules.itcEligibility, 'needs_review')
+  const user = applyUserClassification(rules, { itcEligibility: 'eligible' })
+  assert.equal(user.itcEligibility, 'eligible')
+  assert.match(user.itcReason, /human confirmed/)
+  // An absent / invalid patch value leaves the machine's honest needs_review standing.
+  assert.equal(applyUserClassification(rules, { itcEligibility: 'bogus' }).itcEligibility, 'needs_review')
+  assert.equal(applyUserClassification(rules, {}).itcEligibility, 'needs_review')
+})
+
+test('CL-cat-reviewonly: capital_purchase and sales are enum-valid but never machine-assigned', () => {
+  assert.equal(isAccountingCategory('capital_purchase'), true) // a human MAY set it
+  assert.equal(isAccountingCategory('sales'), true)
+  assert.ok(MACHINE_FORBIDDEN_CATEGORIES.has('capital_purchase') && MACHINE_FORBIDDEN_CATEGORIES.has('sales'))
+  // decideAccountingCategory never returns a forbidden category, whatever the wording.
+  for (const text of ['Capital goods machinery equipment', 'Sales invoice for outward supply', 'rent invoice']) {
+    const c = decideAccountingCategory('invoice', text)
+    assert.ok(!MACHINE_FORBIDDEN_CATEGORIES.has(c.category), `rules must not auto-assign ${c.category}`)
+  }
+})
+
+test('CL-cat-reviewonly: the AI gate rejects a model that proposes a review-only category', () => {
+  // Force the rules answer to be undecided so the AI override branch is reached.
+  const rules = classifyDocument({ structuralNoteType: null, headingText: 'page with no title', fullText: 'nothing decisive' })
+  assert.equal(rules.documentType, 'unknown')
+  assert.equal(acceptAiClassification({ documentType: 'invoice', accountingCategory: 'sales' }, rules).accepted, false)
+  assert.equal(acceptAiClassification({ documentType: 'invoice', accountingCategory: 'capital_purchase' }, rules).accepted, false)
+  // A permitted category is still accepted where the rules were genuinely undecided.
+  assert.equal(acceptAiClassification({ documentType: 'invoice', accountingCategory: 'purchase' }, rules).accepted, true)
 })
 
 // ===========================================================================

@@ -13,7 +13,7 @@ import { verifyWebhookSignature, safeTokenEqual } from '@/lib/whatsapp/verify';
 import { transition, menuText, type ConversationState, type SessionSnapshot, type TransitionResult } from '@/lib/whatsapp/conversation';
 import { loadSession, loadAccountType, saveSession, isExpired, expiredSnapshot, updateSessionDeliveryState, claimUploadAck } from '@/lib/whatsapp/sessions';
 import { sendText, sendAccountTypeButtons, sendClientList, sendConfirmApply, sendMenu, sendReviewList, type SendOutcome } from '@/lib/whatsapp/send';
-import { composeReviewEditorMessage, REVIEW_EDIT_HELP } from '@/lib/whatsapp/review-edit';
+import { composeReviewEditorMessage, REVIEW_EDIT_HELP, fieldPromptForIndex } from '@/lib/whatsapp/review-edit';
 import {
   ensureIndividualWorkspace, ensureOrganizationWorkspace,
   listClients, createClient, verifyClientInWorkspace, setClientOwnGstin,
@@ -249,7 +249,7 @@ async function handleOnboardingSideEffects(
           // did nothing. Descriptive only — a row that fails a validator is still
           // never force-filed; the reviewer fixes the field, then replies APPROVE.
           const fix = r.blockers.length > 0
-            ? ` Tap the invoice below and ${r.blockers.join('; ')}, then reply APPROVE.`
+            ? ` To fix, tap an invoice below and correct: ${r.blockers.join('; ')}. Then reply APPROVE.`
             : ' Tap an invoice below, fix the flagged field, then reply APPROVE.';
           parts.push(`${r.stillPending} could NOT be approved as-is — a value did not add up, so nothing was forced through.${fix}`);
         }
@@ -329,9 +329,10 @@ async function handleOnboardingSideEffects(
       } else if (cmd && cmd.action === 'help') {
         editReplyBody = REVIEW_EDIT_HELP;
       } else {
-        // unknown-field / reprompt: never guess which field a stray number meant.
+        // unknown-field / reprompt: never guess which field a stray number meant, and
+        // never claim a REAL field does not exist — a bare number just needs its value.
         editReplyBody = cmd && cmd.action === 'unknown-field' && cmd.fieldNo != null
-          ? `There is no field ${cmd.fieldNo} on this invoice. ${REVIEW_EDIT_HELP}`
+          ? `${fieldPromptForIndex(cmd.fieldNo)}\n\n${REVIEW_EDIT_HELP}`
           : REVIEW_EDIT_HELP;
       }
     }

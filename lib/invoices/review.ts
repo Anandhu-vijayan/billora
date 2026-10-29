@@ -28,7 +28,7 @@ import { encryptExtractedPayload, decryptExtractedPayload } from '@/lib/encrypti
 import { deriveKeyVersion } from '@/lib/encryption/files'
 import { evaluateLedger, mergeCandidates, type LedgerCandidate, type LedgerRow } from '@/lib/ocr/ledger'
 import {
-  applyUserClassification, isAccountingCategory, isDocTypeFull, CLASSIFICATION_VERSION,
+  applyUserClassification, isAccountingCategory, isDocTypeFull, isItcEligibility, CLASSIFICATION_VERSION,
   type ClassificationResult,
 } from '@/lib/ocr/classify'
 import { moneyToMinorUnits, minorUnitsToNumber } from '@/lib/ocr/validators/money'
@@ -97,7 +97,7 @@ const CLASSIFICATION_KEY = '_classification'
 const AUDIT_HISTORY_CAP = 50
 
 /** A reviewer-confirmed classification change; values are validated as enums. */
-export interface ClassificationPatch { documentType?: unknown; accountingCategory?: unknown }
+export interface ClassificationPatch { documentType?: unknown; accountingCategory?: unknown; itcEligibility?: unknown }
 
 function decodeStoredRecord(encryptedPayload: unknown, masterKeyHex: string): StoredRecord | null {
   try {
@@ -128,7 +128,16 @@ function splitAudit(record: StoredRecord | null): { candidate: LedgerCandidate; 
   // treated as absent rather than trusted — a human can still set it explicitly.
   const c = classRaw as Partial<ClassificationResult> | null | undefined
   const classification = c && typeof c === 'object' && isDocTypeFull(c.documentType) && isAccountingCategory(c.accountingCategory)
-    ? (classRaw as ClassificationResult)
+    // §3.3 a pre-ITC stored row has no itc sibling; normalize it to the machine's
+    // honest 'needs_review' rather than dropping the whole classification. A human
+    // can still set the final value; the machine never claims 'eligible'.
+    ? {
+        ...(classRaw as ClassificationResult),
+        itcEligibility: isItcEligibility(c.itcEligibility) ? (classRaw as ClassificationResult).itcEligibility : 'needs_review',
+        itcReason: typeof c.itcReason === 'string'
+          ? (classRaw as ClassificationResult).itcReason
+          : 'input-tax-credit eligibility requires human confirmation',
+      }
     : null
   return { candidate: candidate as LedgerCandidate, audit, reasons, classification }
 }
@@ -148,6 +157,7 @@ function encodeRow(row: LedgerRow, audit: CorrectionAudit | null, reasons: reado
 function baselineClassification(stored: ClassificationResult | null): ClassificationResult {
   return stored ?? {
     documentType: 'unknown', accountingCategory: 'unknown', method: 'rules',
+    itcEligibility: 'needs_review', itcReason: 'no machine ITC determination stored for this row',
     confidence: 'low', evidence: ['no machine classification stored for this row'],
     needsReview: false, reviewReasons: [], originalInvoiceRef: null, version: CLASSIFICATION_VERSION,
   }
@@ -191,6 +201,9 @@ function appendClassificationHistory(
   if (prior?.accountingCategory !== next.accountingCategory) {
     added.push({ field: 'accountingCategory', from: prior?.accountingCategory ?? null, to: next.accountingCategory, at: now, source: 'human' })
   }
+  if (prior?.itcEligibility !== next.itcEligibility) {
+    added.push({ field: 'itcEligibility', from: prior?.itcEligibility ?? null, to: next.itcEligibility, at: now, source: 'human' })
+  }
   if (added.length === 0) return audit
   const base: CorrectionAudit = audit ?? { originalExtracted: null, history: [] }
   return { originalExtracted: base.originalExtracted, history: [...base.history, ...added].slice(-AUDIT_HISTORY_CAP) }
@@ -201,6 +214,23 @@ function scalarToString(v: unknown): string | null {
   if (typeof v === 'string') return v
   if (typeof v === 'number' || typeof v === 'boolean') return String(v)
   return null
+}
+
+/**
+ * §UX soft-only override: the ONLY reason families a human confirmation may clear.
+ * `low-confidence` (measured OR the model's own `low-confidence:source:*`) is a
+ * RELIABILITY signal, not a data-integrity failure. `tax-rate-advisory` is the same
+ * rate/amount disagreement evaluateLedger raises ONLY when the invoice total ALREADY
+ * ties out — the money reconciles, so it is a glance-at-the-rate hint, not a broken
+ * bill. Every genuine integrity break (bad/missing GSTIN, unresolved/future date,
+ * missing number/vendor, non-finite/negative/UNRECONCILED amounts, incoherent tax
+ * structure, a HARD `tax-rate-mismatch` when the total does NOT tie, a non-invoice
+ * document, a duplicate, a placeholder) is pushed as its OWN non-soft reason, so it
+ * is NEVER classified soft here.
+ */
+function isSoftReviewReason(code: string): boolean {
+  const base = code.split(':')[0]
+  return base === 'low-confidence' || base === 'tax-rate-advisory'
 }
 
 /**
@@ -259,6 +289,14 @@ export async function applyInvoiceReview(
      * classification review guard lifts ONLY because a human answered the question.
      */
     classificationPatch?: ClassificationPatch
+    /**
+     * §bulk-approve: when true the invoice is still approved + filed into its
+     * (client, month) batch, but the register rebuild is NOT scheduled here — the
+     * caller defers a single coalesced enqueue until every row in the batch has
+     * committed, so a bulk approve never builds a half-approved (partial) workbook.
+     * Defaults to false; a single approve and the extraction path are unchanged.
+     */
+    deferRegister?: boolean
   },
 ): Promise<InvoiceReviewResult> {
   const { workspaceId, invoiceId, masterKeyHex } = args
@@ -326,6 +364,26 @@ export async function applyInvoiceReview(
   }
   review = foldClassificationGuard(review, reasons, nextClassification)
 
+  // §UX soft-only human override (operator-authorized). A person who explicitly
+  // confirms an invoice may file a row whose ONLY blemish is the READER'S modest
+  // self-confidence on an otherwise fully-valid bill. Because every objective check
+  // (invalid/missing GSTIN, unresolved/future date, missing number or vendor, non-
+  // finite/negative or unreconciled amounts, incoherent tax structure, a non-invoice
+  // document) carries its OWN named reason, a row flagged ONLY by `low-confidence`
+  // has necessarily passed them all — so clearing it files no bad GSTIN, no broken
+  // math and no placeholder. This NEVER clears a hard reason: it only stops the AI's
+  // own under-confidence from vetoing a bill a human has personally confirmed. It is
+  // gated on the reviewer affirmatively confirming the invoice number (as approval
+  // always is), so a bare/empty submit can never trigger it.
+  if (
+    review === 'needs_review'
+    && reviewerConfirmedInvoiceNumber
+    && reasons.length > 0
+    && reasons.every(isSoftReviewReason)
+  ) {
+    review = 'approved'
+  }
+
   const keyVersion = deriveKeyVersion(masterKeyHex)
   const payload = encryptExtractedPayload(encodeRow(evaluation.row, nextAudit, reasons, nextClassification), masterKeyHex)
   const { error: recWriteErr } = await db.from('extracted_records').upsert({
@@ -346,11 +404,39 @@ export async function applyInvoiceReview(
     .eq('workspace_id', workspaceId).eq('id', invoiceId)
   if (stErr) throw new Error(`REVIEW_INVOICE_STATUS_ERROR: ${stErr.message}`)
 
+  // §3.5 re-evaluate the duplicate-review decision on completion. When a human
+  // approves an invoice that carried a machine-'pending' duplicate flag, their
+  // review IS the resolution act, so we best-effort mark that pair 'resolved'
+  // (a terminal, human-handled audit state) — we NEVER claim confirmed_duplicate
+  // or distinct here, those are judgements a dedicated resolve action owns. This
+  // write is deliberately SEPARATE and FAIL-SOFT: until the additive
+  // `duplicate_reviews` migration is applied it errors and is swallowed (logged),
+  // exactly like the identity_key write, so the review above still commits and no
+  // invoice is ever blocked. It never changes the review outcome or the register.
+  if (review === 'approved') {
+    try {
+      const { error: drErr } = await db.from('duplicate_reviews')
+        .update({ review_status: 'resolved', decided_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('workspace_id', workspaceId)
+        .eq('incoming_invoice_id', invoiceId)
+        .eq('review_status', 'pending')
+      if (drErr) {
+        logger.warn('[Review] duplicate_reviews resolve skipped (migration not applied?); decision record inactive', {
+          invoiceId, code: drErr.code ?? 'unknown',
+        })
+      }
+    } catch {
+      // A missing table must never fail a completed review.
+    }
+  }
+
   let batchId: string | null = invoice.batch_id
   if (review === 'approved' && evaluation.invoiceDateResolved) {
-    // Correct client + month from the CONFIRMED date; idempotent register enqueue.
+    // Correct client + month from the CONFIRMED date; idempotent register enqueue
+    // (suppressed when the caller coalesces a single rebuild after a bulk approve).
     batchId = await resolveInvoiceBatch(db, {
       workspaceId, invoiceId, row: evaluation.row, invoice,
+      scheduleRegister: !args.deferRegister,
     })
   }
 
@@ -437,6 +523,12 @@ export function parseReviewCorrections(body: unknown): { corrections: LedgerCand
     if (present(c.accountingCategory)) {
       if (!isAccountingCategory(c.accountingCategory)) errors.push({ field: 'classification.accountingCategory', code: 'INVALID_ENUM' })
       else classification = { ...classification, accountingCategory: c.accountingCategory }
+    }
+    // §3.3 ITC eligibility is a human-settable dimension; validated against the strict
+    // enum and never coerced. This is the ONLY channel that may promote it to 'eligible'.
+    if (present(c.itcEligibility)) {
+      if (!isItcEligibility(c.itcEligibility)) errors.push({ field: 'classification.itcEligibility', code: 'INVALID_ENUM' })
+      else classification = { ...classification, itcEligibility: c.itcEligibility }
     }
   }
 

@@ -38,9 +38,33 @@ export const DOC_TYPES = [
 export type DocTypeFull = (typeof DOC_TYPES)[number]
 
 export const ACCOUNTING_CATEGORIES = [
-  'purchase', 'expense', 'service', 'fixed_asset', 'other', 'unknown',
+  'purchase', 'expense', 'service', 'fixed_asset', 'capital_purchase', 'sales', 'other', 'unknown',
 ] as const
 export type AccountingCategory = (typeof ACCOUNTING_CATEGORIES)[number]
+
+/**
+ * §3.3 categories the MACHINE may never auto-assign. 'capital_purchase' and 'sales'
+ * carry legal/use ambiguity the spec forbids guessing at ("HSN must not determine
+ * whether an item is a purchase, expense or capital purchase"; "Sales classification
+ * must follow the configured business workflow and document direction"), so they are
+ * reachable ONLY through a human confirmation (applyUserClassification).
+ * decideAccountingCategory never returns them, and acceptAiClassification rejects an
+ * AI that proposes them — closing the loophole where a model reply would count as an
+ * auto-assignment. The legacy 'fixed_asset' rules behaviour is left untouched.
+ */
+export const MACHINE_FORBIDDEN_CATEGORIES: ReadonlySet<AccountingCategory> =
+  new Set<AccountingCategory>(['capital_purchase', 'sales'])
+
+/**
+ * §3.3 a THIRD, independent classification dimension — input-tax-credit eligibility.
+ * The machine NEVER claims 'eligible' (that is a legal §17(5) determination we must
+ * not fabricate); it only ever returns 'ineligible' for a document categorically not
+ * a tax invoice, or 'needs_review'. A human sets the final value via the review path.
+ * ITC is DESCRIPTIVE ONLY: it never adds a blocking review reason and never filters a
+ * record out of its register (§5).
+ */
+export const ITC_ELIGIBILITY = ['eligible', 'ineligible', 'needs_review'] as const
+export type ItcEligibility = (typeof ITC_ELIGIBILITY)[number]
 
 export const CLASSIFICATION_METHODS = ['rules', 'ai', 'user'] as const
 export type ClassificationMethod = (typeof CLASSIFICATION_METHODS)[number]
@@ -53,12 +77,16 @@ export const CLASSIFICATION_VERSION = 1
 
 const DOC_TYPE_SET: ReadonlySet<string> = new Set(DOC_TYPES)
 const CATEGORY_SET: ReadonlySet<string> = new Set(ACCOUNTING_CATEGORIES)
+const ITC_SET: ReadonlySet<string> = new Set(ITC_ELIGIBILITY)
 
 export function isDocTypeFull(value: unknown): value is DocTypeFull {
   return typeof value === 'string' && DOC_TYPE_SET.has(value)
 }
 export function isAccountingCategory(value: unknown): value is AccountingCategory {
   return typeof value === 'string' && CATEGORY_SET.has(value)
+}
+export function isItcEligibility(value: unknown): value is ItcEligibility {
+  return typeof value === 'string' && ITC_SET.has(value)
 }
 
 /** Categories whose documents are purchase-register-shaped (the historical product scope). */
@@ -297,12 +325,40 @@ export function decideAccountingCategory(docType: DocTypeFull, fullText: string)
 }
 
 // ---------------------------------------------------------------------------
+// ITC eligibility (§3.3 third dimension) — descriptive, never auto-'eligible'.
+// ---------------------------------------------------------------------------
+
+export interface ItcDecision {
+  eligibility: ItcEligibility
+  reason: string
+}
+
+/**
+ * Pure, conservative ITC-eligibility decision. The machine NEVER returns 'eligible'
+ * — claiming input-tax credit is a legal §17(5) determination we must not fabricate.
+ * A document categorically NOT a tax invoice (a receipt, payment voucher, delivery
+ * challan or proforma) is 'ineligible' (it can never support ITC); every invoice-shaped
+ * or undetermined document is 'needs_review' until a human decides. Like the accounting
+ * category this rides the encrypted `_classification` sibling only; it never filters a
+ * record out of its register (§5).
+ */
+export function decideItcEligibility(docType: DocTypeFull): ItcDecision {
+  if (docType === 'receipt' || docType === 'payment_voucher'
+    || docType === 'delivery_challan' || docType === 'proforma_invoice') {
+    return { eligibility: 'ineligible', reason: `${docType} is not a tax invoice and cannot support input tax credit` }
+  }
+  return { eligibility: 'needs_review', reason: 'input-tax-credit eligibility requires human confirmation' }
+}
+
+// ---------------------------------------------------------------------------
 // Combined classification result (§2.3 metadata bundle).
 // ---------------------------------------------------------------------------
 
 export interface ClassificationResult {
   documentType: DocTypeFull
   accountingCategory: AccountingCategory
+  itcEligibility: ItcEligibility
+  itcReason: string
   method: ClassificationMethod
   confidence: ClassificationConfidence
   evidence: string[]
@@ -324,6 +380,8 @@ export function classifyDocument(args: {
 }): ClassificationResult {
   const heading = decideDocType(args.structuralNoteType, args.headingText)
   const category = decideAccountingCategory(heading.docType, args.fullText)
+  // ITC is computed but NEVER pushed into reviewReasons: it is descriptive (§5).
+  const itc = decideItcEligibility(heading.docType)
   const reviewReasons: string[] = []
   // A POSITIVE heading conflict is blocking (two competing document titles).
   // Mere absence of a heading is not — see decideAccountingCategory's fail-open
@@ -333,6 +391,8 @@ export function classifyDocument(args: {
   return {
     documentType: heading.docType,
     accountingCategory: category.category,
+    itcEligibility: itc.eligibility,
+    itcReason: itc.reason,
     method: 'rules',
     confidence: heading.docType === 'unknown' || category.confidence === 'low' ? 'low'
       : heading.docType === 'invoice' && category.confidence === 'high' ? 'high'
@@ -368,6 +428,9 @@ export function acceptAiClassification(
   rules: ClassificationResult,
 ): { accepted: false } | { accepted: true; result: ClassificationResult } {
   if (!isDocTypeFull(reply.documentType) || !isAccountingCategory(reply.accountingCategory)) return { accepted: false }
+  // A model reply is still a MACHINE: it may never auto-assign the review-only
+  // categories (§3.3). Reject so the rules answer + Review stands and a human decides.
+  if (MACHINE_FORBIDDEN_CATEGORIES.has(reply.accountingCategory)) return { accepted: false }
   const overridesRules = rules.documentType === 'unknown' || rules.confidence === 'low'
   if (!overridesRules) return { accepted: false }
   const reviewReasons = (reply.documentType === 'unknown' || reply.accountingCategory === 'unknown')
@@ -400,10 +463,15 @@ export function acceptAiClassification(
  */
 export function applyUserClassification(
   rules: ClassificationResult,
-  patch: { documentType?: unknown; accountingCategory?: unknown },
+  patch: { documentType?: unknown; accountingCategory?: unknown; itcEligibility?: unknown },
 ): ClassificationResult {
   const documentType = isDocTypeFull(patch.documentType) ? patch.documentType : rules.documentType
   const accountingCategory = isAccountingCategory(patch.accountingCategory) ? patch.accountingCategory : rules.accountingCategory
+  // Only a HUMAN may promote ITC to 'eligible'; the machine never could. An absent or
+  // invalid patch value leaves the machine's honest 'needs_review' standing.
+  const itcEligibility = isItcEligibility(patch.itcEligibility) ? patch.itcEligibility : rules.itcEligibility
+  const itcChanged = isItcEligibility(patch.itcEligibility) && patch.itcEligibility !== rules.itcEligibility
+  const itcReason = itcChanged ? `human confirmed ITC as ${itcEligibility}` : rules.itcReason
   const machineReasons = new Set([
     'document-type-could-not-be-determined', 'category-could-not-be-determined',
     'document-heading-conflict', 'category-evidence-conflict',
@@ -414,6 +482,8 @@ export function applyUserClassification(
     ...rules,
     documentType,
     accountingCategory,
+    itcEligibility,
+    itcReason,
     method: 'user',
     confidence: stillUndecided ? 'low' : 'high',
     evidence: [...rules.evidence, `user confirmed ${documentType}/${accountingCategory}`],

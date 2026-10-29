@@ -213,12 +213,14 @@ export const TAX_BREAKDOWN_SHEET_NAME = 'Tax Breakdown';
 // delivery + integrity contract keys on); every other category rides its own
 // clearly-labelled sheet. Ordering is deterministic so a rebuild is byte-stable
 // and an accountant always finds purchases first.
-const REGISTER_CATEGORY_ORDER = ['purchase', 'expense', 'service', 'fixed_asset', 'other', 'unknown'] as const;
+const REGISTER_CATEGORY_ORDER = ['purchase', 'expense', 'service', 'fixed_asset', 'capital_purchase', 'sales', 'other', 'unknown'] as const;
 const REGISTER_CATEGORY_SHEET: Record<string, string> = {
   purchase: PURCHASE_REGISTER_SHEET_NAME,
   expense: 'Expense Register',
   service: 'Service Register',
   fixed_asset: 'Fixed Asset Register',
+  capital_purchase: 'Capital Purchase Register',
+  sales: 'Sales Register',
   other: 'Other Register',
   unknown: 'Uncategorised Register',
 };
@@ -229,6 +231,18 @@ function normalizeRegisterCategory(value: string | null | undefined): string {
 /** True for any per-category register sheet (all end in " Register"), false for Tax Breakdown / Purchase Import. */
 function isRegisterSheetName(name: string): boolean {
   return /\sRegister$/.test(name);
+}
+
+/**
+ * §3.3 render the machine/human ITC determination as stable, accountant-readable
+ * text. An absent/legacy value renders BLANK (never a fabricated 'eligible'); the
+ * machine itself only ever produces 'ineligible' or 'needs_review'.
+ */
+const ITC_ELIGIBILITY_LABEL: Record<string, string> = {
+  eligible: 'ITC eligible', ineligible: 'ITC ineligible', needs_review: 'ITC needs review',
+};
+function itcLabel(value: string | null | undefined): string | null {
+  return typeof value === 'string' ? (ITC_ELIGIBILITY_LABEL[value] ?? null) : null;
 }
 
 /** One rate/treatment slice as the register renders it (every money is number|null). */
@@ -263,6 +277,13 @@ export interface RegisterInvoiceInput {
    * touches an amount, a ledger mapping, or the aggregate Tax Breakdown / import.
    */
   accountingCategory?: string | null;
+  /**
+   * §3.3 the ITC-eligibility determination for this invoice (eligible / ineligible /
+   * needs_review). DESCRIPTIVE ONLY: it never filters the row out of the register (§5),
+   * it is rendered as one added column on the per-category REGISTER sheets, and the
+   * 12-column Purchase Import contract is untouched. Absent/legacy renders blank.
+   */
+  itcEligibility?: string | null;
   total_taxable_value: number | null;
   total_cgst: number | null;
   total_sgst: number | null;
@@ -290,6 +311,7 @@ const REGISTER_FIXED_HEADERS = [
 const REGISTER_TOTAL_HEADERS = [
   'Total Taxable Value', 'Total CGST', 'Total SGST', 'Total IGST', 'Total Cess',
   'Other Charges', 'Discount', 'Round Off', 'Grand Total', 'Review/Validation Status',
+  'ITC Eligibility',
 ] as const;
 const BREAKDOWN_HEADERS = [
   'Invoice Date', 'Invoice No', 'Supplier Name', 'Supplier GSTIN', 'Tax Rate', 'Tax Treatment',
@@ -406,6 +428,7 @@ function renderRegisterSheet(
     writeNumberCell(row.getCell(c++), inv.round_off ?? null, MONEY_FMT);
     writeNumberCell(row.getCell(c++), inv.grand_total, MONEY_FMT);
     writeTextCell(row.getCell(c++), inv.review_status ?? null);
+    writeTextCell(row.getCell(c++), itcLabel(inv.itcEligibility));
     row.eachCell((cell) => { if (!cell.font) cell.font = coreFont; });
   }
   ws.views = [{ showGridLines: true, state: 'frozen', xSplit: 2, ySplit: 1 }];

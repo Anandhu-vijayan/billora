@@ -16,6 +16,7 @@
 //   * Review accounting: needs_review/failed invoices are NOT silently dropped —
 //     they are counted and logged, and only approved rows enter the register.
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { createHash } from 'node:crypto'
 import { bucketFor } from '@/lib/supabase/server'
 import { logger } from '@/lib/logger'
 import { PermanentJobError } from '@/lib/jobs/queue'
@@ -75,6 +76,30 @@ async function retireLiveWorkbooks(
   // A failed retire must requeue (transient throw) rather than leave a stale,
   // still-downloadable register behind.
   if (error) throw new Error(`WORKBOOK_RETIRE_ERROR: ${error.message}`)
+  await markRetiredAt(db, workspaceId, batchId)
+}
+
+/**
+ * §6 fail-soft: stamp `retired_at` on the batch's now-expired workbooks so the
+ * version chain / delivery isolation is auditable. Kept SEPARATE and best-effort:
+ * until the additive `retired_at` column exists this update fails SOFT (logged) —
+ * the status-only retire above has ALREADY made the register un-servable, so a
+ * stale workbook is never downloadable whether or not the migration is applied.
+ */
+async function markRetiredAt(db: Db, workspaceId: string, batchId: string): Promise<void> {
+  try {
+    const { error } = await db.from('generated_workbooks')
+      .update({ retired_at: new Date().toISOString() })
+      .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+      .eq('status', 'expired').is('retired_at', null)
+    if (error) {
+      logger.warn('[Register] retired_at stamp skipped (migration not applied?)', {
+        batchId, code: error.code ?? 'unknown',
+      })
+    }
+  } catch {
+    // provenance must never block a retire that already made the register stale.
+  }
 }
 
 /** The WhatsApp sender identity that owns a workspace (for reply linkage). */
@@ -271,15 +296,29 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 
   const { masterKeyHex, pathKeyHex } = resolveFileKeyConfig()
   const { data: records, error: recErr } = await db
-    .from('extracted_records').select('invoice_id,encrypted_payload,review_status')
+    .from('extracted_records').select('invoice_id,encrypted_payload,review_status,updated_at')
     .eq('workspace_id', workspaceId).eq('review_status', 'approved').in('invoice_id', invoiceIds)
   if (recErr) throw new Error(`RECORDS_READ_ERROR: ${recErr.message}`)
 
-  const rows: Array<LedgerRow & { _classification?: { accountingCategory?: unknown } }> = []
+  // §6 capture the EXACT approved source fingerprint BEFORE the (potentially slow)
+  // build so publish can prove nothing a reviewer changed mid-build ships as
+  // current. `membershipHash` is a one-way SHA-256 of the SORTED approved invoice-id
+  // set (never the ids -> no new PII); `sourceRevision` additionally folds each
+  // record's updated_at, so an approval/rejection/correction/re-date is detected.
+  // Both are computed over already-fetched rows (no extra round-trip) using ONLY
+  // base-schema columns, so the concurrency re-check works even before the additive
+  // metadata migration is applied.
+  const recList = (records ?? []) as Array<{ invoice_id: string; updated_at?: string | null }>
+  const membershipHashHex = createHash('sha256')
+    .update(recList.map((r) => r.invoice_id).sort().join('\n')).digest('hex')
+  const sourceRevision = createHash('sha256')
+    .update(recList.map((r) => `${r.invoice_id}\u0000${r.updated_at ?? ''}`).sort().join('\n')).digest('hex')
+
+  const rows: Array<LedgerRow & { _classification?: { accountingCategory?: unknown; itcEligibility?: unknown } }> = []
   for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
     try {
       const plain = decryptExtractedPayload(byteaToBuffer(rec.encrypted_payload), masterKeyHex)
-      rows.push(JSON.parse(plain) as LedgerRow & { _classification?: { accountingCategory?: unknown } })
+      rows.push(JSON.parse(plain) as LedgerRow & { _classification?: { accountingCategory?: unknown; itcEligibility?: unknown } })
     } catch (e) {
       // A corrupt stored payload is unexpected, but never emit a partial/garbage
       // workbook: skip that one row and record it. The batch still ships cleanly.
@@ -359,6 +398,13 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
       accountingCategory: typeof row._classification?.accountingCategory === 'string'
         ? row._classification.accountingCategory
         : null,
+      // §3.3 ITC eligibility is DESCRIPTIVE on the register: it never filtered this row
+      // out (an approved record always renders regardless of ITC, per §5); it only tells
+      // the accountant the credit position. Rides the same encrypted `_classification`
+      // sibling; a legacy row without it renders blank (never a fabricated value).
+      itcEligibility: typeof row._classification?.itcEligibility === 'string'
+        ? row._classification.itcEligibility
+        : null,
       total_taxable_value: row.taxable_value,
       total_cgst: row.cgst_amount,
       total_sgst: row.sgst_amount,
@@ -394,6 +440,9 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     importRowCount,
   })
   logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
+  // §6 content-integrity seal over the PLAINTEXT workbook bytes (independent of the
+  // at-rest ciphertext). Computed once here; persisted fail-soft with the row below.
+  const workbookChecksumHex = createHash('sha256').update(workbook).digest('hex')
   const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
   const exportsBucket = bucketFor('exports')
   // Encrypt the register AT REST: vendor names, GSTINs and amounts are customer
@@ -412,12 +461,41 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     batchId, jobId: job.id, sizeBytes: enc.sizeBytes, rowCount: rows.length,
   })
 
+  // §6 CONCURRENCY / DELIVERY ISOLATION: re-read the approved source fingerprint
+  // immediately before publishing and refuse to publish if it moved while we were
+  // building (a reviewer approved, rejected, corrected, or re-dated a row mid-build,
+  // so this workbook no longer reflects current truth). Uses ONLY base-schema
+  // columns, so it is active regardless of the additive metadata migration. A
+  // mismatch is a NORMAL throw (the coalesced requeue rebuilds against the CURRENT
+  // set) — nothing is published and no stale register is ever served. A re-check
+  // that itself cannot run degrades SOFT (log + proceed): it must never block a
+  // build that already cleared every integrity gate.
+  await assertLease()
+  {
+    const { data: curRecs, error: curErr } = await db
+      .from('extracted_records').select('invoice_id,updated_at')
+      .eq('workspace_id', workspaceId).eq('review_status', 'approved').in('invoice_id', invoiceIds)
+    if (curErr) {
+      logger.warn('[Register] source-revision re-check unavailable; publishing last known-good build', {
+        batchId, jobId: job.id, code: curErr.code ?? 'unknown',
+      })
+    } else {
+      const cur = (curRecs ?? []) as Array<{ invoice_id: string; updated_at?: string | null }>
+      const curRevision = createHash('sha256')
+        .update(cur.map((r) => `${r.invoice_id}\u0000${r.updated_at ?? ''}`).sort().join('\n')).digest('hex')
+      if (curRevision !== sourceRevision) {
+        throw new Error('REGISTER_SOURCE_CHANGED: approved set moved during build; rebuilding')
+      }
+    }
+  }
+
   // Freshness: retire prior workbooks for this batch, then insert the new one
   // with a monotonic version. The insert is what makes it the current register.
   await assertLease()
   await db.from('generated_workbooks')
     .update({ status: 'expired' })
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).in('status', ['ready', 'sent'])
+  await markRetiredAt(db, workspaceId, batchId)
   const { data: prior } = await db.from('generated_workbooks').select('version')
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).order('version', { ascending: false }).limit(1)
   const version = ((prior ?? [])[0]?.version as number | undefined ?? 0) + 1
@@ -432,6 +510,27 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   if (gwErr || !inserted) throw new Error(`WORKBOOK_ROW_ERROR: ${gwErr?.message ?? 'no id'}`)
   const workbookId = (inserted as { id: string }).id
   logger.info('[Register] workbook ready', { workbookId, batchId, jobId: job.id, rowCount: rows.length })
+
+  // §6 provenance metadata: a SEPARATE best-effort write so the register ALWAYS
+  // publishes even before the additive metadata migration is applied — that update
+  // then fails SOFT (logged), leaving the fully-working base row untouched. The
+  // revision here equals the re-check value, so a published row always records the
+  // exact source set it was proven against.
+  try {
+    const { error: metaErr } = await db.from('generated_workbooks').update({
+      source_dataset_revision: sourceRevision,
+      source_row_count: rows.length,
+      source_membership_hash: `\\x${membershipHashHex}`,
+      workbook_checksum: `\\x${workbookChecksumHex}`,
+    }).eq('workspace_id', workspaceId).eq('id', workbookId)
+    if (metaErr) {
+      logger.warn('[Register] workbook metadata columns skipped (migration not applied?); provenance inactive', {
+        workbookId, jobId: job.id, code: metaErr.code ?? 'unknown',
+      })
+    }
+  } catch {
+    // provenance is descriptive; it must never fail a completed, delivered register.
+  }
 
   // Delivery is best-effort and NEVER fails the generation job (rule 5).
   await scheduleDelivery(db, workspaceId, workbookId, job.id, rows.length, flagged ?? 0, mappingRequired + unresolvedRate, expiresAt, assertLease)

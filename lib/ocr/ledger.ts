@@ -644,6 +644,14 @@ export function evaluateLedger(
       ? candidate.document_type
       : 'invoice'
 
+  // §UX multi-rate: an EXPLICIT multi-slab bill (two or more distinct printed
+  // rates) cannot be checked with one flat per-head rate, so flag it here and skip
+  // the single-rate cross-check below. Only explicit slices count — the vision
+  // schema is flat, so an ordinary single-rate bill still runs the check. The
+  // mixed-slice breakdown validator + the total invariant still guard its amounts.
+  const rateCheckSlices = normalizeSlices(candidate.tax_slices)
+  const multiRate = rateCheckSlices !== null && distinctTaxRates(rateCheckSlices).length >= 2
+
   const crossChecks = validateInvoiceCrossChecks({
     taxableValue: candidate.taxable_value,
     cgstAmount: candidate.cgst_amount,
@@ -651,6 +659,11 @@ export function evaluateLedger(
     igstAmount: candidate.igst_amount,
     totalAmount: candidate.total_amount,
     toleranceMinorUnits: BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101))),
+    // §UX: a rate/amount disagreement on a bill whose printed TOTAL already ties is
+    // a SOFT advisory (a human may one-tap approve); if the total does NOT tie it
+    // stays a HARD integrity break. The amounts themselves are never rewritten.
+    totalReconciles: amountsFinite && arithmeticConsistent,
+    multiRate,
     taxRates: {
       ...(candidate.cgst_rate_percent == null ? {} : { cgst: candidate.cgst_rate_percent }),
       ...(candidate.sgst_rate_percent == null ? {} : { sgst: candidate.sgst_rate_percent }),
@@ -850,6 +863,9 @@ const HARD_VALIDATION_FAILURES = new Set([
   'supplier-equals-recipient', 'tax-rate-mismatch', 'tax-rate-amount-missing', 'tax-rate-invalid',
   'tax-rate-cgst-sgst-unequal', 'tax-rate-igst-with-cgst-sgst', 'amount-words-total-mismatch',
   'candidate-conflict',
+  // NOTE: `tax-rate-advisory` is DELIBERATELY ABSENT. It is the SAME rate/amount
+  // disagreement raised only when the invoice total already ties out, so it is a
+  // soft reliability hint (a human may one-tap approve), never an integrity break.
 ])
 
 export function hardValidationFailureCount(reasons: readonly string[]): number {
@@ -958,7 +974,7 @@ export function retryHintFor(
     } else if (r === 'supplier-equals-buyer') {
       const own = (opts?.buyerGstin ?? '').trim().toUpperCase();
       lines.push('You returned the buyer\'s OWN GSTIN' + (own ? ` (${own})` : '') + ' as supplier_gstin; that GSTIN belongs to the customer and can NEVER be the supplier. Re-read the SELLER\'s GSTIN from the "Supplier / Sold By / Invoice From" block.');
-    } else if (r.startsWith('tax-rate-mismatch:') || r.startsWith('tax-rate-amount-missing:')) {
+    } else if (r.startsWith('tax-rate-mismatch:') || r.startsWith('tax-rate-advisory:') || r.startsWith('tax-rate-amount-missing:')) {
       lines.push('The printed tax percentage and extracted tax amount did not agree; re-read the taxable value, rate and corresponding tax amount. Do not calculate a replacement unless the printed values support it.');
     } else if (r === 'tax-rate-invalid:cgst' || r === 'tax-rate-invalid:sgst' || r === 'tax-rate-invalid:igst') {
       lines.push('A printed tax rate could not be parsed as a percentage from 0 to 100; re-read it exactly as printed.');

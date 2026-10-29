@@ -203,3 +203,56 @@ test('DP-wire: migration adds identity_key + a partial live index and is additiv
   assert.match(src, /create index invoices_identity_dup_idx[\s\S]*?where identity_key is not null and status <> 'deleted'/)
   assert.doesNotMatch(src, /grant[^;]*to (anon|authenticated)/i, 'the column widens no browser-visible surface')
 })
+
+// ===========================================================================
+// §3.5 DUPLICATE-REVIEW DECISION RECORDS — write-only migration + fail-soft wiring.
+// The runtime lives in `@/`-aliased modules the harness cannot import, so these
+// are SOURCE CONTRACTS (readFileSync), exactly like the Layer-2 wiring above.
+// ===========================================================================
+const reviewSrc = () => readFileSync(new URL('../lib/invoices/review.ts', import.meta.url), 'utf8')
+const dupReviewMigrationSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261029000000_duplicate_reviews.sql', import.meta.url), 'utf8')
+
+test('DR-wire: extraction records a machine-PENDING decision, never auto-resolves', () => {
+  const src = extractSrc()
+  // it upserts the pair into duplicate_reviews with the machine-owned 'pending' state
+  assert.match(src, /from\('duplicate_reviews'\)\.upsert\(/, 'a decision row is recorded on detection')
+  assert.match(src, /review_status: 'pending'/, 'the machine only ever writes pending')
+  assert.doesNotMatch(src, /duplicate_reviews'[\s\S]{0,400}review_status: '(confirmed_duplicate|distinct|resolved)'/,
+    'the machine NEVER self-resolves a duplicate')
+  // match_evidence is the SAME non-reversible blind index, never plaintext
+  assert.match(src, /match_evidence: identityKeyToBytea\(identityKeyHex\)/, 'evidence is the blind index bytea')
+  // idempotent per (workspace, incoming, canonical) so re-scans do not pile up rows
+  assert.match(src, /onConflict: 'workspace_id,incoming_invoice_id,canonical_invoice_id'/)
+  // FAIL-SOFT: wrapped so an unapplied migration can never break a real bill
+  assert.match(src, /try \{[\s\S]*?from\('duplicate_reviews'\)[\s\S]*?\} catch/, 'the write is guarded')
+  assert.match(src, /logger\.warn\([^)]*duplicate_reviews write skipped/, 'a failed write is a warning, not a throw')
+})
+
+test('DR-wire: shared review path resolves the pending pair fail-soft on approval', () => {
+  const src = reviewSrc()
+  assert.match(src, /from\('duplicate_reviews'\)[\s\S]*?\.update\(\{ review_status: 'resolved'/, 'approval resolves the pending decision')
+  assert.match(src, /\.eq\('incoming_invoice_id', invoiceId\)[\s\S]*?\.eq\('review_status', 'pending'\)/, 'only the still-pending row for this invoice')
+  // it never fabricates a judgement: only 'resolved' is set, never confirmed_duplicate/distinct
+  assert.doesNotMatch(src, /duplicate_reviews[\s\S]{0,300}review_status: '(confirmed_duplicate|distinct)'/,
+    'the review path does not assert a duplicate/distinct judgement')
+  // FAIL-SOFT: guarded + warn, and only under an approved outcome
+  assert.match(src, /if \(review === 'approved'\) \{[\s\S]*?try \{[\s\S]*?duplicate_reviews[\s\S]*?\} catch/)
+  assert.match(src, /logger\.warn\([^)]*duplicate_reviews resolve skipped/)
+})
+
+test('DR-schema: duplicate_reviews migration is additive, tenant-scoped, and read-only to the API', () => {
+  const src = dupReviewMigrationSrc()
+  assert.match(src, /create table if not exists public\.duplicate_reviews/, 'forward-only + re-runnable')
+  assert.match(src, /review_status in \('pending', 'confirmed_duplicate', 'distinct', 'resolved'\)/, 'human decision enum')
+  assert.match(src, /match_evidence bytea/, 'non-reversible evidence column, never plaintext')
+  assert.match(src, /unique \(workspace_id, incoming_invoice_id, canonical_invoice_id\)/, 'idempotent per pair')
+  assert.match(src, /foreign key \(incoming_invoice_id, workspace_id\)[\s\S]*?references public\.invoices\(id, workspace_id\)/, 'tenant-scoped incoming FK')
+  assert.match(src, /foreign key \(canonical_invoice_id, workspace_id\)[\s\S]*?references public\.invoices\(id, workspace_id\)/, 'tenant-scoped canonical FK')
+  assert.match(src, /enable row level security/)
+  assert.match(src, /for select to authenticated[\s\S]*?is_workspace_member\(workspace_id\)/, 'members read only')
+  // no browser write policy: the public API surface is not widened
+  assert.doesNotMatch(src, /create policy[\s\S]*?for (insert|update|delete) to (anon|authenticated)/,
+    'writes stay service-role only')
+  assert.doesNotMatch(src, /to anon\b/, 'anon gains nothing')
+})

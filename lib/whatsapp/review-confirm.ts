@@ -21,6 +21,8 @@ import { decryptExtractedPayload } from '@/lib/encryption'
 import { resolveFileKeyConfig } from '@/lib/encryption/files'
 import type { LedgerCandidate, LedgerRow } from '@/lib/ocr/ledger'
 import { applyInvoiceReview, applyInvoiceCorrection, parseReviewCorrections } from '@/lib/invoices/review'
+import { enqueueRegisterGeneration } from '@/lib/invoices/batch'
+import { logger } from '@/lib/logger'
 import { summarizeReasons, reasonFixHints } from '@/lib/whatsapp/review-edit'
 import { monthLabel } from '@/lib/exports/naming'
 import type { ConfirmOutcome } from '@/lib/whatsapp/finalize'
@@ -51,7 +53,8 @@ interface StoredRow {
   _reviewReasons?: string[]
   // §Part-2 the encrypted classification sibling (document type + accounting
   // category). Absent on pre-Part-2 rows; shown to the reviewer read-only.
-  _classification?: { documentType?: string; accountingCategory?: string } | null
+  // §3.3 itcEligibility is absent on pre-ITC rows; readers default it to 'needs_review'.
+  _classification?: { documentType?: string; accountingCategory?: string; itcEligibility?: string } | null
 }
 
 /** The stored reason codes for a row, defensively read (never throws on shape). */
@@ -186,7 +189,7 @@ function pageSize(n: number): number { return Math.max(1, n) }
  * dedups the register enqueue, so it never creates a second batch or workbook.
  */
 export async function confirmInvoice(
-  db: Db, args: { workspaceId: string; invoiceId: string },
+  db: Db, args: { workspaceId: string; invoiceId: string; deferRegister?: boolean },
 ): Promise<ConfirmOutcome> {
   const { workspaceId, invoiceId } = args
   const { masterKeyHex } = resolveFileKeyConfig()
@@ -227,7 +230,9 @@ export async function confirmInvoice(
     if (typeof v === 'number' && Number.isFinite(v) && v >= 0) corrections[f] = v
   }
 
-  const result = await applyInvoiceReview(db, { workspaceId, invoiceId, corrections, masterKeyHex })
+  const result = await applyInvoiceReview(db, {
+    workspaceId, invoiceId, corrections, masterKeyHex, deferRegister: args.deferRegister,
+  })
   return {
     ok: true,
     review: result.review,
@@ -268,8 +273,14 @@ export async function approveAllPending(
   const items = await listPendingReview(db, workspaceId) // first (up to 10) confirmable
   let approved = 0; let stillPending = 0; let failed = 0
   const pendingReasons: string[] = []
+  // §bulk-approve: the batches a newly-approved row was filed into. The per-row
+  // register rebuild is DEFERRED (enqueue suppressed in confirmInvoice) and coalesced
+  // into ONE deduped job per batch AFTER the loop, so build_register can never read a
+  // half-approved batch and ship a partial workbook (the "September missing / only 2
+  // of 3 rows" symptom seen in the field). Approvals + batching are unchanged.
+  const touchedBatches = new Set<string>()
   for (const item of items.slice(0, Math.max(0, cap))) {
-    const r = await confirmInvoice(db, { workspaceId, invoiceId: item.invoiceId })
+    const r = await confirmInvoice(db, { workspaceId, invoiceId: item.invoiceId, deferRegister: true })
     if (!r.ok) { failed += 1; continue }
     // Collect WHY a row stayed flagged (deduped by base code) so the summary can
     // name the exact field to correct (§UX). Purely descriptive — it never changes
@@ -280,8 +291,21 @@ export async function approveAllPending(
         if (!pendingReasons.some((x) => x.split(':')[0] === base)) pendingReasons.push(reason)
       }
     }
-    if (r.review === 'approved') approved += 1
+    if (r.review === 'approved') { approved += 1; if (r.batchId) touchedBatches.add(r.batchId) }
     else stillPending += 1 // re-validated but still flagged — never force-approved
+  }
+  // Coalesced scheduling: exactly one (deduped) register job per affected batch, now
+  // that every approval has committed, so the single rebuild sees the full cumulative
+  // approved set. Best-effort — an enqueue error cannot undo an approval, and any
+  // later finalize for the batch re-schedules the register.
+  for (const batchId of touchedBatches) {
+    try {
+      await enqueueRegisterGeneration(db, workspaceId, batchId)
+    } catch (e) {
+      logger.warn('[Review] coalesced register enqueue deferred', {
+        batchId, error: e instanceof Error ? e.message : String(e),
+      })
+    }
   }
   return { approved, stillPending, failed, blockers: reasonFixHints(pendingReasons, 3) }
 }
@@ -295,7 +319,7 @@ export async function approveAllPending(
 // approve (confirmInvoice) files the invoice.
 
 export type InvoiceEditLoad =
-  | { ok: true; row: LedgerRow; reasons: string[]; classification: { documentType: string; accountingCategory: string } | null }
+  | { ok: true; row: LedgerRow; reasons: string[]; classification: { documentType: string; accountingCategory: string; itcEligibility: string } | null }
   | { ok: false; error: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT' }
 
 /**
@@ -326,7 +350,7 @@ export async function loadInvoiceForEdit(
     ) as StoredRow
     const cls = parsed._classification
     const classification = cls && typeof cls.documentType === 'string' && typeof cls.accountingCategory === 'string'
-      ? { documentType: cls.documentType, accountingCategory: cls.accountingCategory }
+      ? { documentType: cls.documentType, accountingCategory: cls.accountingCategory, itcEligibility: typeof cls.itcEligibility === 'string' ? cls.itcEligibility : 'needs_review' }
       : null
     return { ok: true, row: parsed as unknown as LedgerRow, reasons: storedReasons(parsed), classification }
   } catch {
@@ -344,7 +368,7 @@ export interface InvoiceEditOutcome {
   /** True when the corrected row now validates clean + dated: a later APPROVE files it. */
   approvable?: boolean
   /** §Part-2 the classification after this edit, for the read-only editor line. */
-  classification?: { documentType: string; accountingCategory: string } | null
+  classification?: { documentType: string; accountingCategory: string; itcEligibility: string } | null
   error?: 'NOT_FOUND' | 'NOT_PENDING' | 'FAULT'
 }
 
@@ -376,7 +400,7 @@ export async function applyInvoiceEdit(
     return {
       ok: true, review: res.review, reasons: res.reasons, row: res.row, approvable: res.approvable,
       classification: res.classification
-        ? { documentType: res.classification.documentType, accountingCategory: res.classification.accountingCategory }
+        ? { documentType: res.classification.documentType, accountingCategory: res.classification.accountingCategory, itcEligibility: res.classification.itcEligibility }
         : null,
     }
   } catch (e) {
