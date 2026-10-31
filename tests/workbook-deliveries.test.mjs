@@ -159,6 +159,35 @@ test('DELIVERY-10 the outbox is driven from the inbound webhook and reclaimed by
   assert.match(worker, /await recoverExpiredDeliveryLeases\(db\)/, 'each tick reclaims lapsed sending leases to unknown')
 })
 
+test('DELIVERY-11 backfill structurally CANNOT create a duplicate delivery row for one workbook+recipient', () => {
+  const s = execSql(sql())
+  const bi = s.indexOf('function public.backfill_missing_deliveries')
+  const fn = s.slice(bi, s.indexOf('$$;', s.indexOf('as $$', bi)))
+  assert.match(fn, /insert into public\.workbook_deliveries[\s\S]*select[\s\S]*from public\.generated_workbooks w/, 'insert..select from still-ready workbooks')
+  assert.match(fn, /and w\.status = 'ready'/, 'only a workbook that has NOT been delivered (still ready) is backfilled')
+  // The anti-duplicate core: the not-exists covers EVERY delivery status (no d.status
+  // predicate), so a pending/sending/sent/failed/unknown row all block a re-insert.
+  const ne = fn.slice(fn.indexOf('not exists'))
+  assert.ok(!/d\.status/.test(ne), 'not-exists is status-agnostic: an existing row of ANY state blocks a duplicate')
+  // The unique constraint is the ultimate guarantee; ON CONFLICT keeps a racing
+  // concurrent enqueue from rolling back the whole sweep (which would defer others).
+  assert.match(fn, /on conflict \(workspace_id, workbook_id, recipient_sender_hmac\) do nothing/, 'racing insert is a per-row skip, never a collateral deferral')
+  assert.match(fn, /'pending'/, 'a backfilled row is always pending (never pre-settled)')
+})
+
+test('DELIVERY-12 a lapsed worker can NEVER double-settle: recovery nulls the fence, settle requires it', () => {
+  const s = execSql(sql())
+  // recover_expired_delivery_leases both flips sending->unknown AND clears the token,
+  // so the abandoned worker's later mark/release/resolve (all fenced on claim_token +
+  // status='sending') no-ops instead of clobbering the reconciled state.
+  const rec = s.slice(s.indexOf('function public.recover_expired_delivery_leases'),
+    s.indexOf('$$;', s.indexOf('as $$', s.indexOf('function public.recover_expired_delivery_leases'))))
+  assert.match(rec, /status\s+= 'unknown'/, 'lapsed sending parks as unknown')
+  assert.match(rec, /claim_token\s+null/, 'recovery clears the ownership fence')
+  const mk = s.slice(s.indexOf('function public.mark_workbook_delivery_sent'))
+  assert.match(mk, /claim_token = p_claim_token[\s\S]*and status = 'sending'/, 'settle is fenced by token AND still-sending; a cleared/unknown row cannot be settled by anyone')
+})
+
 // ==========================================================================
 // 3) LIVE-DB integration (opt-in): DELIVERY_LIVE_DB=1 + migrations pushed.
 // ==========================================================================

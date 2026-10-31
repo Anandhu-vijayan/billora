@@ -281,7 +281,13 @@ begin
        select 1 from public.workbook_deliveries d
         where d.workbook_id = w.id
           and d.recipient_sender_hmac = p_recipient_sender_hmac
-     );
+     )
+  -- Concurrent enqueue/backfill for the SAME (workbook, recipient) can race past the
+  -- not-exists snapshot. ON CONFLICT DO NOTHING makes that a per-row skip instead of
+  -- rolling back the WHOLE sweep (which would otherwise DEFER every other owed file in
+  -- this statement to a later inbound). No duplicate is ever created: the unique
+  -- constraint is the guarantee, this only removes the collateral deferral.
+  on conflict (workspace_id, workbook_id, recipient_sender_hmac) do nothing;
   get diagnostics v_count = row_count;
   return v_count;
 end;
