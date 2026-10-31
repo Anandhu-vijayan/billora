@@ -898,48 +898,49 @@ test('G6a workbook object key is deterministic per batch under the path key (rea
   assert.throws(() => files.deriveWorkbookKey('x', 'not-a-key'), /STORAGE_PATH_KEY/)
 })
 
-test('G6b register builds from approved rows, ENCRYPTS the workbook at rest, versions, and delivers best-effort', () => {
+test('G6b register builds per-category workbooks, ENCRYPTS at rest, versions, and records a DURABLE delivery', () => {
   const s = registerSrc()
   assert.ok(s.includes("throw new PermanentJobError('REGISTER_MISSING_BATCH')"))
   assert.ok(s.includes(".eq('workspace_id', workspaceId).eq('id', batchId)"), 'batch verified to belong to workspace')
-  assert.ok(s.includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'deterministic export path')
+  // §separate-files-per-category: one deterministic, category-decorated object key per
+  // bucket, so re-running a category overwrites ITS slot and never another category's.
+  assert.ok(s.includes('deriveWorkbookKey(batchId, pathKeyHex, categoryFileToken(sheetName))'), 'deterministic per-category export path')
+  assert.ok(s.includes('accounting_category: p.category'), 'each workbook row records the accounting category it renders')
   // Workbook is encrypted with the same envelope scheme as originals, then the
   // container uploads as octet-stream (never a plaintext spreadsheet at rest).
-  assert.ok(s.includes('encryptFile(workbook, masterKeyHex'), 'register encrypted at rest')
+  assert.ok(s.includes('encryptFile(buffer, masterKeyHex'), 'register encrypted at rest')
   assert.ok(s.includes("contentType: 'application/octet-stream', upsert: true"), 'encrypted container transport')
   assert.ok(s.includes('original_mime: SPREADSHEET_MIME'), 'logical type retained as metadata')
-  assert.ok(s.includes('file_encryption_key_version: enc.keyVersion'), 'key version tracked for decrypt + rotation')
+  assert.ok(s.includes('file_encryption_key_version: p.keyVersion'), 'key version tracked for decrypt + rotation')
   // No raw bucket/signed URL is ever handed out for an encrypted object.
   assert.ok(!s.includes('createSignedUrl'), 'encrypted workbook must not be served via a raw signed URL')
-  assert.ok(s.includes('status: \'expired\''), 'prior workbook retired (freshness)')
-  assert.match(s, /\[Register\] workbook generated/)
-  assert.match(s, /\[Register\] workbook stored/)
+  // Freshness + history preservation: a new monotonic version is written FIRST, then
+  // strictly-older versions retire to 'expired'. History is never deleted.
+  assert.ok(s.includes("status: 'ready', version: newVersion, generated_at: new Date().toISOString()"), 'published at a fresh monotonic version')
+  assert.ok(s.includes(".update({ status: 'expired' })") && s.includes(".lt('version', newVersion)"), 'prior versions retired AFTER the new rows persist (never the just-written rows)')
   assert.match(s, /\[Register\] workbook ready/)
-  assert.match(s, /need review and are not included/)
   assert.match(s, /await assertLease\(\)/)
-  assert.match(s, /version, generated_at: new Date\(\)/)
-  // Delivery records an in-chat document handoff on EVERY generation, not just
-  // when a public origin is configured; the authenticated link is an extra
-  // fallback included only when PUBLIC_APP_URL is set.
-  assert.ok(s.includes('/api/exports/${workbookId}/download'), 'authenticated link included as a fallback')
-  assert.ok(s.includes('PUBLIC_APP_URL'), 'link only built when a public origin is configured')
-  assert.ok(s.includes('[[deliver:${workbookId}]]'), 'records an in-chat document handoff token')
-  // §user "another file is missing": the single pending_reply_body slot must NOT
-  // clobber a different month's register that is still waiting to be handed off.
-  // The writer reads the outstanding tokens and MERGES them so every ready register
-  // flushes on the next inbound (this one last).
-  assert.ok(s.includes("select('pending_reply_body')"), 'reads the outstanding handoff before writing')
-  assert.ok(s.includes('priorIds'), 'collects any prior deliver tokens')
-  assert.ok(s.includes('[[deliver:${id}]]'), 're-emits each prior workbook as a token')
-  assert.ok(s.includes('updateSessionDeliveryState(db, senderHmac'), 'delivery via next inbound reply')
-  assert.ok(!/public URL unset; workbook ready, delivery deferred/.test(s), 'must NOT skip delivery when PUBLIC_APP_URL is unset')
+  // Delivery is DECOUPLED from generation via the durable outbox: the handler records
+  // one independent, retryable delivery row per published workbook and touches NOTHING
+  // on the racy single-slot session handoff. Generation success never depends on send.
+  assert.ok(s.includes('await enqueueRegisterDeliveries('), 'records a durable delivery per published workbook')
+  assert.ok(s.includes('enqueueWorkbookDelivery(db,'), 'delivery goes through the outbox primitive')
+  assert.ok(s.includes('SEND_DEFERRED'), 'a failed enqueue is deferred, NEVER fails the job')
+  // The removed race: none of these may return to the generation handler.
+  assert.ok(!s.includes('[[deliver:'), 'no in-chat handoff token written by generation')
+  assert.ok(!/pending_reply_body\s*:/.test(s), 'generation never WRITES the single-slot reply body (only the fix comment may name it)')
+  assert.ok(!s.includes("select('pending_reply_body')"), 'no lost-update read-modify-write of the reply slot')
+  assert.ok(!s.includes('updateSessionDeliveryState'), 'no session delivery-state RMW in the register path')
+  assert.ok(!s.includes('PUBLIC_APP_URL'), 'generation never builds a public download link')
+  assert.ok(!/api\/exports\/\$\{/.test(s), 'generation never CONSTRUCTS a web download link (the fix comment may name the route)')
+  assert.ok(!/async function scheduleDelivery/.test(s), 'the old scheduleDelivery (proactive+token fallback) is gone')
+  assert.ok(!s.includes('deliverWorkbookToWhatsApp'), 'generation performs no send itself (consumer owns the send)')
   // Batch readiness gate lives HERE: never build a premature workbook.
   assert.ok(s.includes("eq('job_type', 'invoice_extraction').in('status', ['queued', 'processing'])"))
   assert.ok(s.includes('REGISTER_NOT_READY'), 'requeues while siblings are in flight')
-  // Delivery is orthogonal to generation: it is caught and NEVER fails the job.
-  const sched = s.slice(s.indexOf('async function scheduleDelivery'))
-  assert.match(sched, /catch \(e\)/)
-  assert.ok(s.includes('SEND_DEFERRED'))
+  // §concurrency: the approved source set is re-checked before publish so a reviewer's
+  // mid-build change never ships as current.
+  assert.ok(s.includes('REGISTER_SOURCE_CHANGED'), 'refuses to publish when the approved set moved during build')
   // A batch with nothing approved is a no-op completion, not a failure.
   assert.match(s, /rows\.length === 0[\s\S]*return/)
 })
@@ -1821,7 +1822,7 @@ test('M7 multiple months / clients resolve to separate batches and one workbook 
   const bs = batchSrc()
   assert.ok(bs.includes('p_client: invoice.client_id'), 'batch scoped to the invoice client (orgs never mix clients)')
   assert.ok(bs.includes('const { start, end } = monthBounds(iso)'), 'period derived ONLY from the parsed date')
-  assert.ok(registerSrc().includes('deriveWorkbookKey(batchId, pathKeyHex)'), 'one deterministic workbook per batch, never merged')
+  assert.ok(registerSrc().includes('deriveWorkbookKey(batchId, pathKeyHex, categoryFileToken(sheetName))'), 'one deterministic workbook per (batch, category), never merged across months or categories')
   assert.ok(registerSrc().includes("in('invoice_id', invoiceIds)"), 'outstanding extraction also checked via invoice membership')
 })
 
@@ -1841,7 +1842,7 @@ test('M8 no approved rows yields a review/no-export result, never a false succes
   assert.match(msg, /2 invoice\(s\) need review/)
   assert.ok(!/register is ready|Download/i.test(msg), 'no false ready/link claim')
   const s = registerSrc()
-  assert.ok(s.indexOf('rows.length === 0') < s.indexOf('await scheduleDelivery('), 'no-op return precedes any delivery scheduling')
+  assert.ok(s.indexOf('rows.length === 0') < s.indexOf('await enqueueRegisterDeliveries('), 'no-op return precedes any delivery scheduling')
 })
 
 test('M8b a no-op rebuild retires the stale workbook instead of leaving a mis-dated register downloadable', () => {
@@ -2364,8 +2365,8 @@ test('P15 engine + handler wiring: ranking-based selection, conflict provenance,
 
   const reg = registerSrc()
   assert.ok(reg.includes("eq('review_status', 'approved')"), 'the workbook exports ONLY approved rows')
-  assert.ok(reg.includes('need review and are not included'), 'held-for-review invoices are reported, not silently dropped')
-  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildRegisterWorkbook'),
+  assert.ok(reg.includes('batch has invoices awaiting review'), 'held-for-review invoices are reported, not silently dropped')
+  assert.ok(reg.indexOf('rows.length === 0') < reg.indexOf('await buildCategoryWorkbook'),
     'an all-review batch is a no-op that never reaches workbook generation/delivery')
   // §multi-rate: the register is the THREE-sheet workbook; mixed-rate import
   // expansion is gated on a reconciled breakdown, never on raw slices alone.
@@ -2468,18 +2469,18 @@ test('T6 the integrity gate reopens a good workbook and fails CLOSED on truncate
   }
 })
 
-test('T7 the register validates the workbook AFTER build and BEFORE encrypt/upload', () => {
+test('T7 the register validates each category workbook AFTER build and BEFORE encrypt/upload', () => {
   const reg = registerSrc()
-  assert.ok(reg.includes('validateRegisterWorkbook(workbook'), 'the three-sheet integrity gate is wired into the handler')
-  const gen = reg.indexOf('await buildRegisterWorkbook')
-  const validate = reg.indexOf('await validateRegisterWorkbook(workbook')
-  const encrypt = reg.indexOf('encryptFile(workbook')
+  assert.ok(reg.includes('validateCategoryWorkbook(buffer'), 'the per-category integrity gate is wired into the handler')
+  const gen = reg.indexOf('await buildCategoryWorkbook')
+  const validate = reg.indexOf('await validateCategoryWorkbook(buffer')
+  const encrypt = reg.indexOf('encryptFile(buffer')
   assert.ok(gen > -1 && gen < validate && validate < encrypt,
     'generate -> validate -> encrypt: a malformed buffer can never be stored or delivered')
-  // The delivered register carries ALL THREE sheets: one row per invoice stays
-  // the primary contract even when the Purchase Import expands per rate slice.
-  assert.ok(reg.includes('invoiceCount: invoices.length'), 'Purchase Register row count is asserted per INVOICE, not per import line')
-  assert.ok(reg.includes('taxBreakdownRowCount: expectedTaxBreakdownRowCount(invoices)'), 'Tax Breakdown row count is validated')
+  // Each category file carries ITS OWN bucket counts: one row per invoice in that
+  // category stays the primary contract even when the Purchase Import expands per rate slice.
+  assert.ok(reg.includes('invoiceCount: bucket.length'), 'register row count is asserted per INVOICE in the bucket, not per import line')
+  assert.ok(reg.includes('taxBreakdownRowCount: expectedTaxBreakdownRowCount(bucket)'), 'Tax Breakdown row count is validated')
   assert.ok(reg.includes('importRowCount'), 'Purchase Import line count is validated')
 })
 
@@ -3254,15 +3255,15 @@ test('P1-5 collectFinalizeState builds the per-month breakdown from each batch p
   assert.equal(m2.fileName, 'Billora_2026-09.xlsx'); assert.equal(m2.invoiceCount, 1)
 })
 
-test('P1-5 both serve paths name the download by the batch period (source contract)', () => {
+test('P1-5 both serve paths name the download by batch period AND accounting category (source contract)', () => {
   const dl = downloadRouteSrc()
-  assert.ok(/workbookFileName\(periodStart\)/.test(dl) && /batch_id/.test(dl),
-    'the download route resolves the batch period and names the file per month')
+  assert.ok(/workbookFileName\(periodStart, categoryTokenFromKey\(/.test(dl) && /batch_id/.test(dl),
+    'the download route resolves the batch period and names the file per month + category')
   assert.ok(/'Content-Disposition': `attachment; filename="\$\{filename\}"`/.test(dl),
     'the served filename is the computed per-month name, not a hard-coded const')
   assert.ok(!/filename="billora-register\.xlsx"/.test(dl), 'the old fixed filename is gone from the web download')
   const dv = readFileSync(new URL('../lib/exports/deliver.ts', import.meta.url), 'utf8')
-  assert.ok(/workbookFileName\(periodStart\)/.test(dv), 'the in-chat document uses the same per-month naming')
+  assert.ok(/workbookFileName\(periodStart, categoryFileToken\(registerSheetNameForCategory\(/.test(dv), 'the in-chat document uses the same per-month + per-category naming')
   assert.ok(!/const FILENAME = 'billora-register\.xlsx'/.test(dv), 'the fixed in-chat filename const is removed')
 })
 
@@ -3371,14 +3372,16 @@ test('P1-6 route: consent is stored only when the flag AND separate key are set'
   assert.ok(/result\.note === 'proactive-enable' \|\| result\.note === 'proactive-disable'/.test(src), 'both opt turns are handled')
 })
 
-test('P1-6 register build: attempts an in-window proactive push, else falls back to next-inbound', () => {
+test('P1-6 register build: records a DURABLE outbox delivery (proactive push + reply-slot RMW removed)', () => {
   const src = registerSrc()
-  assert.ok(/canProactivelyPush\(\{ consent: identity\.consent, lastActivityMs: identity\.lastActivityMs \}\)/.test(src), 'the full gate is consulted before any spontaneous push')
-  assert.ok(/openWaId\(identity\.sealed\)/.test(src), 'the wa_id is opened only after the gate passes')
-  assert.ok(/deliverWorkbookToWhatsApp\(db, \{/.test(src), 'the push reuses the same document-delivery primitive (ready->sent, idempotent)')
-  assert.ok(/pending_reply_body: null/.test(src), 'a confirmed push clears the pending handoff')
-  // The next-inbound queue stays intact as the fallback (never lost).
-  assert.ok(/delivery queued for next inbound reply|pending_reply_body: body/.test(src), 'the next-inbound handoff fallback is preserved')
+  // Generation now decouples from delivery: it records one durable, retryable
+  // outbox row per published workbook and performs NO send itself.
+  assert.ok(/await enqueueRegisterDeliveries\(/.test(src), 'durable delivery recorded after publish')
+  assert.ok(/enqueueWorkbookDelivery\(db, \{ workspaceId, workbookId, recipientSenderHmac: senderHmac \}\)/.test(src), 'one independent outbox row per workbook, recipient stored only as HMAC')
+  assert.ok(!/canProactivelyPush\(\{ consent: identity\.consent/.test(src), 'the register handler no longer does an in-window proactive push itself')
+  assert.ok(!/openWaId\(/.test(src), 'the register handler never opens a sealed wa_id (send lives in the consumer)')
+  assert.ok(!/deliverWorkbookToWhatsApp\(/.test(src), 'generation performs no send; the delivery consumer owns it')
+  assert.ok(!/pending_reply_body\s*:/.test(src) && !/select\(['"]pending_reply_body/.test(src), 'the racy reply body is never written or read in the register path (only named in the fix comment)')
 })
 
 test('P1-6 menu: a proactive row is offered without exceeding the WhatsApp 10-row cap', () => {

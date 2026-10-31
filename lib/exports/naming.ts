@@ -31,10 +31,11 @@ export function monthToken(periodStart: string | null | undefined): string | nul
   return `${m[1]}-${String(month).padStart(2, '0')}`
 }
 
-/** The human-facing filename for one month's register. */
-export function workbookFileName(periodStart: string | null | undefined): string {
+/** The human-facing filename for one month's register. §separate-files-per-category: a non-purchase category register gets its category decorated into the name; the purchase file keeps the exact historical `Billora_YYYY-MM.xlsx` name. */
+export function workbookFileName(periodStart: string | null | undefined, categoryToken?: string | null): string {
   const tok = monthToken(periodStart)
-  return tok ? `Billora_${tok}.xlsx` : GENERIC_REGISTER_FILENAME
+  if (!tok) return GENERIC_REGISTER_FILENAME
+  return categoryToken ? `Billora_${tok}_${categoryToken}.xlsx` : `Billora_${tok}.xlsx`
 }
 
 /** A short label ("Oct 2026") for the bulk summary, or null when undated. */
@@ -43,4 +44,38 @@ export function monthLabel(periodStart: string | null | undefined): string | nul
   if (!tok) return null
   const month = Number(tok.slice(5, 7))
   return `${SHORT_MONTHS[month - 1]} ${tok.slice(0, 4)}`
+}
+
+/**
+ * §separate-files-per-category: a filename-safe token for an accounting category
+ * derived from its register sheet label (the SAME label the generator writes), so
+ * the download name, the object key and the sheet name can never disagree.
+ * 'Purchase Register' -> null (the purchase file keeps the historical name),
+ * 'Expense Register' -> 'expense', 'Fixed Asset Register' -> 'fixed-asset',
+ * 'Capital Purchase Register' -> 'capital-purchase'.
+ */
+export function categoryFileToken(registerSheetName: string): string | null {
+  if (registerSheetName === 'Purchase Register') return null
+  const words = registerSheetName.replace(/\s+Register$/, '').trim()
+  if (!words) return null
+  return words.toLowerCase().replace(/\s+/g, '-')
+}
+
+/**
+ * §separate-files-per-category: the filename token for an accounting-category KEY
+ * (the normalized value stored on generated_workbooks.accounting_category). Mirrors
+ * categoryFileToken(sheetName) but without needing the generator, so the display
+ * layer can name each per-category file. purchase/null -> null (bare month name).
+ */
+export function categoryTokenFromKey(categoryKey: string | null | undefined): string | null {
+  if (!categoryKey || categoryKey === 'purchase') return null
+  return categoryKey.replace(/_/g, '-')
+}
+
+/** A month label decorated with its category for the chat ("Oct 2026 (Expense)"). */
+export function monthLabelFor(periodStart: string | null | undefined, categoryToken?: string | null): string | null {
+  const base = monthLabel(periodStart)
+  if (!base || !categoryToken) return base
+  const pretty = categoryToken.split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+  return `${base} (${pretty})`
 }

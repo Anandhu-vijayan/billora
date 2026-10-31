@@ -22,6 +22,7 @@ function graphBase(): string {
 async function postMessage(
   payload: Record<string, unknown>,
   correlation: { workbookId?: string } = {},
+  messageIdOut?: { current: string | null },
 ): Promise<SendOutcome> {
   const token = process.env.WHATSAPP_ACCESS_TOKEN || ''
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || ''
@@ -67,6 +68,10 @@ async function postMessage(
     logger.info('[WhatsApp] Meta send response', responseFields)
 
     if (res.ok && messageId) {
+      // Hand the provider message id back to an opted-in caller so the delivery
+      // outbox can record exactly which Meta message settled a claim. Never logged
+      // in full here (only the suffix is).
+      if (messageIdOut) messageIdOut.current = messageId
       return 'ok'
     }
     const errorCode = body?.error?.code
@@ -103,6 +108,7 @@ export function sendDocument(
   to: string,
   args: { mediaId: string; filename: string; caption?: string },
   correlation?: { workbookId?: string },
+  messageIdOut?: { current: string | null },
 ): Promise<SendOutcome> {
   // Send by media id: Meta derives the type from the stored upload. Declaring a
   // mime_type that differs from the type Meta normalized on upload makes it
@@ -110,7 +116,7 @@ export function sendDocument(
   // it here. The upload (uploadWhatsAppMedia) still carries the real type.
   const document: Record<string, unknown> = { id: args.mediaId, filename: args.filename }
   if (args.caption) document.caption = args.caption.slice(0, 1024)
-  return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation)
+  return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation, messageIdOut)
 }
 
 export function sendAccountTypeButtons(to: string): Promise<SendOutcome> {

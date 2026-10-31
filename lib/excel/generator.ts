@@ -213,7 +213,7 @@ export const TAX_BREAKDOWN_SHEET_NAME = 'Tax Breakdown';
 // delivery + integrity contract keys on); every other category rides its own
 // clearly-labelled sheet. Ordering is deterministic so a rebuild is byte-stable
 // and an accountant always finds purchases first.
-const REGISTER_CATEGORY_ORDER = ['purchase', 'expense', 'service', 'fixed_asset', 'capital_purchase', 'sales', 'other', 'unknown'] as const;
+export const REGISTER_CATEGORY_ORDER = ['purchase', 'expense', 'service', 'fixed_asset', 'capital_purchase', 'sales', 'other', 'unknown'] as const;
 const REGISTER_CATEGORY_SHEET: Record<string, string> = {
   purchase: PURCHASE_REGISTER_SHEET_NAME,
   expense: 'Expense Register',
@@ -224,13 +224,24 @@ const REGISTER_CATEGORY_SHEET: Record<string, string> = {
   other: 'Other Register',
   unknown: 'Uncategorised Register',
 };
-/** A missing/unknown category is the historical default: the primary purchase sheet. */
-function normalizeRegisterCategory(value: string | null | undefined): string {
+/** A missing/unknown category is the historical default: the primary purchase sheet. Exported so the worker buckets invoices into per-category files with the EXACT same normalization the renderer uses. */
+export function normalizeRegisterCategory(value: string | null | undefined): string {
   return value && REGISTER_CATEGORY_SHEET[value] ? value : 'purchase';
 }
 /** True for any per-category register sheet (all end in " Register"), false for Tax Breakdown / Purchase Import. */
 function isRegisterSheetName(name: string): boolean {
   return /\sRegister$/.test(name);
+}
+
+/**
+ * §separate-files-per-category: the register sheet name a category owns, so the
+ * handler can (a) name the per-category file and (b) validate that exact sheet.
+ * A missing/unknown/garbage category collapses to the primary Purchase Register,
+ * byte-for-byte matching the historical default. Exported so the worker + naming
+ * key on the SAME label the renderer writes — no second source of truth.
+ */
+export function registerSheetNameForCategory(category: string | null | undefined): string {
+  return REGISTER_CATEGORY_SHEET[normalizeRegisterCategory(category)] ?? PURCHASE_REGISTER_SHEET_NAME;
 }
 
 /**
@@ -473,6 +484,27 @@ export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): P
   }
 
   // ---- Sheet 2: Tax Breakdown (one row per invoice per slice) ----------------
+  renderTaxBreakdownSheet(workbook, invoices, coreFont);
+
+  // ---- Sheet 3: Purchase Import (existing 12-column contract) ----------------
+  const importRows = invoices.flatMap((inv) => inv.importRows);
+  writePurchaseImportSheet(workbook, importRows);
+
+  const buf = await workbook.xlsx.writeBuffer();
+  return Buffer.from(buf as unknown as ArrayBuffer);
+}
+
+/**
+ * Render the aggregate Tax Breakdown sheet (one row per invoice per slice) into
+ * an EXISTING workbook. Extracted so the multi-sheet register and the
+ * per-category single-sheet file share ONE breakdown renderer and can never
+ * drift. A genuinely unknown cell is left BLANK (never the literal "null").
+ */
+function renderTaxBreakdownSheet(
+  workbook: ExcelJS.Workbook,
+  invoices: readonly RegisterInvoiceInput[],
+  coreFont: { name: string },
+): ExcelJS.Worksheet {
   const bd = workbook.addWorksheet(TAX_BREAKDOWN_SHEET_NAME);
   bd.columns = BREAKDOWN_HEADERS.map((header, i) => ({ header, key: `b${i}`, width: i < 4 ? [12, 18, 30, 18][i] : 15 }));
   bd.getRow(1).eachCell((cell) => {
@@ -507,11 +539,31 @@ export async function buildRegisterWorkbook(invoices: RegisterInvoiceInput[]): P
   }
   bd.views = [{ showGridLines: true, state: 'frozen', ySplit: 1 }];
   bd.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: BREAKDOWN_HEADERS.length } };
+  return bd;
+}
 
-  // ---- Sheet 3: Purchase Import (existing 12-column contract) ----------------
-  const importRows = invoices.flatMap((inv) => inv.importRows);
-  writePurchaseImportSheet(workbook, importRows);
-
+/**
+ * §separate-files-per-category: build ONE register workbook for a SINGLE
+ * accounting category. It carries exactly three sheets — the category's register
+ * (named by `registerSheetNameForCategory`), the Tax Breakdown and the 12-column
+ * Purchase Import — each filtered to that category's invoices, so the sheets can
+ * never disagree and a purchase-only file is byte-identical to the historical
+ * single-sheet register. Amounts/mappings are never re-derived here (fully
+ * resolved values in), and no summary row is ever added.
+ */
+export async function buildCategoryWorkbook(
+  category: string | null | undefined,
+  invoices: readonly RegisterInvoiceInput[],
+): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const coreFont = { name: 'Segoe UI' };
+  // Column schema is derived from THIS category's invoices only, so a rate unique
+  // to another category never reserves an empty column here.
+  const rates = rateColumnSchema(invoices);
+  const nilColumn = hasUnratedTaxable(invoices);
+  renderRegisterSheet(workbook, registerSheetNameForCategory(category), invoices, rates, nilColumn, coreFont);
+  renderTaxBreakdownSheet(workbook, invoices, coreFont);
+  writePurchaseImportSheet(workbook, invoices.flatMap((inv) => inv.importRows));
   const buf = await workbook.xlsx.writeBuffer();
   return Buffer.from(buf as unknown as ArrayBuffer);
 }
@@ -569,6 +621,62 @@ export async function validateRegisterWorkbook(buf: Buffer, counts: RegisterWork
   }
   if (registerRows !== counts.invoiceCount) {
     throw new Error(`WORKBOOK_INVALID: register sheets expected ${counts.invoiceCount} invoice row(s) in total, found ${registerRows}`);
+  }
+  if (bd.rowCount !== counts.taxBreakdownRowCount + 1) {
+    throw new Error(`WORKBOOK_INVALID: Tax Breakdown expected ${counts.taxBreakdownRowCount} slice row(s), found ${bd.rowCount - 1}`);
+  }
+  if (imp.columnCount !== TALLY_HEADERS.length) {
+    throw new Error(`WORKBOOK_INVALID: Purchase Import expected ${TALLY_HEADERS.length} columns, found ${imp.columnCount}`);
+  }
+  const impHeader = imp.getRow(1);
+  for (let i = 0; i < TALLY_HEADERS.length; i += 1) {
+    const got = String(impHeader.getCell(i + 1).text ?? '').trim();
+    if (got !== TALLY_HEADERS[i]) {
+      throw new Error(`WORKBOOK_INVALID: Purchase Import column ${i + 1} header is "${got}" not "${TALLY_HEADERS[i]}"`);
+    }
+  }
+  if (imp.rowCount !== counts.importRowCount + 1) {
+    throw new Error(`WORKBOOK_INVALID: Purchase Import expected ${counts.importRowCount} row(s), found ${imp.rowCount - 1}`);
+  }
+}
+
+/** Counts a per-category register workbook must hold to be intact. */
+export interface CategoryWorkbookCounts extends RegisterWorkbookCounts {
+  /** The exact register sheet name this file must carry (matches the category). */
+  registerSheetName: string;
+}
+
+/**
+ * Reopen a per-category register and fail CLOSED unless it carries the category's
+ * register sheet, the intact Tax Breakdown + 12-column Purchase Import, and the
+ * precise row counts (no phantom summary, no dropped invoice/slice). A purchase
+ * file uses the same sheet name/contract as the historical register, so the
+ * delivery + integrity guarantees hold per file with no special-casing. Never logs
+ * any row value — only the structural failure reason.
+ */
+export async function validateCategoryWorkbook(buf: Buffer, counts: CategoryWorkbookCounts): Promise<void> {
+  if (!Buffer.isBuffer(buf) || buf.length < 22 || buf.subarray(0, 2).toString('latin1') !== 'PK') {
+    throw new Error('WORKBOOK_INVALID: missing ZIP/OOXML signature');
+  }
+  const check = new ExcelJS.Workbook();
+  try {
+    await check.xlsx.load(buf as unknown as Parameters<typeof check.xlsx.load>[0]);
+  } catch {
+    throw new Error('WORKBOOK_INVALID: buffer is not a parseable workbook');
+  }
+  const reg = check.getWorksheet(counts.registerSheetName);
+  const bd = check.getWorksheet(TAX_BREAKDOWN_SHEET_NAME);
+  const imp = check.getWorksheet(TALLY_SHEET_NAME);
+  if (!reg) throw new Error(`WORKBOOK_INVALID: "${counts.registerSheetName}" worksheet is missing`);
+  if (!bd) throw new Error('WORKBOOK_INVALID: "Tax Breakdown" worksheet is missing');
+  if (!imp) throw new Error('WORKBOOK_INVALID: "Purchase Import" worksheet is missing');
+  if (String(reg.getRow(1).getCell(1).text).trim() !== 'Invoice Date') {
+    throw new Error(`WORKBOOK_INVALID: "${counts.registerSheetName}" header row did not render`);
+  }
+  // Exactly this category's invoices on its single register sheet — no bucketing
+  // loss, no cross-category duplication (each category is its own file now).
+  if (reg.rowCount - 1 !== counts.invoiceCount) {
+    throw new Error(`WORKBOOK_INVALID: "${counts.registerSheetName}" expected ${counts.invoiceCount} invoice row(s), found ${reg.rowCount - 1}`);
   }
   if (bd.rowCount !== counts.taxBreakdownRowCount + 1) {
     throw new Error(`WORKBOOK_INVALID: Tax Breakdown expected ${counts.taxBreakdownRowCount} slice row(s), found ${bd.rowCount - 1}`);

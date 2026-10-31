@@ -16,7 +16,7 @@ import { getSupabaseAdmin, bucketFor } from '@/lib/supabase/server'
 import { getAuthenticatedUserId } from '@/lib/supabase/server-session'
 import { decryptFile, resolveFileKeyConfig } from '@/lib/encryption/files'
 import { decideDownloadAccess } from '@/lib/exports/access'
-import { workbookFileName } from '@/lib/exports/naming'
+import { workbookFileName, categoryTokenFromKey } from '@/lib/exports/naming'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -31,6 +31,7 @@ interface WorkbookRow {
   expires_at: string | null
   file_object_path: string
   file_encryption_key_version: string | null
+  accounting_category: string | null
 }
 
 function deny(status: number, code: string): NextResponse {
@@ -52,7 +53,7 @@ export async function GET(
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category')
     .eq('id', id)
     .maybeSingle()
   if (readErr) {
@@ -111,7 +112,10 @@ export async function GET(
         .eq('workspace_id', workbook.workspace_id).eq('id', workbook.batch_id).maybeSingle()
       periodStart = (batchRow as { period_start?: string | null } | null)?.period_start ?? null
     }
-    const filename = workbookFileName(periodStart)
+    // §separate-files-per-category: each accounting category is its own file, so
+    // the download name carries the category token (purchase keeps the bare month
+    // name) — two categories of one month can never collide under one filename.
+    const filename = workbookFileName(periodStart, categoryTokenFromKey(workbook.accounting_category))
 
     return new Response(new Uint8Array(plain), {
       headers: {

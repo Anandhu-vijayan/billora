@@ -24,8 +24,11 @@ import type { JobContext } from '@/lib/jobs/worker'
 import { resolveFileKeyConfig, deriveWorkbookKey, encryptFile } from '@/lib/encryption/files'
 import { decryptExtractedPayload } from '@/lib/encryption'
 import {
-  buildRegisterWorkbook,
-  validateRegisterWorkbook,
+  buildCategoryWorkbook,
+  validateCategoryWorkbook,
+  registerSheetNameForCategory,
+  normalizeRegisterCategory,
+  REGISTER_CATEGORY_ORDER,
   expectedTaxBreakdownRowCount,
   type RegisterInvoiceInput,
   type RegisterSliceCell,
@@ -33,14 +36,13 @@ import {
 } from '@/lib/excel/generator'
 import { resolveLedgerName, resolveSliceLedgerName, tallyDefaultLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
 import { deriveSlicesFromInvoiceHeads, isMixedRate, normalizeSlices, validateTaxSlices, type InvoiceTaxSlice } from '@/lib/ocr/tax-slices'
-import { updateSessionDeliveryState } from '@/lib/whatsapp/sessions'
-// Opt-in proactive delivery (§P1-6): when the owner consented AND the feature flag +
-// separate key are set AND the send is inside Meta's 24h window, push the workbook
-// straight away; otherwise fall through to the next-inbound handoff. The wa_id is
-// opened in memory only and never logged.
-import { canProactivelyPush } from '@/lib/whatsapp/proactive'
-import { loadProactiveIdentity, openWaId } from '@/lib/whatsapp/proactive-store'
-import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver'
+// §delivery-decoupling: build-register now records a DURABLE outbox row per
+// workbook and never touches whatsapp_sessions.pending_reply_body (the old single
+// slot whose lost-update race dropped a concurrent month's register). The actual
+// send lives in the delivery consumer (lib/jobs/handlers/deliver-register.ts), so
+// a register's generation is fully independent of its delivery outcome.
+import { categoryFileToken } from '@/lib/exports/naming'
+import { enqueueWorkbookDelivery } from '@/lib/whatsapp/delivery-outbox'
 import type { LedgerRow } from '@/lib/ocr/ledger'
 
 type Db = SupabaseClient
@@ -421,55 +423,75 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
       importRows,
     })
   }
-  const importRowCount = invoices.reduce((n, inv) => n + inv.importRows.length, 0)
+  // §separate-files-per-category: a monthly register is emitted as ONE FILE PER
+  // accounting category. Bucket the fully-resolved invoices by the SAME category
+  // normalization the renderer uses (a batch is already one (client, calendar
+  // month), so each bucket is that month's CUMULATIVE set for the category), in a
+  // deterministic order. The queue's one-live-register-job-per-batch invariant is
+  // the scope lock, so two generations of the same month never overlap.
+  const byCategory = new Map<string, RegisterInvoiceInput[]>()
+  for (const inv of invoices) {
+    const cat = normalizeRegisterCategory(inv.accountingCategory)
+    const bucket = byCategory.get(cat)
+    if (bucket) bucket.push(inv); else byCategory.set(cat, [inv])
+  }
+  const presentCategories = REGISTER_CATEGORY_ORDER.filter((c) => byCategory.has(c))
+  const bucketedCount = presentCategories.reduce((n, c) => n + (byCategory.get(c)?.length ?? 0), 0)
+  if (bucketedCount !== invoices.length) {
+    // Fail CLOSED before touching storage: a normalization drift that let any
+    // invoice fall outside the buckets must never silently drop it from a register.
+    throw new Error(`REGISTER_BUCKET_ERROR: ${invoices.length - bucketedCount} invoice(s) fell outside the category buckets`)
+  }
+  const exportsBucket = bucketFor('exports')
   logger.info('[Register] ledger mapping resolved', {
     batchId, jobId: job.id, mapped, mappingRequired, unresolvedRate,
-  })
-  const workbook = await buildRegisterWorkbook(invoices)
-  // Integrity gate BEFORE anything is persisted: reopen the buffer and prove it
-  // is a genuine, openable .xlsx with all three sheets, the exact 12 Tally
-  // headers on Purchase Import, EXACTLY one Purchase Register row per invoice,
-  // one Tax Breakdown row per slice (>=1 per invoice) and precisely the resolved
-  // number of import rows (a stray summary row would import as a phantom voucher
-  // and is rejected here). A truncated/partial write or an ExcelJS regression
-  // throws (the job requeues) instead of encrypting, storing, and later
-  // "delivering" a register the accountant cannot import. No row data is logged.
-  await validateRegisterWorkbook(workbook, {
-    invoiceCount: invoices.length,
-    taxBreakdownRowCount: expectedTaxBreakdownRowCount(invoices),
-    importRowCount,
-  })
-  logger.info('[Register] workbook generated', { batchId, jobId: job.id, rowCount: rows.length, sizeBytes: workbook.length })
-  // §6 content-integrity seal over the PLAINTEXT workbook bytes (independent of the
-  // at-rest ciphertext). Computed once here; persisted fail-soft with the row below.
-  const workbookChecksumHex = createHash('sha256').update(workbook).digest('hex')
-  const exportPath = deriveWorkbookKey(batchId, pathKeyHex)
-  const exportsBucket = bucketFor('exports')
-  // Encrypt the register AT REST: vendor names, GSTINs and amounts are customer
-  // data. The envelope container uploads as application/octet-stream; the
-  // logical spreadsheetml type + extension are retained as object metadata so
-  // the download route can name the file it streams after decrypting in memory.
-  const enc = encryptFile(workbook, masterKeyHex, { context: exportPath })
-  await assertLease()
-  const { error: upErr } = await db.storage.from(exportsBucket)
-    .upload(exportPath, enc.container, {
-      contentType: 'application/octet-stream', upsert: true,
-      metadata: { original_mime: SPREADSHEET_MIME, original_extension: 'xlsx' },
-    })
-  if (upErr) throw new Error(`WORKBOOK_UPLOAD_ERROR: ${upErr.message}`)
-  logger.info('[Register] workbook stored', {
-    batchId, jobId: job.id, sizeBytes: enc.sizeBytes, rowCount: rows.length,
+    categories: presentCategories.length,
   })
 
-  // §6 CONCURRENCY / DELIVERY ISOLATION: re-read the approved source fingerprint
-  // immediately before publishing and refuse to publish if it moved while we were
-  // building (a reviewer approved, rejected, corrected, or re-dated a row mid-build,
-  // so this workbook no longer reflects current truth). Uses ONLY base-schema
-  // columns, so it is active regardless of the additive metadata migration. A
-  // mismatch is a NORMAL throw (the coalesced requeue rebuilds against the CURRENT
-  // set) — nothing is published and no stale register is ever served. A re-check
-  // that itself cannot run degrades SOFT (log + proceed): it must never block a
-  // build that already cleared every integrity gate.
+  // PHASE 1 — build + validate + encrypt + upload EVERY category file before any
+  // row changes. All the fallible work happens here, so a failure leaves the
+  // current live register fully intact (a failed generation never discards or
+  // retires the last valid workbook). No row data is ever logged.
+  type PendingPublish = {
+    category: string; sheetName: string; rowCount: number;
+    exportPath: string; sizeBytes: number; keyVersion: string; checksumHex: string;
+  }
+  const pending: PendingPublish[] = []
+  for (const category of presentCategories) {
+    const bucket = byCategory.get(category) ?? []
+    const sheetName = registerSheetNameForCategory(category)
+    const catImportCount = bucket.reduce((n, inv) => n + inv.importRows.length, 0)
+    const buffer = await buildCategoryWorkbook(category, bucket)
+    await assertLease()
+    await validateCategoryWorkbook(buffer, {
+      registerSheetName: sheetName,
+      invoiceCount: bucket.length,
+      taxBreakdownRowCount: expectedTaxBreakdownRowCount(bucket),
+      importRowCount: catImportCount,
+    })
+    const checksumHex = createHash('sha256').update(buffer).digest('hex')
+    const exportPath = deriveWorkbookKey(batchId, pathKeyHex, categoryFileToken(sheetName))
+    const enc = encryptFile(buffer, masterKeyHex, { context: exportPath })
+    await assertLease()
+    const { error: upErr } = await db.storage.from(exportsBucket)
+      .upload(exportPath, enc.container, {
+        contentType: 'application/octet-stream', upsert: true,
+        metadata: { original_mime: SPREADSHEET_MIME, original_extension: 'xlsx' },
+      })
+    if (upErr) throw new Error(`WORKBOOK_UPLOAD_ERROR: ${upErr.message}`)
+    pending.push({ category, sheetName, rowCount: bucket.length, exportPath, sizeBytes: enc.sizeBytes, keyVersion: enc.keyVersion, checksumHex })
+  }
+  logger.info('[Register] category workbooks built & stored', {
+    batchId, jobId: job.id, files: pending.length, rowCount: rows.length,
+  })
+
+  // PHASE 2 — concurrency re-check: refuse to publish if the approved source set
+  // moved while we were building (a reviewer approved/rejected/corrected/re-dated a
+  // row mid-build). Uses base-schema columns only, so it is active regardless of the
+  // additive metadata migration. A mismatch is a NORMAL throw (the coalesced requeue
+  // rebuilds against the CURRENT set) — nothing is published, no stale register is
+  // served. A re-check that cannot run degrades SOFT (log + proceed): it never
+  // blocks a build that already cleared every integrity gate.
   await assertLease()
   {
     const { data: curRecs, error: curErr } = await db
@@ -489,153 +511,106 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     }
   }
 
-  // Freshness: retire prior workbooks for this batch, then insert the new one
-  // with a monotonic version. The insert is what makes it the current register.
+  // PHASE 3 — publish. Every workbook is proven good, so this is the only moment
+  // the live register changes. Insert one ready row per category at a fresh
+  // monotonic version FIRST, THEN retire the batch's prior versions — so there is
+  // never an instant with no live register, history is never deleted (retire =
+  // status 'expired'), and the highest version always wins for every reader.
+  await assertLease()
+  const { data: prior } = await db.from('generated_workbooks').select('version')
+    .eq('workspace_id', workspaceId).eq('batch_id', batchId).order('version', { ascending: false }).limit(1)
+  const newVersion = (((prior ?? [])[0]?.version as number | undefined) ?? 0) + 1
+  const expiresAt = new Date(Date.now() + WORKBOOK_LINK_TTL_SECONDS * 1000).toISOString()
+
+  const published: Array<{ workbookId: string; category: string; rowCount: number }> = []
+  for (const p of pending) {
+    await assertLease()
+    const { data: inserted, error: gwErr } = await db.from('generated_workbooks').insert({
+      workspace_id: workspaceId, batch_id: batchId, file_object_path: p.exportPath,
+      accounting_category: p.category,
+      file_encryption_key_version: p.keyVersion, size_bytes: p.sizeBytes,
+      status: 'ready', version: newVersion, generated_at: new Date().toISOString(), expires_at: expiresAt,
+    }).select('id').single()
+    if (gwErr || !inserted) throw new Error(`WORKBOOK_ROW_ERROR: ${gwErr?.message ?? 'no id'}`)
+    const workbookId = (inserted as { id: string }).id
+    published.push({ workbookId, category: p.category, rowCount: p.rowCount })
+    logger.info('[Register] workbook ready', { workbookId, batchId, jobId: job.id, category: p.category, rowCount: p.rowCount })
+    // §6 provenance metadata: a SEPARATE best-effort write so a register ALWAYS
+    // publishes even before the additive metadata migration is applied (then it
+    // fails SOFT, logged). The revision equals the re-check value proven above.
+    try {
+      const { error: metaErr } = await db.from('generated_workbooks').update({
+        source_dataset_revision: sourceRevision,
+        source_row_count: p.rowCount,
+        source_membership_hash: `\\x${membershipHashHex}`,
+        workbook_checksum: `\\x${p.checksumHex}`,
+      }).eq('workspace_id', workspaceId).eq('id', workbookId)
+      if (metaErr) {
+        logger.warn('[Register] workbook metadata columns skipped (migration not applied?); provenance inactive', {
+          workbookId, jobId: job.id, code: metaErr.code ?? 'unknown',
+        })
+      }
+    } catch {
+      // provenance is descriptive; it must never fail a completed register.
+    }
+  }
+
+  // NOW supersede the prior versions (never the rows just written).
   await assertLease()
   await db.from('generated_workbooks')
     .update({ status: 'expired' })
-    .eq('workspace_id', workspaceId).eq('batch_id', batchId).in('status', ['ready', 'sent'])
+    .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+    .lt('version', newVersion).in('status', ['ready', 'sent'])
   await markRetiredAt(db, workspaceId, batchId)
-  const { data: prior } = await db.from('generated_workbooks').select('version')
-    .eq('workspace_id', workspaceId).eq('batch_id', batchId).order('version', { ascending: false }).limit(1)
-  const version = ((prior ?? [])[0]?.version as number | undefined ?? 0) + 1
 
-  const expiresAt = new Date(Date.now() + WORKBOOK_LINK_TTL_SECONDS * 1000).toISOString()
-  await assertLease()
-  const { data: inserted, error: gwErr } = await db.from('generated_workbooks').insert({
-    workspace_id: workspaceId, batch_id: batchId, file_object_path: exportPath,
-    file_encryption_key_version: enc.keyVersion, size_bytes: enc.sizeBytes,
-    status: 'ready', version, generated_at: new Date().toISOString(), expires_at: expiresAt,
-  }).select('id').single()
-  if (gwErr || !inserted) throw new Error(`WORKBOOK_ROW_ERROR: ${gwErr?.message ?? 'no id'}`)
-  const workbookId = (inserted as { id: string }).id
-  logger.info('[Register] workbook ready', { workbookId, batchId, jobId: job.id, rowCount: rows.length })
-
-  // §6 provenance metadata: a SEPARATE best-effort write so the register ALWAYS
-  // publishes even before the additive metadata migration is applied — that update
-  // then fails SOFT (logged), leaving the fully-working base row untouched. The
-  // revision here equals the re-check value, so a published row always records the
-  // exact source set it was proven against.
-  try {
-    const { error: metaErr } = await db.from('generated_workbooks').update({
-      source_dataset_revision: sourceRevision,
-      source_row_count: rows.length,
-      source_membership_hash: `\\x${membershipHashHex}`,
-      workbook_checksum: `\\x${workbookChecksumHex}`,
-    }).eq('workspace_id', workspaceId).eq('id', workbookId)
-    if (metaErr) {
-      logger.warn('[Register] workbook metadata columns skipped (migration not applied?); provenance inactive', {
-        workbookId, jobId: job.id, code: metaErr.code ?? 'unknown',
-      })
-    }
-  } catch {
-    // provenance is descriptive; it must never fail a completed, delivered register.
-  }
-
-  // Delivery is best-effort and NEVER fails the generation job (rule 5).
-  await scheduleDelivery(db, workspaceId, workbookId, job.id, rows.length, flagged ?? 0, mappingRequired + unresolvedRate, expiresAt, assertLease)
+  // PHASE 4 — durable delivery. Record ONE independent outbox row per published
+  // workbook; the delivery consumer owns the send. Generation success NEVER
+  // depends on send success and the racy single-slot pending_reply_body RMW is gone.
+  await enqueueRegisterDeliveries(db, workspaceId, batchId, published, job.id, assertLease)
 }
 
 /**
- * Best-effort delivery: hand the register to the owner's NEXT inbound reply.
- * The workbook is encrypted at rest and the web download route needs a signed-in
- * session a WhatsApp-only user does not have, so the reliable channel is to send
- * the decrypted .xlsx back into the owner's chat as a document (see
- * lib/exports/deliver.ts). A spontaneous push is impossible off-webhook — the
- * raw phone number is never stored, only its HMAC — so we record a handoff that
- * the sender's next inbound flush turns into the attached file. The leading
- * [[deliver:<uuid>]] token carries the workbook id for the flush and is stripped
- * before any text fallback, so it is never shown. When a public origin IS
- * configured we also include the authenticated download link as a fallback, but
- * delivery is recorded regardless of it. Storing the handoff is send-only
- * bookkeeping — a failure here cannot fail the generation job (rule 5), and the
- * workbook row persists for a later retry.
+ * §durable delivery: record one independent, retryable outbox row per published
+ * workbook so the owner is owed each file, then let the delivery consumer
+ * (lib/jobs/handlers/deliver-register.ts) own the send. This is the fix for the
+ * lost-notification race: the old code wrote every handoff into the SINGLE
+ * `whatsapp_sessions.pending_reply_body` slot via an unguarded read-modify-write,
+ * so two concurrent per-batch builds clobbered each other's token and one month's
+ * file silently vanished. One durable row per (workbook, recipient) can never
+ * overwrite another's. Enqueue is best-effort and NEVER fails generation (a
+ * failure leaves the workbook 'ready' and the legacy backfill / Done-Review
+ * ready-sweep still delivers it), and the recipient is stored only as its HMAC —
+ * never logged as a phone number.
  */
-async function scheduleDelivery(
+async function enqueueRegisterDeliveries(
   db: Db,
   workspaceId: string,
-  workbookId: string,
+  batchId: string,
+  published: ReadonlyArray<{ workbookId: string; category: string; rowCount: number }>,
   jobId: string,
-  rowCount: number,
-  needsReview: number,
-  unmappedCount: number,
-  expiresAt: string,
   assertLease: () => Promise<void>,
 ): Promise<void> {
   try {
     const senderHmac = await findOwnerSenderHmac(db, workspaceId)
     if (!senderHmac) {
-      logger.info('[Register] no linked WhatsApp sender; workbook ready for later delivery', { workbookId, jobId })
+      logger.info('[Register] no linked WhatsApp sender; workbooks ready for later delivery', {
+        batchId, jobId, count: published.length,
+      })
       return
     }
-    const reviewNote = needsReview > 0
-      ? ` ${needsReview} invoice(s) need review and are not included. Reply Review or choose Menu > Review.`
-      : ''
-    // Honest import-readiness: a workbook is only "import-ready" once every line
-    // has a configured ledger. Report the outstanding count truthfully (§8) rather
-    // than claiming a clean import when lines are still unmapped.
-    const mappingNote = unmappedCount > 0
-      ? ` ${unmappedCount} line(s) still need a ledger mapping before they import into Tally.`
-      : ''
-    // §P1-6 OPT-IN PROACTIVE PUSH. Attempted only when the owner explicitly consented,
-    // the operator switched the feature on AND configured the separate sealing key,
-    // and the send is inside Meta's 24-hour service window. deliverWorkbookToWhatsApp
-    // is idempotent (ready→sent), so this is safe even if the lease lapses mid-send.
-    // Any non-delivery (ineligible, decrypt failure, transient send) falls through to
-    // the reliable next-inbound handoff below — the register is NEVER lost, and the
-    // owner's number is never logged on any path.
-    try {
-      const identity = await loadProactiveIdentity(db, senderHmac)
-      const waId = identity && canProactivelyPush({ consent: identity.consent, lastActivityMs: identity.lastActivityMs })
-        ? openWaId(identity.sealed)
-        : null
-      if (waId) {
-        const push = await deliverWorkbookToWhatsApp(db, {
-          workbookId, to: waId,
-          caption: `Your invoice register is ready — ${rowCount} invoice(s).${reviewNote}${mappingNote}`,
+    for (const { workbookId, category, rowCount } of published) {
+      await assertLease()
+      const queued = await enqueueWorkbookDelivery(db, { workspaceId, workbookId, recipientSenderHmac: senderHmac })
+      logger.info(queued
+        ? '[Register] durable delivery queued'
+        : '[Register] delivery enqueue deferred (outbox unavailable?)', {
+          workbookId, batchId, jobId, category, rowCount,
         })
-        if (push.delivered) {
-          await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: null, last_reply_error_code: null })
-          logger.info('[Register] proactive delivery pushed', { workbookId, jobId, rowCount })
-          return
-        }
-        logger.info('[Register] proactive push not delivered; using next-inbound handoff', {
-          workbookId, jobId, outcome: push.outcome,
-        })
-      }
-    } catch (e) {
-      logger.warn('[Register] proactive push unavailable; using next-inbound handoff', {
-        jobId, workbookId, error: e instanceof Error ? e.message : String(e),
-      })
     }
-    const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '')
-    // Document delivery needs no public origin, so we never defer just because
-    // the web link can't be built; the link is an EXTRA fallback when configured.
-    const linkNote = base
-      ? ` Secure download (sign in required): ${base}/api/exports/${workbookId}/download (valid until ${expiresAt}).`
-      : ''
-    // whatsapp_sessions has ONE pending_reply_body slot. If a register for a
-    // DIFFERENT month finished since the owner's last inbound and its handoff is
-    // still waiting there, blindly overwriting it would silently drop that Excel
-    // file (§user: "another file is missing"). Merge the outstanding deliver
-    // tokens so every ready register flushes on the next inbound, this one last.
-    const { data: slot } = await db.from('whatsapp_sessions').select('pending_reply_body')
-      .eq('sender_hmac', senderHmac).maybeSingle()
-    const existing = (slot?.pending_reply_body as string | null | undefined) ?? ''
-    const priorIds = [...existing.matchAll(/\[\[deliver:([0-9a-f-]{36})\]\]/gi)]
-      .map((m) => m[1]).filter((id) => id !== workbookId)
-    const priorTokens = priorIds.map((id) => `[[deliver:${id}]]\n`).join('')
-    const multi = priorIds.length > 0
-    const body = `${priorTokens}[[deliver:${workbookId}]]\nYour invoice register${multi ? 's are' : ' is'} ready — ${rowCount} invoice(s). I'll send the Excel ${multi ? 'files' : 'file'} here in this chat.${linkNote}${reviewNote}${mappingNote}`
-    await assertLease()
-    const queued = await updateSessionDeliveryState(db, senderHmac, { pending_reply_body: body, last_reply_error_code: null })
-    logger.info(queued
-      ? '[Register] delivery queued for next inbound reply'
-      : '[Register] delivery deferred: delivery state could not be saved', { workbookId, jobId, rowCount })
   } catch (e) {
     // Delivery is orthogonal to generation; swallow so the job still completes.
-    logger.warn('[Register] SEND_DEFERRED: delivery scheduling failed', {
-      jobId, workbookId, error: e instanceof Error ? e.message : String(e),
+    logger.warn('[Register] SEND_DEFERRED: delivery enqueue failed', {
+      jobId, batchId, error: e instanceof Error ? e.message : String(e),
     })
   }
 }

@@ -19,7 +19,8 @@ import { bucketFor } from '@/lib/supabase/server'
 import { decryptFile, resolveFileKeyConfig } from '@/lib/encryption/files'
 import { uploadWhatsAppMedia, isPermanentMediaFailure } from '@/lib/whatsapp/media'
 import { sendDocument, type SendOutcome } from '@/lib/whatsapp/send'
-import { workbookFileName } from '@/lib/exports/naming'
+import { workbookFileName, categoryFileToken } from '@/lib/exports/naming'
+import { registerSheetNameForCategory } from '@/lib/excel/generator'
 import { logger } from '@/lib/logger'
 
 type Db = SupabaseClient
@@ -34,6 +35,7 @@ interface WorkbookRow {
   expires_at: string | null
   file_object_path: string
   file_encryption_key_version: string | null
+  accounting_category: string | null
 }
 
 export interface DeliverResult {
@@ -41,6 +43,8 @@ export interface DeliverResult {
   delivered: boolean
   /** 'skipped' = not eligible (missing/expired/not-ready) — not a failure. */
   outcome: SendOutcome | 'skipped'
+  /** Meta's message id when THIS call confirmed a send, for outbox audit. */
+  providerMessageId?: string | null
 }
 
 /**
@@ -51,14 +55,14 @@ export interface DeliverResult {
  */
 export async function deliverWorkbookToWhatsApp(
   db: Db,
-  args: { workbookId: string; to: string; caption?: string },
+  args: { workbookId: string; to: string; caption?: string; expectedWorkspaceId?: string },
 ): Promise<DeliverResult> {
   const { workbookId, to } = args
   if (!UUID_RE.test(workbookId)) return { delivered: false, outcome: 'skipped' }
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category')
     .eq('id', workbookId)
     .maybeSingle()
   if (readErr || !row) {
@@ -66,6 +70,14 @@ export async function deliverWorkbookToWhatsApp(
     return { delivered: false, outcome: 'skipped' }
   }
   const wb = row as WorkbookRow
+  // §delivery isolation: when the caller knows which workspace the recipient is
+  // owed (the delivery outbox records it per row), refuse to serve a workbook that
+  // belongs to a DIFFERENT tenant — a claim must never resolve to another
+  // workspace's file even given a forged/guessed workbook id.
+  if (args.expectedWorkspaceId && wb.workspace_id !== args.expectedWorkspaceId) {
+    logger.warn('[Deliver] workspace mismatch; refusing cross-tenant send', { code: 'DELIVER_TENANT_MISMATCH', workbookId })
+    return { delivered: false, outcome: 'skipped' }
+  }
   const expired = !!wb.expires_at && new Date(wb.expires_at).getTime() <= Date.now()
   if (expired || !wb.file_object_path) return { delivered: false, outcome: 'skipped' }
   // Already pushed to this owner once — do not re-send; report as delivered.
@@ -99,7 +111,7 @@ export async function deliverWorkbookToWhatsApp(
         .eq('workspace_id', wb.workspace_id).eq('id', wb.batch_id).maybeSingle()
       periodStart = (batchRow as { period_start?: string | null } | null)?.period_start ?? null
     }
-    const filename = workbookFileName(periodStart)
+    const filename = workbookFileName(periodStart, categoryFileToken(registerSheetNameForCategory(wb.accounting_category)))
 
     let mediaId: string
     try {
@@ -113,6 +125,9 @@ export async function deliverWorkbookToWhatsApp(
       return { delivered: false, outcome: 'transient' }
     }
 
+    // Capture Meta's message id so the outbox records exactly which send settled
+    // the claim (audit + reconciliation); it is never logged in full.
+    const messageIdOut: { current: string | null } = { current: null }
     const outcome = await sendDocument(
       to,
       {
@@ -121,14 +136,15 @@ export async function deliverWorkbookToWhatsApp(
         caption: args.caption ?? 'Your Billora invoice register. Each invoice is filed under its own invoice month.',
       },
       { workbookId },
+      messageIdOut,
     )
-    if (outcome !== 'ok') return { delivered: false, outcome }
+    if (outcome !== 'ok') return { delivered: false, outcome, providerMessageId: messageIdOut.current }
 
     // Confirmed delivered: retire the pending row so we never re-send it. A lost
     // race (already flipped) is fine — the file is in the chat either way.
     await db.from('generated_workbooks').update({ status: 'sent' }).eq('id', workbookId).eq('status', 'ready')
     logger.info('[Deliver] register delivered as document', { workbookId })
-    return { delivered: true, outcome: 'ok' }
+    return { delivered: true, outcome: 'ok', providerMessageId: messageIdOut.current }
   } catch {
     logger.error('[Deliver] delivery failed', { code: 'DELIVER_FAILED' })
     return { delivered: false, outcome: 'transient' }

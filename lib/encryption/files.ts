@@ -238,11 +238,18 @@ export function deriveObjectKey(
  * batch id under the same dedicated path key. Re-running a batch regenerates
  * the same `.xlsx` slot (upsert) instead of accumulating duplicates, while an
  * unrelated batch can never collide.
+ *
+ * §separate-files-per-category: an optional category token widens the HMAC seed
+ * so a batch's multiple per-category registers occupy DISTINCT object slots and
+ * never overwrite one another. With no token the seed is the historical
+ * `exports:<batch>` string, so the purchase register (and every pre-split object)
+ * keeps its EXACT prior key — full backward compatibility.
  */
-export function deriveWorkbookKey(batchId: string, pathKeyHex: string): string {
+export function deriveWorkbookKey(batchId: string, pathKeyHex: string, categoryToken?: string | null): string {
   requireKey(pathKeyHex, 'STORAGE_PATH_KEY')
   if (!batchId) throw new EncryptionConfigError('deriveWorkbookKey: empty batch id')
-  const h = createHmac('sha256', pathKeyHex).update(`exports:${batchId}`).digest('hex')
+  const seed = categoryToken ? `exports:${batchId}:${categoryToken}` : `exports:${batchId}`
+  const h = createHmac('sha256', pathKeyHex).update(seed).digest('hex')
   return `whatsapp/exports/${h}.xlsx`
 }
 

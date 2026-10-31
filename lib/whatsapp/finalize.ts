@@ -12,7 +12,7 @@
 // module is deliberately dependency-light (only an erased SupabaseClient type)
 // so the pure message composer is unit-testable in-process.
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { monthLabel, workbookFileName } from '../exports/naming'
+import { monthLabel, workbookFileName, categoryTokenFromKey } from '../exports/naming'
 import { wakeWorker } from '../jobs/wake'
 
 type Db = SupabaseClient
@@ -337,13 +337,13 @@ export async function collectFinalizeState(db: Db, workspaceId: string, scope?: 
     }
   }
   const readyQuery = db
-    .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at')
+    .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at,accounting_category')
     .eq('workspace_id', workspaceId).eq('status', 'ready').not('file_object_path', 'is', null)
     .order('created_at', { ascending: false })
   const { data: readyRows, error: readyErr } = await (scopedBatchIds ? readyQuery.in('batch_id', scopedBatchIds) : readyQuery)
   if (readyErr) throw new Error(`FINALIZE_READY_ERROR: ${readyErr.message}`)
   const now = Date.now()
-  const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null }>)
+  const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null; accounting_category: string | null }>)
     .filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now)
 
   // Per-month breakdown (§P1-5): resolve each ready batch's own accounting period
@@ -369,10 +369,14 @@ export async function collectFinalizeState(db: Db, workspaceId: string, scope?: 
   }
   const readyMonths: ReadyMonth[] = usable.map((r) => {
     const period = r.batch_id ? periodByBatch.get(r.batch_id) ?? null : null
+    // §separate-files-per-category: name each file with its category so a batch's
+    // multiple per-category registers never collapse onto one duplicate-looking
+    // `Billora_YYYY-MM.xlsx` in the Done/Review breakdown. Purchase keeps the bare
+    // month name (the historical primary), matching the delivered object name.
     return {
       workbookId: r.id,
       monthLabel: monthLabel(period),
-      fileName: workbookFileName(period),
+      fileName: workbookFileName(period, categoryTokenFromKey(r.accounting_category)),
       invoiceCount: r.batch_id ? countByBatch.get(r.batch_id) ?? 0 : 0,
       periodStart: period,
     }

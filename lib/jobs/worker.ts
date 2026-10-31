@@ -20,6 +20,7 @@ import {
   JOB_LEASE_SECONDS, backoffSeconds, claimJobs, completeJob, failJob,
   isPermanentJobFailure, recoverStaleJobs, renewLease, type ClaimedJob,
 } from '@/lib/jobs/queue'
+import { recoverExpiredDeliveryLeases } from '@/lib/whatsapp/delivery-outbox'
 
 type Db = SupabaseClient
 
@@ -271,6 +272,19 @@ export async function runWorkerTick(
     }
   } catch (e: unknown) {
     logger.error('[Worker] recovery pass failed', {
+      error: e instanceof Error ? e.message : String(e),
+    })
+  }
+
+  // §delivery recovery: a 'sending' delivery whose lease lapsed (the worker died
+  // mid-send, so it is uncertain whether Meta accepted it) moves to 'unknown' —
+  // NEVER blindly resent. Opportunistic per tick; returns 0 (no-op) until the
+  // outbox migration is applied, so this is inert on an un-migrated deployment.
+  try {
+    const swept = await recoverExpiredDeliveryLeases(db)
+    if (swept > 0) logger.info('[Worker] expired delivery leases recovered to unknown', { swept })
+  } catch (e: unknown) {
+    logger.error('[Worker] delivery lease recovery failed', {
       error: e instanceof Error ? e.message : String(e),
     })
   }

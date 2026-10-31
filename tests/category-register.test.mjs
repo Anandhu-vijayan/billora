@@ -189,7 +189,7 @@ test('2b-validate-throws: a phantom extra register row is rejected (integrity ga
 // Source-contract: the handler reads the classified category off the encrypted
 // sibling and feeds it to the generator — WITHOUT touching delivery/naming.
 // ==========================================================================
-test('2b-wire: build-register passes _classification.accountingCategory into the register row (default purchase)', () => {
+test('2b-wire: build-register passes _classification.accountingCategory and emits ONE FILE PER category', () => {
   const src = registerSrc()
   assert.match(src, /_classification\?:\s*\{ accountingCategory\?:\s*unknown(?:;\s*itcEligibility\?:\s*unknown)? \}/, 'the decrypted payload type carries the classification sibling')
   assert.match(
@@ -197,10 +197,18 @@ test('2b-wire: build-register passes _classification.accountingCategory into the
     /accountingCategory:\s*typeof row\._classification\?\.accountingCategory === 'string'\s*\?\s*row\._classification\.accountingCategory\s*:\s*null/,
     'a string category rides through; anything else is null (generator defaults it to purchase)',
   )
-  // the split must remain a DISPLAY-only concern of ONE workbook: exactly one build call,
-  // and the register row count is still asserted per INVOICE across all sheets.
-  assert.equal((src.match(/await buildRegisterWorkbook\(/g) ?? []).length, 1, 'still a SINGLE workbook build (no parallel per-category pipeline)')
-  assert.match(src, /invoiceCount:\s*invoices\.length/, 'the summed register-row integrity check is keyed on total invoices, not per sheet')
+  // §separate-files-per-category: the handler now buckets the resolved invoices by
+  // the SAME normalization the renderer uses, walks a deterministic order, and
+  // builds exactly ONE workbook per present category — the old single-workbook
+  // display split is intentionally gone.
+  assert.match(src, /normalizeRegisterCategory\(inv\.accountingCategory\)/, 'invoices are bucketed by the normalized accounting category')
+  assert.match(src, /REGISTER_CATEGORY_ORDER\.filter\(/, 'categories are emitted in a deterministic order')
+  assert.match(src, /REGISTER_BUCKET_ERROR/, 'a normalization drift that drops an invoice fails CLOSED before storage')
+  assert.equal((src.match(/await buildCategoryWorkbook\(/g) ?? []).length, 1, 'exactly one per-category build call site (looped over buckets)')
+  assert.equal((src.match(/await buildRegisterWorkbook\(/g) ?? []).length, 0, 'the old single-workbook build is gone from the handler')
+  // each category file is validated with ITS OWN bucket row count and sheet name
+  assert.match(src, /invoiceCount:\s*bucket\.length/, 'the register-row integrity check is keyed on the bucket, per file')
+  assert.match(src, /registerSheetName:\s*sheetName/, 'the validator asserts the category-specific register sheet')
 })
 
 // ==========================================================================

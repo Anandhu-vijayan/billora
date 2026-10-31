@@ -36,6 +36,7 @@ import { proactiveDeliveryEnabled, proactiveKeyConfigured } from '@/lib/whatsapp
 import { setProactiveConsent } from '@/lib/whatsapp/proactive-store';
 import { suggestOwnGstin } from '@/lib/invoices/own-gstin-suggest';
 import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
+import { flushPendingDeliveries } from '@/lib/jobs/handlers/deliver-register';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -847,6 +848,11 @@ async function processMessage(
   // now (send only — no business operation re-runs), before normal processing.
   if (message.from) {
     try { await resendPendingReply(db, senderHmac(message.from), message.from); } catch { /* best effort */ }
+    // Durable outbox flush: send every workbook this owner is currently owed via
+    // the atomic-claim state machine (replaces the racy single-slot handoff). Send
+    // only — never re-runs intake/onboarding. Best-effort; a failure leaves the
+    // rows pending for the next inbound or the worker recovery sweep.
+    try { await flushPendingDeliveries(db, senderHmac(message.from), message.from); } catch { /* best effort */ }
   }
   let onboardingWorkspaceId: string | null = null;
   let onboardingClientId: string | null = null;
