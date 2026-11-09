@@ -15,6 +15,7 @@ import { importTs } from '../scripts/_ts-import.mjs'
 
 const finalize = await importTs('lib/whatsapp/finalize.ts')
 const routeSrc = () => readFileSync(new URL('../app/api/whatsapp/route.ts', import.meta.url), 'utf8')
+const consumerSrc = () => readFileSync(new URL('../lib/jobs/handlers/deliver-register.ts', import.meta.url), 'utf8')
 const sqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261027000000_delivery_scope_indexes.sql', import.meta.url), 'utf8')
 
@@ -48,7 +49,7 @@ const FILED = [ // completed invoices per batch (for the per-month counts)
  * would, so scope filters genuinely narrow rows (unlike the permissive fake in
  * onboarding.test.mjs, which returns whatever the resolver wants per call).
  */
-function filteringDb({ failBatchRead = false } = {}) {
+function filteringDb({ failBatchRead = false, extraWorkbooks = [], extraBatches = [] } = {}) {
   const matches = (row, filters) => filters.every((f) => {
     if (f.eq) return row[f.eq[0]] === f.eq[1]
     if (f.is) return row[f.is[0]] === f.is[1]
@@ -60,8 +61,8 @@ function filteringDb({ failBatchRead = false } = {}) {
     return true
   })
   const tableRows = (table) => {
-    if (table === 'invoice_batches') return BATCHES
-    if (table === 'generated_workbooks') return WORKBOOKS
+    if (table === 'invoice_batches') return [...BATCHES, ...extraBatches]
+    if (table === 'generated_workbooks') return [...WORKBOOKS, ...extraWorkbooks]
     if (table === 'invoices') return [
       ...FILED.map((r) => ({ ...r, workspace_id: 'ws', status: 'completed' })),
       ...BATCHES.map((b) => ({ batch_id: b.id, workspace_id: 'ws', status: 'received' })), // every batch holds >=1 invoice, incl. b-orphan (no workbook yet)
@@ -203,7 +204,13 @@ test('D9 route.ts source contract: no arbitrary [0], scope passed, delivery logg
   assert.match(r, /collectFinalizeState\(db, workspaceId, scope\)/, 'both finalize reads are client-scoped')
   assert.match(r, /const scope = \{ clientId: clientId \?\? null \}/, 'individuals scope to client-less batches')
   assert.match(r, /pickPrimaryWorkbook\(counts\.readyMonths \?\? \[\]\)/, 'the link is the deterministic latest-period pick')
-  assert.match(r, /register delivery attempt[\s\S]*workbookId: id/, 'each delivery logs its exact workbook id (correlation)')
+  // §one-delivery-path: the route hands EVERY register send to the durable outbox
+  // consumer, which is where a send is actually logged. Correlation (the exact
+  // workbook id per attempt) therefore lives with the consumer, not in the route.
+  assert.match(r, /flushPendingDeliveries\(db, hmac, to\)/, 'the route delivers only through the single outbox consumer')
+  const c = consumerSrc()
+  assert.match(c, /outbox delivery sent[\s\S]*?workbookId: d\.workbook_id/, 'each delivery logs its exact workbook id (correlation)')
+  assert.match(c, /outbox send transient[\s\S]*?workbookId: d\.workbook_id/, 'a failed send is logged against the same workbook id')
 })
 
 test('D10 delivery-scope migration is forward-only, additive, service-role safe', () => {
@@ -214,4 +221,33 @@ test('D10 delivery-scope migration is forward-only, additive, service-role safe'
   assert.ok(!/drop\s/i.test(executable), 'never destructive')
   assert.ok(!/\bgrant\b/i.test(executable), 'grants nothing new — indexes only')
   assert.ok(!/alter table/i.test(executable), 'no column changes required for the scope fix')
+})
+
+// ---- §register-scope: the delivered name/label comes from the workbook's OWN
+// validated period, NOT whatever month the batch happens to carry. A legacy row
+// with no stamped period still falls back to the batch, byte-for-byte unchanged. ----
+test('D11 a workbook names its OWN validated period even when the batch says otherwise', async () => {
+  // b-mislabel-c1 claims October, but the register file was validated for July.
+  const db = filteringDb({
+    extraBatches: [{ id: 'b-mislabel-c1', workspace_id: 'ws', client_id: 'C1', period_start: '2026-10-01' }],
+    extraWorkbooks: [{ id: 'w-stamped', workspace_id: 'ws', batch_id: 'b-mislabel-c1', status: 'ready', file_object_path: 'p9', expires_at: FUTURE, period_start: '2026-07-15' }],
+  })
+  const c = await finalize.collectFinalizeState(db, 'ws')
+  const july = c.readyMonths.find((m) => m.workbookId === 'w-stamped')
+  assert.ok(july, 'the stamped workbook is listed')
+  assert.equal(july.periodStart, '2026-07-15', 'period read from the workbook, not the October batch')
+  assert.equal(july.monthLabel, 'Jul 2026', 'label derived from the validated scope')
+  assert.equal(july.fileName, 'Billora_2026-07.xlsx', 'delivered name matches the register contents, never the batch label')
+})
+
+test('D12 a legacy workbook with no stamped period still falls back to the batch period', async () => {
+  // w-legacy has no period_start column value; batch b-oct-c1 is October.
+  const db = filteringDb({
+    extraWorkbooks: [{ id: 'w-legacy', workspace_id: 'ws', batch_id: 'b-oct-c1', status: 'ready', file_object_path: 'pl', expires_at: FUTURE }],
+  })
+  const c = await finalize.collectFinalizeState(db, 'ws')
+  const legacy = c.readyMonths.find((m) => m.workbookId === 'w-legacy')
+  assert.ok(legacy)
+  assert.equal(legacy.periodStart, '2026-10-01', 'unchanged pre-migration behaviour: batch period used')
+  assert.equal(legacy.fileName, 'Billora_2026-10.xlsx')
 })

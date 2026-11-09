@@ -58,10 +58,17 @@ const withinTolerance = (a: bigint, b: bigint, tol: bigint): boolean => {
  *   * if the printed CGST+SGST tie to the SUM of the halves, the halves are
  *     genuine and the overall is their sum (UNCHANGED behaviour);
  *   * only when the sum does NOT tie but the SINGLE printed value DOES do we
- *     treat that value as the combined total.
+ *     treat that value as the combined total;
+ *   * when NEITHER reading corroborates the amounts that were printed, there is
+ *     no single overall rate at all — return null. An invoice-level rate field
+ *     that cannot explain the invoice's own tax amounts is not evidence of a
+ *     slab: it is a MULTI-rate bill flattened onto one head, or a zero-filled /
+ *     misread rate. Asserting it would print a fabricated `{rate}%` column and
+ *     name a `Purchase @ <rate>%` ledger (the Devamatha-shaped failure was a
+ *     doubled slab; this one was a 0% slab on a bill charging 25% of tax).
  * This NEVER invents a rate from amounts alone: with no full rate evidence it
- * returns null, and it never overrides the documented halves-sum when that sum
- * already reconciles. It simply disambiguates which field a printed rate belongs
+ * returns null, and it never overrides the halves-sum when that sum already
+ * reconciles. It simply disambiguates which field a printed rate belongs
  * in, using amounts the total-reconciliation has already validated.
  */
 export function resolveOverallLocalRatePercent(args: {
@@ -92,7 +99,11 @@ export function resolveOverallLocalRatePercent(args: {
   if (sumExpected !== null && withinTolerance(actual, sumExpected, tol)) return sumRate
   const combinedExpected = expectedTaxMinorUnits(taxable, c) // printed value read as the combined total
   if (combinedExpected !== null && withinTolerance(actual, combinedExpected, tol)) return Number(c.toFixed(2))
-  return sumRate                                     // neither interpretation ties -> documented behaviour; validators flag it
+  // Both readings contradict the amounts that were actually charged: no single
+  // overall rate is evidenced. Null means UNRESOLVED (blank ledger class, no
+  // per-rate column) — never the unevidenced sum, which would assert a slab the
+  // document does not support. The rate/amount validators flag the disagreement.
+  return null
 }
 
 /** Compare printed tax rates with extracted amounts; never computes replacement values. */

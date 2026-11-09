@@ -128,6 +128,21 @@ const VISION_PROMPT = [
   'GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1',
   'alphanumeric, "Z", 1 alphanumeric. Read it character by character.',
   'If the page shows several invoices, read only the first/most prominent one.',
+  // §multi-rate: the register's per-rate columns and the Tally per-slab ledger
+  // lines can only be filled from an EVIDENCED rate-wise breakdown. The flat
+  // cgst/sgst/igst rate fields above are the invoice-level heads, so a bill that
+  // mixes slabs (say 18% on one line and 28% on another) cannot express itself
+  // through them — without tax_slices such a bill degrades to one unexplained
+  // slab. Ask for it explicitly, with the same never-guess rule as everything
+  // else on this page.
+  'RATE-WISE BREAKDOWN: if the document PRINTS a rate-wise / slab-wise tax summary',
+  '(a table or block grouping the taxable value and the tax amounts by GST rate,',
+  'e.g. "18% 7,500.00 675.00 675.00"), return tax_slices with ONE entry per',
+  'printed rate line: rate_percent and the amounts as plain numbers, treatment',
+  '"local" when that row prints CGST and SGST and "interstate" when it prints',
+  'IGST. Copy those rows exactly — never split a single-rate invoice, never',
+  'derive a slab from an item line, never compute an amount the document does',
+  'not print. Return an EMPTY array when there is no printed rate-wise summary.',
 ].join(' ')
 
 const confidenceSchema = {
@@ -150,6 +165,29 @@ const confidenceSchema = {
   propertyOrdering: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+  ],
+}
+
+// One line of a printed rate-wise tax summary. Every field is nullable and the
+// array itself is OPTIONAL (never in `required`): a single-rate invoice, an older
+// model or a bill with no slab table must still produce a valid response. The
+// numbers are copied evidence — parseVisionJson tolerates a malformed entry and
+// ledger.ts validates the whole array against the invoice heads before using it,
+// so a wrong answer here can only ever force review, never fabricate a slab.
+const taxSliceSchema = {
+  type: Type.OBJECT,
+  properties: {
+    rate_percent: { type: Type.NUMBER, nullable: true },
+    taxable_value: { type: Type.NUMBER, nullable: true },
+    cgst_amount: { type: Type.NUMBER, nullable: true },
+    sgst_amount: { type: Type.NUMBER, nullable: true },
+    igst_amount: { type: Type.NUMBER, nullable: true },
+    cess_amount: { type: Type.NUMBER, nullable: true },
+    treatment: { type: Type.STRING, nullable: true },
+  },
+  propertyOrdering: [
+    'rate_percent', 'taxable_value', 'cgst_amount', 'sgst_amount',
+    'igst_amount', 'cess_amount', 'treatment',
   ],
 }
 
@@ -176,6 +214,7 @@ const LEDGER_SCHEMA = {
     igst_rate_percent: { type: Type.STRING, nullable: true },
     total_amount_in_words: { type: Type.STRING, nullable: true },
     confidence: confidenceSchema,
+    tax_slices: { type: Type.ARRAY, nullable: true, items: taxSliceSchema },
   },
   required: [
     'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
@@ -187,6 +226,7 @@ const LEDGER_SCHEMA = {
     'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
     'cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off',
     'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
+    'tax_slices',
   ],
 }
 

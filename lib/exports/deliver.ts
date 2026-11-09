@@ -36,6 +36,8 @@ interface WorkbookRow {
   file_object_path: string
   file_encryption_key_version: string | null
   accounting_category: string | null
+  period_start?: string | null
+  version?: number | null
 }
 
 export interface DeliverResult {
@@ -45,6 +47,8 @@ export interface DeliverResult {
   outcome: SendOutcome | 'skipped'
   /** Meta's message id when THIS call confirmed a send, for outbox audit. */
   providerMessageId?: string | null
+  /** Bounded, PII-free reason when it did not land — persisted as last_error. */
+  providerDetail?: string | null
 }
 
 /**
@@ -62,7 +66,7 @@ export async function deliverWorkbookToWhatsApp(
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category,period_start,version')
     .eq('id', workbookId)
     .maybeSingle()
   if (readErr || !row) {
@@ -83,6 +87,26 @@ export async function deliverWorkbookToWhatsApp(
   // Already pushed to this owner once — do not re-send; report as delivered.
   if (wb.status === 'sent') return { delivered: true, outcome: 'ok' }
   if (wb.status !== 'ready') return { delivered: false, outcome: 'skipped' }
+  // §one-file-per-month: a workbook is only servable while it is still the LIVE
+  // register for its own (batch, category). Publish retires prior versions, but a
+  // rebuild that raced the retire (or two builds that read the same max version)
+  // can leave two 'ready' rows for one month — and the owner would then receive the
+  // same month twice, an older copy first. If a NEWER version exists for this exact
+  // scope, this row is superseded: skip it, never send a stale register.
+  if (wb.batch_id && wb.version != null) {
+    const scope = db.from('generated_workbooks').select('id')
+      .eq('workspace_id', wb.workspace_id).eq('batch_id', wb.batch_id)
+      .gt('version', wb.version).in('status', ['ready', 'sent', 'expired'])
+    // A legacy row may carry no category at all: match on IS NULL rather than
+    // eq(null), which PostgREST renders as a filter that can never match.
+    const { data: newer } = await (wb.accounting_category
+      ? scope.eq('accounting_category', wb.accounting_category)
+      : scope.is('accounting_category', null)).limit(1)
+    if ((newer ?? []).length > 0) {
+      logger.info('[Deliver] workbook superseded by a newer version; not sending a stale register', { workbookId })
+      return { delivered: false, outcome: 'skipped', providerDetail: 'superseded by a newer version' }
+    }
+  }
 
   try {
     const { masterKeyHex } = resolveFileKeyConfig()
@@ -103,7 +127,10 @@ export async function deliverWorkbookToWhatsApp(
         code: missing ? 'DELIVER_OBJECT_MISSING' : 'DELIVER_STORAGE_ERROR',
         status: status ?? null, providerCode: pcode ?? null, workbookId,
       })
-      return { delivered: false, outcome: missing ? 'skipped' : 'transient' }
+      return {
+        delivered: false, outcome: missing ? 'skipped' : 'transient',
+        providerDetail: `storage: ${missing ? 'object missing' : `status ${String(status ?? pcode ?? 'unknown')}`}`,
+      }
     }
     const container = Buffer.from(await blob.arrayBuffer())
     // A tampered / wrong-key container throws (never emits plaintext); we surface
@@ -114,10 +141,13 @@ export async function deliverWorkbookToWhatsApp(
     })
 
     // The in-chat file is named by its REAL accounting month (Billora_YYYY-MM.xlsx,
-    // §P1-5), read from the batch's own period_start. An unresolvable period keeps
-    // the stable generic name — we never stamp a guessed month on the download.
-    let periodStart: string | null = null
-    if (wb.batch_id) {
+    // §P1-5), read from the workbook's OWN validated period (§register-scope) — the
+    // scope it was actually built for — and only if that is absent (a legacy row from
+    // before the period was stamped) does it fall back to the batch's period_start.
+    // An unresolvable period keeps the stable generic name; we never stamp a guessed
+    // month on the download.
+    let periodStart: string | null = wb.period_start ?? null
+    if (!periodStart && wb.batch_id) {
       const { data: batchRow } = await db
         .from('invoice_batches').select('period_start')
         .eq('workspace_id', wb.workspace_id).eq('id', wb.batch_id).maybeSingle()
@@ -129,17 +159,23 @@ export async function deliverWorkbookToWhatsApp(
     try {
       mediaId = await uploadWhatsAppMedia({ buffer: plain, mimeType: SPREADSHEET_MIME, filename })
     } catch (e) {
+      // The message is Meta's own text plus a bounded graph code — no token, no path.
+      const detail = e instanceof Error ? e.message.slice(0, 120) : 'media upload error'
       if (isPermanentMediaFailure(e)) {
         logger.error('[Deliver] media upload blocked (credential)', { code: 'DELIVER_UPLOAD_BLOCKED' })
-        return { delivered: false, outcome: 'blocked' }
+        return { delivered: false, outcome: 'blocked', providerDetail: `upload: ${detail}` }
       }
       logger.warn('[Deliver] media upload transient', { code: 'DELIVER_UPLOAD_RETRY' })
-      return { delivered: false, outcome: 'transient' }
+      return { delivered: false, outcome: 'transient', providerDetail: `upload: ${detail}` }
     }
 
     // Capture Meta's message id so the outbox records exactly which send settled
     // the claim (audit + reconciliation); it is never logged in full.
     const messageIdOut: { current: string | null } = { current: null }
+    // And WHY it did not, when it didn't: a blocked document send and a blocked text
+    // reply are not the same fault, and without the provider code parked in the row
+    // an operator cannot tell a dead token from a temporary Meta media block.
+    const diagnosticsOut: { current: string | null } = { current: null }
     const outcome = await sendDocument(
       to,
       {
@@ -149,16 +185,19 @@ export async function deliverWorkbookToWhatsApp(
       },
       { workbookId },
       messageIdOut,
+      diagnosticsOut,
     )
-    if (outcome !== 'ok') return { delivered: false, outcome, providerMessageId: messageIdOut.current }
+    if (outcome !== 'ok') {
+      return { delivered: false, outcome, providerMessageId: messageIdOut.current, providerDetail: diagnosticsOut.current }
+    }
 
     // Confirmed delivered: retire the pending row so we never re-send it. A lost
     // race (already flipped) is fine — the file is in the chat either way.
     await db.from('generated_workbooks').update({ status: 'sent' }).eq('id', workbookId).eq('status', 'ready')
     logger.info('[Deliver] register delivered as document', { workbookId })
     return { delivered: true, outcome: 'ok', providerMessageId: messageIdOut.current }
-  } catch {
+  } catch (e) {
     logger.error('[Deliver] delivery failed', { code: 'DELIVER_FAILED' })
-    return { delivered: false, outcome: 'transient' }
+    return { delivered: false, outcome: 'transient', providerDetail: `fault: ${e instanceof Error ? e.name : 'unknown'}`.slice(0, 120) }
   }
 }

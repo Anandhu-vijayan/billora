@@ -1560,6 +1560,76 @@ test('K1 text-parser: deterministic parse of a real PDF text layer (real module,
   assert.equal(textParser.hasMeaningfulText('   '), false)
 })
 
+// §supplier/recipient production regression: the BUYER block is never the supplier.
+// Live register rows shipped `Supplier Name = Bill To: Anandhu Enterprises` — a
+// registered-firm suffix ("Enterprises") is carried by the CUSTOMER's name as often
+// as the supplier's, so a suffix match alone picked the recipient and mislabelled
+// every row of that month's purchase register.
+test('K1b text-parser: the Bill To / buyer block never becomes the supplier name', () => {
+  const buyerLines = ['Bill To:', 'Anandhu Enterprises', 'Kalamassery, Ernakulam, Kerala', 'GSTIN: 32CCCCC0000C1ZT']
+  const totals = ['Taxable Value: 25,000.00', 'CGST: 3,125.00', 'SGST: 3,125.00', 'Grand Total: 31,250.00']
+  const supplierFirst = [
+    'TAX INVOICE', 'MALABAR OFFICE STORES', 'GSTIN: 32AAAAA0000A1ZB',
+    'Invoice No: INV-2026-10-103', 'Invoice Date: 05/10/2026',
+    ...buyerLines, 'HSN Description Qty Rate Taxable Value', ...totals,
+  ].join('\n')
+  const cand = textParser.parseInvoiceText(supplierFirst)
+  assert.match(cand.vendor_name, /MALABAR OFFICE STORES/, 'the letterhead supplier is the vendor')
+  assert.ok(!/ANANDHU/i.test(cand.vendor_name), 'the customer block is not the supplier')
+  assert.ok(!/BILL\s*TO/i.test(cand.vendor_name), 'the label itself never rides the name')
+  assert.equal(ledger.evaluateLedger(cand, { minConfidence: 0.8 }).row.vendor_name, 'MALABAR OFFICE STORES',
+    'the canonical register row carries the SUPPLIER')
+
+  // The production shape, precisely: a supplier letterhead carrying a trading-house
+  // word ("... Supplies") beside a buyer block carrying a registered-firm suffix the
+  // grammar DOES know ("... Enterprises"). The old code had no tier for "Supplies",
+  // so the buyer line won and every row of that month's register was mislabelled.
+  // Now the name-shaped trading-house tier fills it at WEAK confidence, and the
+  // buyer block stays refused whatever its suffix looks like.
+  const unknownSupplier = [
+    'TAX INVOICE', 'MALABAR OFFICE SUPPLIES', 'GSTIN: 32AAAAA0000A1ZB',
+    'Invoice No: INV-2026-10-104', 'Invoice Date: 05/10/2026',
+    ...buyerLines, 'HSN Description Qty Rate Taxable Value', ...totals,
+  ].join('\n')
+  const swapped = textParser.parseInvoiceText(unknownSupplier)
+  assert.equal(swapped.vendor_name, 'MALABAR OFFICE SUPPLIES',
+    'the letterhead is the supplier even on the weaker trading-house tier')
+  assert.equal(swapped.confidence.vendor_name, 0.6, 'a contextual name match is WEAK, never claimed strong')
+  assert.ok(!/ANANDHU/i.test(swapped.vendor_name), 'and the buyer block stays refused')
+
+  // The same rule for a one-line "Bill To: <name>" with no supplier printed at all.
+  const buyerOnly = textParser.parseInvoiceText([
+    'TAX INVOICE', 'Invoice No: INV-2026-11-001', 'Bill To: Anandhu Enterprises',
+    'GSTIN: 32CCCCC0000C1ZT', 'Taxable Value: 12,500.00', 'CGST: 832.50', 'SGST: 832.50',
+    'Grand Total: 14,165.00',
+  ].join('\n'))
+  assert.ok(!buyerOnly.vendor_name, 'no supplier printed -> the field stays ABSENT, never the buyer')
+  assert.equal(buyerOnly.invoice_number, 'INV-2026-11-001', 'the rest of the read is unaffected')
+  const ev = ledger.evaluateLedger(buyerOnly, { minConfidence: 0.8 })
+  assert.equal(ev.review, 'needs_review')
+  assert.ok(ev.reasons.includes('vendor-name-missing'), ev.reasons.join(','))
+
+  // A supplier block that prints AFTER the buyer block is still found — and without
+  // its own label, so the register reads a name, not a form caption.
+  const supplierAfterBuyer = textParser.parseInvoiceText([
+    'TAX INVOICE', 'Invoice No: INV-2026-11-201', 'Bill To:', 'Anandhu Enterprises',
+    'GSTIN: 32CCCCC0000C1ZT', 'Sold By: Cochin Pantry Traders', 'GSTIN: 32BBBBB0000B1Z2',
+    'Taxable Value: 12,500.00', 'CGST: 832.50', 'SGST: 832.50', 'Grand Total: 14,165.00',
+  ].join('\n'))
+  assert.equal(supplierAfterBuyer.vendor_name, 'Cochin Pantry Traders',
+    'the supplier heading ends the buyer region; the label is stripped')
+
+  // The widened vocabulary must not turn ITEM prose into a supplier: an amount- or
+  // table-bearing line is refused by the weak tier, so no strong hit anywhere still
+  // means no name, never "Office Supplies" read off a description row.
+  const itemProse = textParser.parseInvoiceText([
+    'TAX INVOICE', 'Invoice No: INV-2026-11-301', 'GSTIN: 32AAAAA0000A1ZB',
+    '1 Office supplies 5 1,200.00 6,000.00 18%', 'Taxable Value: 6,000.00',
+    'CGST: 540.00', 'SGST: 540.00', 'Grand Total: 7,080.00',
+  ].join('\n'))
+  assert.ok(!itemProse.vendor_name, 'a table row is never a supplier name')
+})
+
 test('K2 mergeCandidates: AI assists the local parse but never overrules valid local data', () => {
   const localRow = { invoice_number: 'INV-1', supplier_gstin: 'NOTAGSTIN', total_amount: 1000 }
   const aiRow = {
@@ -1776,8 +1846,11 @@ test('M5b route.ts Done runs real finalization, not a bare ack', () => {
   const r = routeSrc()
   assert.match(r, /ensureBatchRegisters\(db, workspaceId, scope\)/, 'Done re-affirms register jobs for THIS tenant only')
   assert.match(r, /collectFinalizeState\(db, workspaceId, scope\)/, 'Done reads current state, client-scoped')
-  assert.ok(r.includes('composeDoneMessage(counts, { link, delivered: delivered > 0 })'), 'Done sends a truthful result')
-  assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Done attaches the register as an in-chat document')
+  assert.ok(r.includes('composeDoneMessage(counts, { link, delivered: delivered > 0, pushOk, pushOffer })'), 'Done sends a truthful result naming the real hand-over path')
+  // §one-delivery-path: Done no longer hand-sweeps every 'ready' workbook while a
+  // durable outbox consumer is ALSO sending them. One path, one file per month.
+  assert.ok(r.includes('const delivered = await deliverOwedRegisters();'), 'Done attaches the register via the single outbox path')
+  assert.ok(!r.includes('deliverRegisterDocuments('), 'the parallel direct ready-sweep is gone from the route')
   assert.ok(!r.includes('your uploads are queued for processing. Send more invoices anytime'), 'the old ack-only Done text is gone')
   // §wrong-month delivery: the summary link is the deterministic latest-period
   // pick, never an arbitrary first row of a workspace-wide ready list.
@@ -1971,7 +2044,7 @@ test('N1 approved+dated invoice resolves the correct month batch from the invoic
   assert.equal(ops.rpc[0].p_client, 'C1', 'batch is client-scoped (org clients never mix)')
   assert.equal(ops.rpc[0].p_start, '2026-05-01')
   assert.equal(ops.rpc[0].p_end, '2026-05-31', 'period derived from the invoice date, not the upload date')
-  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1' }], 'invoice linked to its batch')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1', invoice_month: '2026-05' }], 'invoice linked to its batch + canonical accounting month (scope key)')
   assert.equal(ops.inserts.length, 1)
   assert.equal(ops.inserts[0].job_type, 'register_generation')
   assert.equal(ops.inserts[0].batch_id, 'BATCH-1')
@@ -1986,7 +2059,7 @@ test('N1b scheduleRegister:false still files the batch but defers the register j
   })
   assert.equal(batchId, 'BATCH-1', 'the invoice is still resolved into its month batch')
   assert.equal(ops.rpc.length, 1, 'batch resolved via the RPC as usual')
-  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1' }], 'invoice still linked to its batch')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-1', invoice_month: '2026-05' }], 'invoice still linked to its batch + canonical month')
   assert.equal(ops.inserts.length, 0, 'NO register job scheduled during the deferred phase (coalesced after the loop)')
 })
 
@@ -2034,7 +2107,7 @@ test('N7 a corrected date that moves a batched invoice to another month re-files
   assert.equal(ops.rpc.length, 1, 'resolved/created the destination batch from the corrected date')
   assert.equal(ops.rpc[0].p_start, '2026-06-01')
   assert.equal(ops.rpc[0].p_end, '2026-06-30')
-  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-JUN' }], 'invoice re-linked to the new period')
+  assert.deepEqual(ops.invoiceUpdate, [{ batch_id: 'BATCH-JUN', invoice_month: '2026-06' }], 'invoice re-linked to the new period + month scope key moves with it')
   const enqueued = ops.inserts.map((i) => i.batch_id).sort()
   assert.deepEqual(enqueued, ['BATCH-JUN', 'BATCH-MAY'], 'BOTH the destination and abandoned registers are rebuilt')
 })
@@ -2106,7 +2179,7 @@ test('N8 WhatsApp Review is truthful: delivers a ready workbook now, or states w
   assert.match(clear, /Nothing needs your attention/)
   const r = routeSrc()
   assert.ok(r.includes('composeReviewMessage(counts, { link, delivered: delivered > 0 })'), 'the Review command renders the truthful body')
-  assert.ok(r.includes('await deliverRegisterDocuments(counts.readyWorkbookIds)'), 'Review attaches the register as an in-chat document')
+  assert.ok(r.includes('const delivered = await deliverOwedRegisters();'), 'Review attaches the register via the single outbox path')
   assert.match(r, /collectFinalizeState\(db, workspaceId, scope\)/, 'Review reads current verified state, client-scoped')
 })
 
@@ -2568,12 +2641,22 @@ test('T14 §P3-15 a local row whose CGST/SGST halves disagree is NEVER collapsed
   assert.equal(out.gstRatePercent, null)
   assert.equal(out.status, 'unresolved-rate', 'a mixed-rate line is flagged, never mapped by luck')
   assert.equal(out.ledgerName, null, 'no ledger name is invented for an unclassifiable rate')
-  // Equal halves still resolve exactly as before (no regression for the common case).
-  const clean = { ...mixed, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  // Equal halves that EXPLAIN the tax charged still resolve to their sum. NOTE the
+  // fixture here used to be internally inconsistent (9%/9% printed against 105/105
+  // charged on 1,000 = 21%), which is exactly the multi-rate-flattened-onto-one-head
+  // shape the October register shipped as a `0%` column: asserting 18 for it was
+  // asserting a slab the document contradicts. Amounts decide, so such a head is
+  // now UNRESOLVED rather than confidently wrong.
+  const clean = { ...mixed, cgst_amount: 90, sgst_amount: 90, total_amount: 1180, cgst_rate_percent: 9, sgst_rate_percent: 9 }
   assert.equal(tallyMap.overallGstRatePercent(clean, 'local'), 18)
   // A 2.5/2.5 (5% slab) invoice is equal halves and resolves to 5.
-  const five = { ...mixed, cgst_rate_percent: 2.5, sgst_rate_percent: 2.5 }
+  const five = { ...mixed, cgst_amount: 25, sgst_amount: 25, total_amount: 1050, cgst_rate_percent: 2.5, sgst_rate_percent: 2.5 }
   assert.equal(tallyMap.overallGstRatePercent(five, 'local'), 5, 'equal halves within epsilon still sum')
+  // Equal halves that CANNOT reproduce the tax charged are no evidence of a slab.
+  const contradicted = { ...mixed, cgst_rate_percent: 9, sgst_rate_percent: 9 }
+  assert.equal(tallyMap.overallGstRatePercent(contradicted, 'local'), null, 'a slab the amounts contradict is never asserted')
+  assert.equal(tallyMap.resolveLedgerName(contradicted, []).status, 'unresolved-rate',
+    'and it never reaches the register as a rate column or a Purchase @ <rate>% ledger')
 })
 
 // ---- Second-pass bug fix (17 Oct logs): selection precedence, money, dates ----
@@ -3371,8 +3454,8 @@ test('P1-6 store: the raw phone / sealed bytes / key are NEVER logged', () => {
 
 test('P1-6 route: consent is stored only when the flag AND separate key are set', () => {
   const src = routeSrc()
-  assert.ok(/import \{ proactiveDeliveryEnabled, proactiveKeyConfigured \} from '@\/lib\/whatsapp\/proactive'/.test(src), 'route imports the pure gate')
-  assert.ok(/import \{ setProactiveConsent \} from '@\/lib\/whatsapp\/proactive-store'/.test(src), 'route imports the consent store')
+  assert.ok(/import \{ proactiveDeliveryEnabled, proactiveKeyConfigured, canProactivelyPush \} from '@\/lib\/whatsapp\/proactive'/.test(src), 'route imports the pure gate')
+  assert.ok(/import \{ setProactiveConsent, loadProactiveIdentity, openWaId \} from '@\/lib\/whatsapp\/proactive-store'/.test(src), 'route imports the consent store')
   assert.ok(/enable && !\(proactiveDeliveryEnabled\(\) && proactiveKeyConfigured\(\)\)/.test(src), 'a bare opt-in with the feature off stores NOTHING')
   assert.ok(/setProactiveConsent\(db, hmac, \{ enabled: enable, waId: enable \? to : null \}\)/.test(src),
     'consent write is scoped to THIS sender (hmac) and passes the raw wa_id only on opt-in, null on opt-out')
@@ -3500,12 +3583,20 @@ test('P1-8 Done waits (bounded) for a still-compiling register so the Excel land
   // delivers inline via the existing ready-workbook path.
   assert.ok(/const REGISTER_READY_WAIT_MS = \d+;/.test(src), 'the wait is a bounded named window')
   assert.ok(/const waitForRegisterReady = async \(scope: DeliveryScope, first: FinalizeCounts\)/.test(src), 'a bounded readiness poll exists')
-  assert.ok(/await ensureBatchRegisters\(db, workspaceId, scope\)[\s\S]*?await waitForRegisterReady\(scope, await collectFinalizeState\(db, workspaceId, scope\)\)[\s\S]*?deliverRegisterDocuments\(counts\.readyWorkbookIds\)/.test(src),
+  assert.ok(/await ensureBatchRegisters\(db, workspaceId, scope\)[\s\S]*?await waitForRegisterReady\(scope, await collectFinalizeState\(db, workspaceId, scope\)\)[\s\S]*?await deliverOwedRegisters\(\)/.test(src),
     'Done: schedule -> wait-for-ready -> deliver inline, in that order')
-  // The poll must break early once ready, stop when nothing is compiling, and never
-  // loop unbounded (deadline + a try/catch that returns the last truthful counts).
+  // The poll must end only on a SETTLED workspace and never loop unbounded (deadline
+  // + a try/catch that returns the last truthful counts).
   const poll = src.slice(src.indexOf('const waitForRegisterReady'), src.indexOf('const deliverDone'))
-  assert.ok(/if \(first\.readyWorkbookIds\.length > 0 \|\| first\.compiling === 0\) return first;/.test(poll), 'no wait when already ready or nothing compiling')
+  // §never-partial — intentional re-pin of the old "return as soon as a workbook
+  // exists" contract. Mid-burst the newest live register is a PARTIAL snapshot of the
+  // month (the field symptom: a one-row October), and the delivery consumer holds a
+  // flush while any job is live, so an early return attached nothing in that turn and
+  // taught the owner to type Done twice. Readiness for THIS reply is now quiescence.
+  assert.ok(/if \(first\.outstanding === 0 && first\.compiling === 0\) return first;/.test(poll), 'no wait when the workspace is already quiet')
+  assert.ok(!/if \(first\.readyWorkbookIds\.length > 0 \|\| first\.compiling === 0\) return first;/.test(poll), 'a ready row alone never ends the wait')
+  assert.ok(/if \(latest\.outstanding === 0 && latest\.compiling === 0\) return latest;/.test(poll), 'the poll ends only once nothing is extracting or compiling')
+  assert.ok(!/if \(latest\.readyWorkbookIds\.length > 0\) return latest;/.test(poll), 'never returns a partial register while work is running')
   assert.ok(/const deadline = Date\.now\(\) \+ REGISTER_READY_WAIT_MS;/.test(poll), 'poll is bounded by the deadline')
   assert.ok(/while \(Date\.now\(\) < deadline\)/.test(poll), 'a bounded while loop, never an unbounded/while(true)')
   assert.ok(/catch \{\s*return latest;/.test(poll), 'a read fault returns the truthful counts (never hangs the webhook)')

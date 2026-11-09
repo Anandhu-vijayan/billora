@@ -9,6 +9,7 @@
 //   Import the untouched 12-column contract).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { importTs } from '../scripts/_ts-import.mjs'
 
 const slices = await importTs('lib/ocr/tax-slices.ts')
@@ -99,6 +100,85 @@ test('genuine equal halves still sum, and a real 10% bill is never wrongly halve
     taxable_value: 1000, cgst_amount: 50, sgst_amount: 50, igst_amount: 0,
     cgst_rate_percent: 5, sgst_rate_percent: 5,
   }, 'local'), 10, 'a genuine 10% (5+5) is not mistaken for a copied 5% total')
+})
+
+// ---- production regression: a MULTI-rate bill never becomes a `0%` slab ----
+//
+// Live fixtures INV-2026-10-103 (Steel Rods 7,500 @18% + Cement 17,500 @28%) and
+// INV-2026-11-201 / INV-2026-11-001 (5% + 18% on 12,500): the extraction carried ONE
+// flat pair of invoice-level rate fields reading 0, the old resolver fell through to
+// the UNEVIDENCED sum, and the register printed the whole taxable value under
+// `0% Taxable Value` while the Tally line posted `Purchase @ 0%` against 6,250 of
+// real tax. An unevidenced rate is now UNRESOLVED — blank per-rate cells and a plain
+// `Purchase` ledger — and a split only ever arrives as evidenced slices (a printed
+// rate-wise summary or the vision rate-wise breakdown), validated against the heads.
+
+const FLAT_18_28 = {
+  taxable_value: 25000, cgst_amount: 3125, sgst_amount: 3125, igst_amount: 0,
+  total_amount: 31250, cgst_rate_percent: 0, sgst_rate_percent: 0,
+}
+const FLAT_5_18 = {
+  taxable_value: 12500, cgst_amount: 832.5, sgst_amount: 832.5, igst_amount: 0,
+  total_amount: 14165, cgst_rate_percent: 0, sgst_rate_percent: 0,
+}
+
+test('a multi-rate bill flattened onto one head resolves to NO rate — never the 0% slab', () => {
+  assert.equal(tallyMap.overallGstRatePercent(FLAT_18_28, 'local'), null, '0/0 cannot explain 6,250 of tax')
+  assert.equal(tallyMap.overallGstRatePercent(FLAT_5_18, 'local'), null, '0/0 cannot explain 1,665 of tax')
+  assert.equal(slices.deriveSlicesFromInvoiceHeads(FLAT_18_28), null, 'no fabricated slice from an unevidenced head')
+  assert.equal(slices.deriveSlicesFromInvoiceHeads(FLAT_5_18), null)
+  // So export posts NOTHING invented: an unresolved class and a plain `Purchase`
+  // display default, never a `Purchase @ 0%` classification of a taxed purchase.
+  const row = {
+    invoice_date: '2026-10-05', invoice_number: 'INV-2026-10-103',
+    vendor_name: 'Steel And Cement Traders', supplier_gstin: '27AAPFU0939F1ZV',
+    igst_rate_percent: null, ...FLAT_18_28,
+  }
+  const res = tallyMap.resolveLedgerName(row, [])
+  assert.equal(res.status, 'unresolved-rate')
+  assert.equal(res.gstRatePercent, null)
+  assert.equal(res.rateClassKey, 'unresolved')
+  assert.equal(tallyMap.tallyDefaultLedgerName(res.gstRatePercent), 'Purchase')
+})
+
+test('a printed rate that cannot reproduce its own tax head derives nothing — local and interstate', () => {
+  // Interstate: a printed 5% IGST rate against 180 on 1,000 is a misread, not a slab.
+  assert.equal(slices.deriveSlicesFromInvoiceHeads({
+    taxable_value: 1000, cgst_amount: 0, sgst_amount: 0, igst_amount: 180, igst_rate_percent: 5,
+  }), null)
+  // Local: equal printed halves are only evidence if they explain the tax charged.
+  assert.equal(slices.deriveSlicesFromInvoiceHeads({
+    taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0,
+    cgst_rate_percent: 12, sgst_rate_percent: 12,
+  }), null, 'a 24% sum contradicts the 180 charged; asserting it would misclassify')
+  // No resolvable taxable value means nothing to corroborate the rate against.
+  assert.equal(slices.deriveSlicesFromInvoiceHeads({
+    taxable_value: null, cgst_amount: 90, sgst_amount: 90, igst_amount: 0,
+    cgst_rate_percent: 9, sgst_rate_percent: 9,
+  }), null)
+  // A rate that DOES explain its halves still derives its one evidenced slice.
+  const ok = slices.deriveSlicesFromInvoiceHeads({
+    taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0,
+    cgst_rate_percent: 9, sgst_rate_percent: 9,
+  })
+  assert.equal(ok.length, 1)
+  assert.equal(ok[0].rate_percent, 18)
+})
+
+test('evaluateLedger leaves an unevidenced multi-rate bill with NO breakdown on the row', () => {
+  const ev = ledger.evaluateLedger({
+    invoice_date: '05/10/2026', invoice_number: 'INV-2026-10-103',
+    vendor_name: 'Steel And Cement Traders', supplier_gstin: '27AAPFU0939F1ZV',
+    ...FLAT_18_28,
+  }, { minConfidence: 0.8, now: NOW })
+  assert.ok(!ev.row.tax_slices, 'the row carries no invented rate-wise breakdown')
+  assert.equal(slices.normalizeSlices(ev.row.tax_slices) ?? slices.deriveSlicesFromInvoiceHeads(ev.row), null,
+    'what build-register resolves for display is NOTHING — blank per-rate cells')
+  assert.ok(!ev.reasons.some((r) => Object.values(R).some((k) => r.startsWith(k))),
+    `no mixed-gst reasons without explicit slices: ${ev.reasons.join(',')}`)
+  // Amounts are never rewritten to make a slab fit.
+  assert.equal(ev.row.taxable_value, 25000)
+  assert.equal(ev.row.cgst_amount, 3125)
 })
 
 // ---- validation: decimal-safe, additive, fail-toward-review ----
@@ -418,4 +498,82 @@ test('the register validator fails CLOSED: every wrong sheet-count is refused', 
   }
   await assert.rejects(() => gen.validateRegisterWorkbook(good.subarray(0, 10), base), /WORKBOOK_INVALID/, 'truncated buffer never ships')
   await assert.rejects(() => gen.validateRegisterWorkbook(Buffer.from('not a zip archive at all', 'latin1'), base), /WORKBOOK_INVALID/)
+})
+
+// ---- capability: the split must be REPORTABLE, or it can only ever be blank ----
+
+/** Mirror the register's per-slice import expansion: one line per evidenced slab. */
+const slabImportLines = (slicesList, inv) => slicesList.map((s) => {
+  const r = tallyMap.resolveSliceLedgerName(s, [])
+  return {
+    invoice_date: inv.invoice_date, invoice_number: inv.invoice_number,
+    vendor_name: inv.vendor_name, supplier_gstin: inv.supplier_gstin,
+    ledger_name: r.ledgerName ?? tallyMap.tallyDefaultLedgerName(r.gstRatePercent),
+    taxable_value: s.taxable_value, gst_rate_percent: s.rate_percent,
+    cgst_amount: s.cgst_amount, sgst_amount: s.sgst_amount, igst_amount: s.igst_amount,
+    round_off: null,
+    gross_total: (s.taxable_value ?? 0) + (s.cgst_amount ?? 0) + (s.sgst_amount ?? 0) + (s.igst_amount ?? 0),
+  }
+})
+
+test('an evidenced rate-wise breakdown splits 18% / 28% and the register prints BOTH slab columns', async () => {
+  // Production fixture INV-2026-10-103 read WITH its printed slab split (a printed
+  // rate-wise summary or the vision rate-wise breakdown — the same explicit-slice
+  // path either source feeds). 7,500 @18% + 17,500 @28% = 25,000 taxable, 6,250 tax.
+  const ev = ledger.evaluateLedger({
+    invoice_date: '05/10/2026', invoice_number: 'INV-2026-10-103',
+    vendor_name: 'Steel And Cement Traders', supplier_gstin: '27AAPFU0939F1ZV',
+    taxable_value: 25000, cgst_amount: 3125, sgst_amount: 3125, igst_amount: 0,
+    total_amount: 31250, cgst_rate_percent: 0, sgst_rate_percent: 0,
+    tax_slices: [
+      slice({ rate_percent: 18, taxable_value: 7500, cgst_amount: 675, sgst_amount: 675, treatment: 'local', provenance: 'item-level' }),
+      slice({ rate_percent: 28, taxable_value: 17500, cgst_amount: 2450, sgst_amount: 2450, treatment: 'local', provenance: 'item-level' }),
+    ],
+  }, { minConfidence: 0.8, now: NOW })
+  assert.equal(ev.review, 'approved', ev.reasons.join(','))
+  assert.equal(ev.breakdownValidated, true, 'the split reconciles to the invoice heads')
+  assert.equal(ev.row.tax_slices.length, 2)
+
+  const inv = {
+    invoice_date: '2026-10-05', invoice_number: 'INV-2026-10-103',
+    vendor_name: 'Steel And Cement Traders', supplier_gstin: '27AAPFU0939F1ZV',
+    total_taxable_value: 25000, total_cgst: 3125, total_sgst: 3125, total_igst: 0,
+    total_cess: null, other_charges: null, discount: null, round_off: null,
+    grand_total: 31250, review_status: 'approved',
+    slices: ev.row.tax_slices,
+    importRows: slabImportLines(ev.row.tax_slices, { invoice_date: '2026-10-05', invoice_number: 'INV-2026-10-103', vendor_name: 'Steel And Cement Traders', supplier_gstin: '27AAPFU0939F1ZV' }),
+  }
+  const buf = await gen.buildRegisterWorkbook([inv])
+  await gen.validateRegisterWorkbook(buf, { invoiceCount: 1, taxBreakdownRowCount: 2, importRowCount: 2 })
+  const wb = await loadWorkbook(buf)
+  const reg = wb.getWorksheet('Purchase Register')
+  const headers = []
+  reg.getRow(1).eachCell((c, i) => { headers[i - 1] = String(c.text).trim() })
+  assert.deepEqual(headers.filter((h) => /^\d/.test(h)), [
+    '18% Taxable Value', '18% CGST', '18% SGST', '18% IGST',
+    '28% Taxable Value', '28% CGST', '28% SGST', '28% IGST',
+  ], 'BOTH slabs print as their own columns — never a `0% Taxable Value` catch-all')
+  const colOf = (label) => headers.indexOf(label) + 1
+  assert.equal(reg.getRow(2).getCell(colOf('18% Taxable Value')).value, 7500)
+  assert.equal(reg.getRow(2).getCell(colOf('28% Taxable Value')).value, 17500)
+  assert.equal(reg.getRow(2).getCell(colOf('18% CGST')).value, 675)
+  assert.equal(reg.getRow(2).getCell(colOf('28% SGST')).value, 2450)
+  assert.equal(reg.getRow(2).getCell(colOf('Total Taxable Value')).value, 25000, 'the invoice stays ONE row')
+  const imp = wb.getWorksheet('Purchase Import')
+  assert.equal(String(imp.getRow(2).getCell(5).text), 'Purchase @ 18%', 'each slab posts to its OWN ledger')
+  assert.equal(String(imp.getRow(3).getCell(5).text), 'Purchase @ 28%')
+})
+
+test('the vision schema ASKS for the printed rate-wise breakdown, and keeps it optional', () => {
+  const src = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
+  assert.match(src, /tax_slices: \{ type: Type\.ARRAY/, 'the flat heads cannot carry a slab split, so the schema must request one')
+  assert.match(src, /RATE-WISE BREAKDOWN/)
+  assert.match(src, /never split a single-rate invoice/, 'the model may only COPY a printed summary')
+  assert.match(src, /Return an EMPTY array when there is no printed rate-wise summary/)
+  // OPTIONAL, never required: a single-rate bill or a model that omits the key must
+  // still be a valid response, not a permanent job failure over missing metadata.
+  const body = src.slice(src.indexOf('const LEDGER_SCHEMA'))
+  const requiredLists = [...body.matchAll(/required: \[([\s\S]*?)\]/g)].map((m) => m[1])
+  assert.ok(requiredLists.length > 0, 'the schema declares a required list')
+  assert.ok(requiredLists.every((r) => !r.includes('tax_slices')), 'tax_slices stays optional')
 })

@@ -92,7 +92,7 @@ export function renderMonthBreakdown(months: ReadyMonth[] | undefined): string {
 
 export function composeDoneMessage(
   c: FinalizeCounts,
-  opts?: { link?: string | null; delivered?: boolean },
+  opts?: { link?: string | null; delivered?: boolean; pushOk?: boolean; pushOffer?: boolean },
 ): string {
   const attention = c.needsReview + c.missingDate
   if (c.outstanding > 0 || c.compiling > 0) {
@@ -100,7 +100,17 @@ export function composeDoneMessage(
       c.outstanding > 0 ? `${c.outstanding} invoice(s) still processing` : null,
       c.compiling > 0 ? 'a register still compiling' : null,
     ].filter(Boolean).join(', ')
-    return `Still working — ${parts}. I'll send your Excel register here as soon as it's ready.${attentionNote(c)}`
+    // §truthful-promise: "I'll send it as soon as it's ready" is only a promise we
+    // can keep UNPROMPTED when the sanctioned proactive path is live for this owner
+    // (their opt-in + the operator's key + inside Meta's 24h window). State the
+    // actual handover for each of the three real states instead of making the owner
+    // discover that they have to message again.
+    const handover = opts?.pushOk
+      ? " I'll send your Excel register here as soon as it's ready."
+      : opts?.pushOffer
+        ? " I'll push your Excel register here the moment it's ready \u2014 reply \"Proactive on\" to allow that; until then, send Done again once processing finishes."
+        : " Send Done again once processing finishes and I'll attach your Excel register."
+    return `Still working — ${parts}.${handover}${attentionNote(c)}`
   }
   if (c.readyWorkbooks > 0) {
     const n = c.readyWorkbooks
@@ -337,13 +347,13 @@ export async function collectFinalizeState(db: Db, workspaceId: string, scope?: 
     }
   }
   const readyQuery = db
-    .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at,accounting_category')
+    .from('generated_workbooks').select('id,batch_id,file_object_path,expires_at,accounting_category,period_start')
     .eq('workspace_id', workspaceId).eq('status', 'ready').not('file_object_path', 'is', null)
     .order('created_at', { ascending: false })
   const { data: readyRows, error: readyErr } = await (scopedBatchIds ? readyQuery.in('batch_id', scopedBatchIds) : readyQuery)
   if (readyErr) throw new Error(`FINALIZE_READY_ERROR: ${readyErr.message}`)
   const now = Date.now()
-  const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null; accounting_category: string | null }>)
+  const usable = (readyRows ?? [] as Array<{ id: string; batch_id: string | null; file_object_path: string | null; expires_at: string | null; accounting_category: string | null; period_start?: string | null }>)
     .filter((r) => !r.expires_at || new Date(r.expires_at).getTime() > now)
 
   // Per-month breakdown (§P1-5): resolve each ready batch's own accounting period
@@ -368,7 +378,11 @@ export async function collectFinalizeState(db: Db, workspaceId: string, scope?: 
     }
   }
   const readyMonths: ReadyMonth[] = usable.map((r) => {
-    const period = r.batch_id ? periodByBatch.get(r.batch_id) ?? null : null
+    // §register-scope: the month label + filename come from the workbook's OWN
+    // validated period when it has one; only a legacy row without a stamped period
+    // falls back to the batch's period_start (unchanged behaviour for pre-migration
+    // registers), so a delivered name always matches the register's actual contents.
+    const period = r.period_start ?? (r.batch_id ? periodByBatch.get(r.batch_id) ?? null : null)
     // §separate-files-per-category: name each file with its category so a batch's
     // multiple per-category registers never collapse onto one duplicate-looking
     // `Billora_YYYY-MM.xlsx` in the Done/Review breakdown. Purchase keeps the bare

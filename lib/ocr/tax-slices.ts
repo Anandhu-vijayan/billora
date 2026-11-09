@@ -170,8 +170,9 @@ export function overallInvoiceRate(args: {
 /**
  * Derive slices for a legacy single-rate invoice from the invoice-level heads it
  * already carries, WITHOUT ever inventing a rate. Produces exactly one slice ONLY
- * when a single overall rate is reliably evidenced; returns null otherwise so the
- * caller keeps the historical no-slice behaviour rather than a fabricated row.
+ * when a single overall rate is reliably evidenced AND explains the tax that same
+ * head charges; returns null otherwise so the caller keeps the historical
+ * no-slice behaviour rather than a fabricated row.
  */
 export function deriveSlicesFromInvoiceHeads(row: {
   taxable_value: number | null
@@ -204,6 +205,21 @@ export function deriveSlicesFromInvoiceHeads(row: {
   })
   // No reliably evidenced single rate: a mixed or unevidenced bill. Never guess.
   if (rate === null) return null
+  // The claimed rate must EXPLAIN the tax the same head actually charges. An
+  // invoice-level rate field that cannot reproduce its own CGST/SGST (or IGST)
+  // is not evidence of a slab — it is a multi-rate bill flattened onto one head
+  // or a zero-filled/misread rate. Materialising it anyway would print the whole
+  // taxable value under a `0% Taxable Value` column and post `Purchase @ 0%` in
+  // the Tally import against real tax: a fabricated classification on an approved
+  // row. Unevidenced means UNRESOLVED (blank), never a wrong number.
+  if (!headRateCorroboratesAmounts({
+    treatment,
+    rate,
+    taxableValue: isFiniteOrNull(row.taxable_value) ? row.taxable_value : null,
+    cgst: isFiniteOrNull(row.cgst_amount) ? row.cgst_amount : null,
+    sgst: isFiniteOrNull(row.sgst_amount) ? row.sgst_amount : null,
+    igst: isFiniteOrNull(row.igst_amount) ? row.igst_amount : null,
+  })) return null
 
   const slice: InvoiceTaxSlice = {
     rate_percent: rate,
@@ -221,6 +237,36 @@ export function deriveSlicesFromInvoiceHeads(row: {
 }
 
 const isFiniteOrNull = (v: unknown): v is number | null => v === null || v === undefined || (typeof v === 'number' && Number.isFinite(v))
+
+/** Same default tolerance the invoice-level evaluator and slice validator use. */
+const DERIVE_TOLERANCE_MINOR = BigInt(101)
+
+/**
+ * Does the single rate claimed by an invoice HEAD reproduce that head's own tax
+ * amounts within the shared tolerance? Local charges the halves (a combined
+ * printed rate is already disambiguated upstream), interstate charges the IGST.
+ * Comparison-only: it never re-derives or rewrites an amount to make a check pass.
+ */
+function headRateCorroboratesAmounts(args: {
+  treatment: SliceTreatment
+  rate: number
+  taxableValue: number | null
+  cgst: number | null
+  sgst: number | null
+  igst: number | null
+}): boolean {
+  const taxable = args.taxableValue
+  if (taxable === null || !Number.isFinite(taxable) || taxable <= 0) return false
+  if (args.treatment === 'local') {
+    const half = Number((args.rate / 2).toFixed(4))
+    return expectedMatches(taxable, half, nz(moneyToMinorUnits(args.cgst ?? undefined)), DERIVE_TOLERANCE_MINOR)
+      && expectedMatches(taxable, half, nz(moneyToMinorUnits(args.sgst ?? undefined)), DERIVE_TOLERANCE_MINOR)
+  }
+  if (args.treatment === 'interstate') {
+    return expectedMatches(taxable, args.rate, nz(moneyToMinorUnits(args.igst ?? undefined)), DERIVE_TOLERANCE_MINOR)
+  }
+  return false
+}
 
 /** Invoice-level totals to reconcile the slices against, already paise-normalised. */
 export interface InvoiceLevelTotals {

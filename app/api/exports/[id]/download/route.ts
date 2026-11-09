@@ -32,6 +32,7 @@ interface WorkbookRow {
   file_object_path: string
   file_encryption_key_version: string | null
   accounting_category: string | null
+  period_start?: string | null
 }
 
 function deny(status: number, code: string): NextResponse {
@@ -53,7 +54,7 @@ export async function GET(
 
   const { data: row, error: readErr } = await db
     .from('generated_workbooks')
-    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category')
+    .select('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category,period_start')
     .eq('id', id)
     .maybeSingle()
   if (readErr) {
@@ -103,10 +104,13 @@ export async function GET(
     })
 
     // Name the register by its REAL accounting month (Billora_YYYY-MM.xlsx, §P1-5),
-    // derived only from the batch's own period_start — never a guessed month. An
-    // unresolvable period falls back to the stable generic name inside workbookFileName.
-    let periodStart: string | null = null
-    if (workbook.batch_id) {
+    // read from the workbook's OWN validated period (§register-scope) — the scope it
+    // was actually generated for — so the delivered name can never disagree with the
+    // register's contents. Only a legacy row with no stamped period falls back to the
+    // batch's period_start; an unresolvable period keeps the stable generic name inside
+    // workbookFileName — never a guessed month.
+    let periodStart: string | null = workbook.period_start ?? null
+    if (!periodStart && workbook.batch_id) {
       const { data: batchRow } = await db
         .from('invoice_batches').select('period_start')
         .eq('workspace_id', workbook.workspace_id).eq('id', workbook.batch_id).maybeSingle()

@@ -19,14 +19,33 @@ function graphBase(): string {
   return `https://graph.facebook.com/${process.env.WHATSAPP_GRAPH_VERSION || 'v21.0'}`
 }
 
+/**
+ * A bounded, PII-free description of WHY a send did not land: `http <status>
+ * code <code> sub <subcode>`. Callers may persist it as a delivery's `last_error`
+ * so an operator can tell a genuine dead credential (190/401) from a temporary
+ * Meta rate/security block (4/463/464) days later, straight from the DB. It never
+ * contains the token, the recipient, the media id or any message body.
+ */
+function providerDetail(
+  httpStatus: number | null, code: number | null | undefined, subcode: number | null | undefined,
+): string {
+  const parts: string[] = []
+  if (httpStatus !== null && httpStatus !== 0) parts.push(`http ${httpStatus}`)
+  if (code !== undefined && code !== null) parts.push(`code ${code}`)
+  if (subcode !== undefined && subcode !== null) parts.push(`sub ${subcode}`)
+  return parts.length > 0 ? parts.join(' ') : 'no provider detail'
+}
+
 async function postMessage(
   payload: Record<string, unknown>,
   correlation: { workbookId?: string } = {},
   messageIdOut?: { current: string | null },
+  diagnosticsOut?: { current: string | null },
 ): Promise<SendOutcome> {
   const token = process.env.WHATSAPP_ACCESS_TOKEN || ''
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID || ''
   if (!token || !phoneNumberId) {
+    if (diagnosticsOut) diagnosticsOut.current = 'config missing (token / phone id)'
     logger.error('[WhatsApp] CREDENTIAL_BLOCKED: send config missing (access token / phone number id); retries suppressed until operator fixes env')
     return 'blocked'
   }
@@ -75,6 +94,9 @@ async function postMessage(
       return 'ok'
     }
     const errorCode = body?.error?.code
+    if (diagnosticsOut) {
+      diagnosticsOut.current = providerDetail(res.status, errorCode, body?.error?.error_subcode ?? null).slice(0, 120)
+    }
     if (res.status === 401 || res.status === 403 || (errorCode !== undefined && BLOCKED_ERROR_CODES.has(errorCode))) {
       // Credential-level failure: alert the operator ONCE per delivery attempt
       // and mark blocked so callers never convert this into a Meta retry loop.
@@ -86,6 +108,7 @@ async function postMessage(
     logger.error('[WhatsApp] send failed (transient)', responseFields)
     return 'transient'
   } catch (e) {
+    if (diagnosticsOut) diagnosticsOut.current = `send error: ${e instanceof Error ? e.name : 'unknown'}`.slice(0, 120)
     logger.error('[WhatsApp] send error (transient)', { error: e instanceof Error ? e.message : String(e) })
     return 'transient'
   } finally {
@@ -109,6 +132,7 @@ export function sendDocument(
   args: { mediaId: string; filename: string; caption?: string },
   correlation?: { workbookId?: string },
   messageIdOut?: { current: string | null },
+  diagnosticsOut?: { current: string | null },
 ): Promise<SendOutcome> {
   // Send by media id: Meta derives the type from the stored upload. Declaring a
   // mime_type that differs from the type Meta normalized on upload makes it
@@ -116,7 +140,7 @@ export function sendDocument(
   // it here. The upload (uploadWhatsAppMedia) still carries the real type.
   const document: Record<string, unknown> = { id: args.mediaId, filename: args.filename }
   if (args.caption) document.caption = args.caption.slice(0, 1024)
-  return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation, messageIdOut)
+  return postMessage({ messaging_product: 'whatsapp', to, type: 'document', document }, correlation, messageIdOut, diagnosticsOut)
 }
 
 export function sendAccountTypeButtons(to: string): Promise<SendOutcome> {

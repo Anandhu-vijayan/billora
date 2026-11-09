@@ -21,6 +21,9 @@ import {
   isPermanentJobFailure, recoverStaleJobs, renewLease, type ClaimedJob,
 } from '@/lib/jobs/queue'
 import { recoverExpiredDeliveryLeases } from '@/lib/whatsapp/delivery-outbox'
+import {
+  pushReadyRegistersForWorkspace, sweepDueDeliveries,
+} from '@/lib/jobs/handlers/deliver-register'
 
 type Db = SupabaseClient
 
@@ -209,8 +212,18 @@ async function processClaimedJob(
       jobId: job.id, type: job.job_type, worker,
       outcome: owned ? 'completed' : 'fenced', ...jobTiming.summary(),
     })
-    if (owned) result.completed += 1
-    else {
+    if (owned) {
+      result.completed += 1
+      // §completion-push: THIS job is now settled, so the workspace can be judged
+      // honestly quiet — a register hand could never pass that gate while it was
+      // still the queue's own live row. Hand the finished file to the delivery
+      // consumer the moment its last build lands, instead of leaving it owed until
+      // the owner happens to message again. The consumer applies every rule
+      // (quiescence, newest-version-per-scope, the owner's proactive opt-in and
+      // Meta's 24h window), no-ops on one count query when any fails, and never
+      // throws — a push problem cannot un-settle a completed job or fail the tick.
+      await pushReadyRegistersForWorkspace(db, job.workspace_id)
+    } else {
       result.fenced += 1
       logger.warn('[Worker] completion fenced after handler', { jobId: job.id, worker })
     }
@@ -323,5 +336,20 @@ export async function runWorkerTick(
       recovered: result.recovered,
     })
   }
+
+  // §delivery sweep: a finished register must not wait for the owner to message
+  // again. After the queue work of this tick, hand over anything owed to an owner
+  // who opted into proactive delivery (and only to them — the consumer re-checks
+  // consent, the 24h window and that the workspace is now quiet). Best-effort: a
+  // failure leaves every row pending/failed for the next tick or inbound.
+  try {
+    const sent = await sweepDueDeliveries(db)
+    if (sent > 0) logger.info('[Worker] due registers delivered without an inbound', { sent })
+  } catch (e: unknown) {
+    logger.error('[Worker] delivery sweep failed', {
+      error: e instanceof Error ? e.message : String(e),
+    })
+  }
+
   return result
 }

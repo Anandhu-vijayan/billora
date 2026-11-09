@@ -54,17 +54,27 @@ test('§6-wire: the CORE workbook insert never names a provenance column', () =>
 test('§6-wire: the source fingerprint is captured over already-fetched rows', () => {
   const src = handlerSrc()
   assert.match(src, /\.select\('invoice_id,encrypted_payload,review_status,updated_at'\)/, 'reads updated_at for the revision')
-  assert.match(src, /const membershipHashHex = createHash\('sha256'\)[\s\S]*?\.invoice_id\)\.sort\(\)\.join/, 'membership is a sorted-id digest')
+  // §content-fingerprint — intentional re-pin of the old whole-set `membershipHashHex`.
+  // The membership value a workbook stores is now the fingerprint of the rows THAT file
+  // renders (per accounting category), because that is the only comparison which can
+  // prove a rebuild is a duplicate. It is the same sorted `id\u0000updated_at` key set,
+  // so an approval, correction or re-date still moves it.
+  assert.match(src, /const rowSourceKeys: string\[\] = \[\]/, 'a source key per rendered row is collected')
+  assert.match(src, /rowSourceKeys\.push\(/, 'the key is recorded in lockstep with the row')
+  assert.match(src, /fingerprintSourceKeys\(sourceKeysByCategory\.get\(category\)/, 'per-category membership is a sorted-key digest')
   assert.match(src, /const sourceRevision = createHash\('sha256'\)[\s\S]*?\.updated_at/, 'revision folds updated_at (detects edits/approvals)')
+  assert.match(src, /source_membership_hash: `\\\\x\$\{p\.fingerprint\}`/, 'the published file records its own fingerprint as bytea')
 })
 
 test('§6-wire: publish re-checks the source and refuses a mid-build change', () => {
   const src = handlerSrc()
   // re-reads the approved set right before retiring/publishing
   const recheckIdx = src.indexOf("select('invoice_id,updated_at')")
-  const freshnessIdx = src.indexOf('// Freshness: retire prior workbooks')
+  // The per-category refactor renamed the publish block to an explicit PHASE 3:
+  // insert-then-retire, so the marker here is the publish, not a loose comment.
+  const publishIdx = src.indexOf('// PHASE 3 \u2014 publish')
   assert.ok(recheckIdx > 0, 'the approved source set is re-read before publish')
-  assert.ok(freshnessIdx > 0 && recheckIdx < freshnessIdx, 'the re-check happens BEFORE the publish retire/version')
+  assert.ok(publishIdx > 0 && recheckIdx < publishIdx, 'the re-check happens BEFORE the publish insert/version/retire')
   // a genuine change is a NORMAL throw (requeue + rebuild), never a silent stale publish
   assert.match(src, /if \(curRevision !== sourceRevision\)[\s\S]*?throw new Error\('REGISTER_SOURCE_CHANGED/)
   assert.doesNotMatch(src, /REGISTER_SOURCE_CHANGED[\s\S]*?PermanentJobError/, 'a stale-source guard requeues; it is never a permanent failure')
@@ -76,8 +86,8 @@ test('§6-wire: provenance + retired_at writes are separate, guarded, fail-soft'
   const src = handlerSrc()
   // metadata is its own update (never folded into the core insert) and is guarded
   assert.match(src, /try \{[\s\S]*?\.update\(\{\s*source_dataset_revision: sourceRevision[\s\S]*?\} catch/, 'metadata write is guarded')
-  assert.match(src, /source_row_count: rows\.length/, 'rendered count is recorded')
-  assert.match(src, /workbook_checksum: `\\\\x\$\{workbookChecksumHex\}`/, 'plaintext checksum is stored as bytea')
+  assert.match(src, /source_row_count: p\.rowCount/, 'each category file records the count it actually rendered')
+  assert.match(src, /workbook_checksum: `\\\\x\$\{p\.checksumHex\}`/, 'each file\'s plaintext checksum is stored as bytea')
   assert.match(src, /logger\.warn\([^)]*workbook metadata columns skipped/, 'a failed metadata write is a warning, not a throw')
   // retired_at is a separate best-effort helper, called on BOTH retire paths
   assert.match(src, /async function markRetiredAt\([\s\S]*?\.update\(\{ retired_at: new Date\(\)/)
@@ -91,4 +101,57 @@ test('§6-wire: the guard relies on base-schema columns only (active pre-migrati
   // re-check queries extracted_records.updated_at — a column present in the initial
   // schema — so concurrency safety is live even before the additive migration runs.
   assert.match(src, /from\('extracted_records'\)\.select\('invoice_id,updated_at'\)[\s\S]*?\.eq\('review_status', 'approved'\)/)
+})
+
+test('§fingerprint: an unchanged register is never re-published, re-owed or re-sent', () => {
+  // Field symptom: several one-row Excel files for a month that had not moved. A rebuild
+  // whose per-category fingerprint matches the LIVE workbook is not new information.
+  const src = handlerSrc()
+  assert.match(src, /const liveFingerprints = await readLiveFingerprints\(db, workspaceId, batchId\)/, 'the live fingerprints are read before anything is built')
+  const detectIdx = src.indexOf('if (changedCategories.length === 0) {')
+  const buildIdx = src.indexOf('buildCategoryWorkbook(')
+  assert.ok(detectIdx > 0 && buildIdx > 0 && detectIdx < buildIdx,
+    'the unchanged verdict short-circuits BEFORE the expensive build/storage work')
+  const noOp = src.slice(detectIdx, src.indexOf('}', src.indexOf('return', detectIdx)) + 1)
+  assert.match(noOp, /logger\.info\('\[[^\]]*\] live register already matches/, 'the skip is logged, never silent')
+  assert.match(noOp, /return/, 'and the job completes without touching a row')
+  // PHASE 1 builds ONLY what moved; the outbox is owed ONLY what was published.
+  // Sliced to the build loop itself: `presentCategories` still legitimately drives the
+  // fingerprint verdict loop just above it.
+  const phase1 = src.slice(
+    src.indexOf('const pending: PendingPublish[] = []'),
+    src.indexOf('buildCategoryWorkbook(category, bucket)'),
+  )
+  assert.match(phase1, /for \(const category of changedCategories\) \{/, 'PHASE 1 builds only the categories that moved')
+  assert.doesNotMatch(phase1, /for \(const category of presentCategories\)/, 'PHASE 1 never rebuilds every category (the duplicate path)')
+  assert.match(src, /enqueueRegisterDeliveries\(db, workspaceId, batchId, published/, 'only published (changed) files are owed')
+})
+
+test('§fingerprint: a retained category keeps its live workbook; only rebuilt ones retire', () => {
+  const src = handlerSrc()
+  // The retire is per REBUILT category, so an unchanged category's live file stays
+  // downloadable instead of being expired alongside it.
+  assert.match(src, /for \(const category of changedCategories\) \{[\s\S]*?\.eq\('accounting_category', category\)[\s\S]*?\.lt\('version', newVersion\)\.in\('status', \['ready', 'sent'\]\)/, 'retire is scoped to the rebuilt category')
+  assert.match(src, /\.is\('accounting_category', null\)[\s\S]*?\.lt\('version', newVersion\)/, 'a pre-per-category legacy file is still superseded')
+  assert.doesNotMatch(src, /\.eq\('batch_id', batchId\)\s*\n\s*\.lt\('version', newVersion\)/, 'never a category-blind batch-wide retire')
+  // The no-op return happens BEFORE any retire, so an unchanged month cannot be made
+  // un-downloadable by its own rebuild.
+  const noOpIdx = src.indexOf('if (changedCategories.length === 0) {')
+  // The PUBLISH retire inside PHASE 3 (the helper defined above is the no-op/empty-batch
+  // retire, which is a different path and legitimately earlier in the file).
+  const retireIdx = src.indexOf(".update({ status: 'expired' })", src.indexOf('// PHASE 3'))
+  assert.ok(noOpIdx > 0 && retireIdx > noOpIdx, 'the unchanged short-circuit precedes any retire')
+})
+
+test('§fingerprint: an unprovable fingerprint always rebuilds (skips only proven duplicates)', () => {
+  const src = handlerSrc()
+  // The live read is best-effort: an error (or a missing additive column) yields an EMPTY
+  // map, which makes every category "changed" — the pre-fix behavior.
+  const body = src.slice(src.indexOf('async function readLiveFingerprints'), src.indexOf('async function findOwnerSenderHmac'))
+  assert.match(body, /if \(error\) return out/, 'a failed fingerprint read means rebuild everything')
+  assert.match(body, /if \(!cat \|\| out\.has\(cat\)\) continue/, 'a legacy NULL-category row never counts as a match')
+  assert.match(body, /if \(!hash \|\| typeof r\.source_row_count !== 'number'\) continue/, 'an unparseable/absent digest never proves sameness')
+  assert.match(body, /catch \{[\s\S]*?return out|fail OPEN/, 'a thrown read degrades to a full rebuild')
+  // And sameness requires BOTH the digest and the rendered row count.
+  assert.match(src, /live\.hash === fingerprint[\s\S]*?live\.rowCount === \(byCategory\.get\(category\)\?\.length \?\? -1\)/, 'rowCount is part of the verdict')
 })

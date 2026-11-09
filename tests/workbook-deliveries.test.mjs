@@ -20,6 +20,8 @@ const routeSrc = () => readFileSync(new URL('../app/api/whatsapp/route.ts', impo
 const workerSrc = () => readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
 const deliverSrc = () => readFileSync(new URL('../lib/exports/deliver.ts', import.meta.url), 'utf8')
 const registerSrc = () => readFileSync(new URL('../lib/jobs/handlers/build-register.ts', import.meta.url), 'utf8')
+const sendSrc = () => readFileSync(new URL('../lib/whatsapp/send.ts', import.meta.url), 'utf8')
+const finalizeSrc = () => readFileSync(new URL('../lib/whatsapp/finalize.ts', import.meta.url), 'utf8')
 
 // Executable SQL only (drop `--` comment lines) so prose never satisfies a check.
 const execSql = (s) => s.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n')
@@ -362,4 +364,136 @@ test('DELIVERY-14 build-register VERIFIES the object exists before marking a wor
   assert.ok(flat.includes('if (!verErr && !(seen ?? []).some((e) => (e as { name?: string }).name === objName))'),
     'a DEFINITE absence (list succeeded, name not present) is the only throw')
   assert.ok(!flat.includes('if (verErr) throw'), 'a list ERROR never throws (degrades soft, trusts the error-free upload)')
+})
+
+// ==========================================================================
+// 4) §one-file-per-month + §completion-push: the two field defects.
+//    (a) the owner received 4-5 copies of the SAME month, unprompted; and
+//    (b) the finished file did NOT arrive by itself — a second "Done" was needed.
+// ==========================================================================
+
+// Everything below reads the flush function's OWN body, so a helper defined
+// earlier in the file can never satisfy (or break) an ordering assertion.
+const flushBody = (s) => {
+  const start = s.indexOf('export async function flushPendingDeliveries')
+  const body = s.slice(start, s.indexOf('\n}\n', start))
+  assert.ok(body.length > 200, 'the flush body was located')
+  return body
+}
+
+test('DELIVERY-15 the flush HOLDS an intermediate register while the workspace still has live work', () => {
+  const s = consumerSrc()
+  const flush = flushBody(s)
+  // The gate must run BEFORE anything is claimed — a claimed row is already
+  // checked out, and holding after the claim would strand it in 'sending'.
+  const gate = flush.indexOf('hasOutstandingWork(db, workspaceId)')
+  const claim = flush.indexOf('claimDueDeliveries(db, senderHmac')
+  assert.ok(gate > -1 && claim > -1 && gate < claim, 'quiescence is decided before a single row is claimed')
+  assert.match(flush, /if \(workspaceId && await hasOutstandingWork\(db, workspaceId\)\)/, 'a workspace with work in flight sends nothing')
+  assert.match(flush, /waitedMs < DELIVERY_SUPPRESS_MAX_MS[\s\S]*?return 0/, 'while inside the hold window the flush returns 0 (rows stay pending)')
+  // Only genuinely-live statuses count; 'succeeded'/'failed' must not suppress.
+  assert.match(s, /\.in\('status', \['queued', 'processing'\]\)/, 'live = queued or processing only')
+  assert.match(s, /const DELIVERY_SUPPRESS_MAX_MS = \d+ \* 60 \* 1000/, 'the hold is a named, bounded window')
+})
+
+test('DELIVERY-16 the quiescence gate fails TOWARD DELIVERY in both directions', () => {
+  const s = consumerSrc()
+  // A count that errors must not silence the owner's finished file.
+  const work = s.slice(s.indexOf('async function hasOutstandingWork'), s.indexOf('async function oldestWaitMs'))
+  assert.match(work, /if \(error\) return false/, 'a failed "is anything running?" read answers NO work (deliver)')
+  // And an old row we cannot date must count as waiting forever, so the bounded
+  // override fires instead of holding indefinitely.
+  const wait = s.slice(s.indexOf('async function oldestWaitMs'), s.indexOf('export async function flushPendingDeliveries'))
+  assert.match(wait, /if \(error\) return Number\.POSITIVE_INFINITY/, 'a failed age read forces delivery')
+  assert.match(wait, /if \(!created\) return Number\.POSITIVE_INFINITY/, 'no pending row found is never read as "just arrived"')
+  // The override path exists and delivers rather than looping on the hold.
+  assert.match(flushBody(s), /flush override[\s\S]*?\)/, 'past the max hold the flush logs the override and continues')
+})
+
+test('DELIVERY-17 the coalescing rule is applied to what was CLAIMED, and dropped rows are parked — never re-queued', () => {
+  const s = consumerSrc()
+  const flush = flushBody(s)
+  assert.match(s, /from '@\/lib\/jobs\/handlers\/delivery-coalesce'/, 'the consumer uses the real, unit-tested rule (no in-file copy)')
+  const coalesceAt = flush.indexOf('newestPerScope(claimed, fields)')
+  const claimAt = flush.indexOf('claimDueDeliveries(db, senderHmac')
+  const sendAt = flush.indexOf('deliverWorkbookToWhatsApp(db, {')
+  assert.ok(claimAt < coalesceAt && coalesceAt < sendAt, 'claim -> collapse -> send only the winner')
+  // A dropped row must leave the claimable set: 'unknown' is terminal and is
+  // never auto-resent, so it cannot come back as a second copy next touch.
+  const park = flush.slice(flush.indexOf('for (const d of superseded)'), flush.indexOf('let delivered = 0'))
+  assert.match(park, /resolveDelivery\(db, d\.id, d\.claim_token, 'unknown'\)/, 'a superseded copy is parked under its own fence')
+  assert.ok(!/releaseDelivery/.test(park), 'it is never released back to pending/failed (that would re-spam the chat)')
+  assert.match(flush, /for \(const d of keep\)/, 'only the per-scope winner reaches the send boundary')
+})
+
+test('DELIVERY-18 the send boundary re-checks supersession, so a page limit cannot ship a stale register', () => {
+  const s = deliverSrc()
+  // Claiming is paged: an older version can be claimed WITHOUT its newer sibling
+  // being in the same page, so coalescing alone cannot protect the owner.
+  assert.match(s, /\.gt\('version', wb\.version\)/, 'a newer version for the same scope is looked for at send time')
+  assert.match(s, /\.eq\('workspace_id', wb\.workspace_id\)\.eq\('batch_id', wb\.batch_id\)/, 'the check is tenant- and batch-scoped')
+  assert.match(s, /scope\.is\('accounting_category', null\)/, 'a legacy NULL category uses IS NULL, never eq(null) which can never match')
+  assert.match(s, /outcome: 'skipped', providerDetail: 'superseded by a newer version'/, 'the stale row is skipped (parked unknown), not sent and not retried')
+  assert.match(s, /select\('workspace_id,batch_id,status,expires_at,file_object_path,file_encryption_key_version,accounting_category,period_start,version'\)/, 'the version is actually read (a guard on a column never selected is no guard)')
+})
+
+test('DELIVERY-19 a blocked send backs off in MINUTES and records the provider reason', () => {
+  const s = consumerSrc()
+  assert.match(s, /const BLOCKED_RETRY_SECONDS = 300/, 'an hour of silence on the owner\'s own file is not acceptable')
+  assert.ok(!/const BLOCKED_RETRY_SECONDS = 3600/.test(s), 'the old one-hour park is gone')
+  const flush = flushBody(s)
+  assert.match(flush, /releaseDelivery\(db, d\.id, d\.claim_token, BLOCKED_RETRY_SECONDS, errorNote\('SEND_BLOCKED', r\.providerDetail\)\)/,
+    'the blocked release persists WHY, not just THAT')
+  assert.match(flush, /errorNote\('SEND_TRANSIENT', r\.providerDetail\)/, 'a transient release records its reason too')
+  // The reason must originate at the provider call and survive to the row.
+  const send = sendSrc()
+  assert.match(send, /diagnosticsOut\.current = providerDetail\(res\.status, errorCode/, 'Meta\'s http status + error code are captured on a failed response')
+  assert.match(send, /function providerDetail\(/, 'a bounded, PII-free detail formatter exists')
+  assert.match(send, /'config missing \(token \/ phone id\)'/, 'a config block is distinguishable from a provider rejection')
+  const d = deliverSrc()
+  assert.match(d, /providerDetail: diagnosticsOut\.current/, 'the send detail is returned to the outbox')
+  assert.match(d, /providerDetail: `upload: \$\{detail\}`/, 'a media-upload fault names its own stage')
+})
+
+test('DELIVERY-20 there is exactly ONE register send path, and it is the outbox', () => {
+  const route = routeSrc()
+  assert.ok(!/deliverRegisterDocuments/.test(route), 'the parallel direct ready-sweep is gone')
+  assert.ok(!/counts\.readyWorkbookIds\)/.test(route), 'no command hands the whole ready list to a sender')
+  assert.match(route, /const delivered = await deliverOwedRegisters\(\);/, 'Done/Review go through the single flush')
+  // Both commands must use it, or Review re-creates the duplicate-file bug.
+  const calls = [...route.matchAll(/await deliverOwedRegisters\(\)/g)].length
+  assert.equal(calls, 2, 'Done AND Review share the one path (2 call sites)')
+  assert.match(route, /flushPendingDeliveries\(db, hmac, to\)/, 'that path is the durable consumer')
+  assert.match(route, /register outbox flush/, 'the flush outcome is logged per inbound')
+})
+
+test('DELIVERY-21 the completion push is consent-gated, post-settlement, and never self-blocked', () => {
+  const s = consumerSrc()
+  const push = s.slice(s.indexOf('export async function pushReadyRegistersForWorkspace'), s.indexOf('export async function sweepDueDeliveries'))
+  assert.match(push, /if \(await hasOutstandingWork\(db, workspaceId\)\) return 0/, 'nothing is pushed while the workspace is still working')
+  assert.match(push, /canProactivelyPush\(\{ consent: id\.consent, lastActivityMs: id\.lastActivityMs \}\)/, 'a business-initiated send requires the owner opt-in + the 24h window')
+  assert.match(push, /const to = openWaId\(id\.sealed\)\s*\n\s*if \(!to\) return 0/, 'and only a sealed number that still opens')
+  assert.match(push, /catch \(e\) \{[\s\S]*?return 0/, 'any fault in the push is swallowed and the row stays owed')
+  assert.ok(!/logger\.\w+\([^)]*\bto\b/.test(push), 'the opened phone is never logged')
+  // The push is wired AFTER a job settles: a build that pushed for itself would
+  // count its own 'processing' row as outstanding work and no-op forever.
+  const register = registerSrc()
+  assert.ok(!/pushReadyRegistersForWorkspace\(/.test(register), 'the register handler does not push while it is still the live queue row')
+  const worker = workerSrc()
+  const completeAt = worker.indexOf('const owned = await completeJob(db, job.id, worker)')
+  const pushAt = worker.indexOf('await pushReadyRegistersForWorkspace(db, job.workspace_id)')
+  assert.ok(completeAt > -1 && pushAt > completeAt, 'the worker pushes only once the job has actually completed')
+  assert.match(worker, /if \(owned\) \{[\s\S]*?result\.completed \+= 1[\s\S]*?await pushReadyRegistersForWorkspace/, 'a fenced (lost-lease) completion does not push')
+  assert.match(worker, /await sweepDueDeliveries\(db\)/, 'each tick also sweeps what is due (backoff retries + out-of-window rows)')
+})
+
+test('DELIVERY-22 the Done handover sentence matches what will actually happen', () => {
+  const f = finalizeSrc()
+  assert.match(f, /opts\?: \{ link\?: string \| null; delivered\?: boolean; pushOk\?: boolean; pushOffer\?: boolean \}/, 'the composer knows the real push posture')
+  assert.match(f, /opts\?\.pushOk\s*\n?\s*\? " I'll send your Excel register here as soon as it's ready\."/, 'an opted-in owner is promised the push we can perform')
+  assert.match(f, /: opts\?\.pushOffer[\s\S]*?Proactive on[\s\S]*?: " Send Done again once processing finishes/, 'the three real states are stated as a chain, never as one unconditional promise')
+  assert.match(f, /Send Done again once processing finishes/, 'without a push, the owner is told what to do instead of waiting for nothing')
+  const route = routeSrc()
+  assert.match(route, /const \{ pushOk, pushOffer \} = await proactivePushState\(\);/, 'the route computes the posture from the same gate it would send through')
+  assert.match(route, /composeDoneMessage\(counts, \{ link, delivered: delivered > 0, pushOk, pushOffer \}\)/, 'and passes it into the reply')
 })

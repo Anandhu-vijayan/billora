@@ -646,8 +646,9 @@ export function evaluateLedger(
 
   // §UX multi-rate: an EXPLICIT multi-slab bill (two or more distinct printed
   // rates) cannot be checked with one flat per-head rate, so flag it here and skip
-  // the single-rate cross-check below. Only explicit slices count — the vision
-  // schema is flat, so an ordinary single-rate bill still runs the check. The
+  // the single-rate cross-check below. Only explicit slices count — a printed
+  // rate-wise summary (local parser) or an AI rate-wise breakdown (vision
+  // `tax_slices`) — so an ordinary single-rate bill still runs the check. The
   // mixed-slice breakdown validator + the total invariant still guard its amounts.
   const rateCheckSlices = normalizeSlices(candidate.tax_slices)
   const multiRate = rateCheckSlices !== null && distinctTaxRates(rateCheckSlices).length >= 2

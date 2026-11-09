@@ -162,31 +162,89 @@ function findGstin(
 
 const VENDOR_SUFFIX =
   /\b(pvt\.?\s*ltd\.?|private limited|limited|ltd\.?|llp|traders|company|co\.|corp(?:oration)?|enterprises|solutions|services|stores|works|mills|firm|trust)\b/i
-const VENDOR_LABEL = /\b(supplier|seller|vendor|from|billed by|invoice from)\b/i
+/**
+ * A WEAKER second tier of trading-house words that appear in a firm name but also
+ * in ordinary item prose ("office supplies", "freight agencies"). Used ONLY when
+ * no strong suffix matched, and only for a line shaped like a NAME — no digits (an
+ * item / amount row always carries numbers) and no tax-table vocabulary — so
+ * widening the vocabulary cannot turn a table row into a supplier name.
+ */
+const VENDOR_SUFFIX_WEAK =
+  /\b(supplies|associates|agencies|merchants|distributors|ventures|industries)\b/i
+const VENDOR_LABEL = /\b(supplier|seller|vendor|from|billed by|invoice from|sold by)\b/i
+// §supplier/recipient: the BUYER block is never the supplier. A registered-firm
+// suffix (Enterprises / Traders / Pvt Ltd) is carried by the CUSTOMER's name just
+// as often as the supplier's, so a suffix match alone cannot decide the party —
+// it must first be outside the "Bill To" region. Taking the buyer's line as the
+// supplier name silently mislabels every row of the purchase register.
+const BUYER_LABEL = /\b(bill(?:ed)?\s*to|buyer|purchaser|customer|recipient|consignee|ship(?:ped)?\s*to|delivered\s*to|sold\s*to)\b/i
+/** A buyer region BEGINS at its own heading line ("Bill To:", "Buyer", "To:"). */
+const BUYER_HEADING = /^[^A-Za-z]*\b(bill(?:ed)?\s*to|buyer|purchaser|customer|recipient|consignee|ship(?:ped)?\s*to|delivered\s*to|to)\b/i
+/** ...and ENDS at a supplier heading or the tax/item table section. */
+const TAX_TABLE_SECTION = /\b(hsn|sac|sl\.?\s*(?:no|no\.)|description|quantity|qty|taxable\s*(?:value|amount|qty)?|assessable|cgst|sgst|igst|cess|discount|round\s*off|grand\s*total|total\b|net\s+(?:payable|amount)|amount\s+(?:in\s+)?(?:words|due)|freight|carriage)\b/i
+
+/**
+ * The NAME a supplier label carries, with the label (and any trailing GSTIN/
+ * address tail) removed: `Sold By: Acme Traders Pvt Ltd` -> `Acme Traders Pvt
+ * Ltd`. A label standing on its own with nothing usable after it returns null,
+ * so the caller keeps the raw line rather than shipping an empty name.
+ */
+function stripVendorLabel(line: string): string | null {
+  const after = line
+    .replace(VENDOR_LABEL, '')
+    .replace(/[:\s]+/g, ' ')
+    .replace(/(GSTIN|GST|UIN|Address|Date).*/i, '')
+    .trim()
+  return after.length >= 2 && after.length <= 80 ? after : null
+}
 
 /**
  * Pick the supplier name. We work LINE BY LINE so a name can never swallow a
  * newline (PDF text items are joined with \n). A line that reads like a
  * registered-firm name (carries a legal suffix) is a strong hit; a line that is
- * just "Supplier: <text>" is a weaker one. Never fabricate: no line matches ->
- * the field stays absent and ledger.ts routes to review.
+ * just "Supplier: <text>" is a weaker one. Lines inside the buyer ("Bill To")
+ * region are refused outright — a buyer name is never a supplier name. Never
+ * fabricate: no line matches -> the field stays absent and ledger.ts routes to
+ * review (a missing supplier is recoverable by one chat correction, a swapped
+ * one ships silently in the register).
  */
 function findVendor(text: string): { value: string; confidence: number } | null {
   const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
   let labelled: { value: string; confidence: number } | null = null
+  let tradingHouse: string | null = null
+  let inBuyerBlock = false
   for (const line of lines) {
     if (line.toUpperCase().includes('GSTIN') || line.toUpperCase().includes('UIN')) continue
+    // Track the buyer region: everything from a "Bill To"/"Buyer"/"To:" heading
+    // until a supplier heading or the tax table belongs to the CUSTOMER.
+    if (BUYER_HEADING.test(line)) { inBuyerBlock = true; continue }
+    if (inBuyerBlock) {
+      if (VENDOR_LABEL.test(line) || TAX_TABLE_SECTION.test(line)) inBuyerBlock = false
+      else continue
+    }
+    // A line that itself names a recipient role is buyer-side wherever it prints.
+    if (BUYER_LABEL.test(line)) continue
     if (VENDOR_SUFFIX.test(line) && line.length <= 80) {
-      // Prefer the labeled supplier line when it also carries the suffix.
-      if (VENDOR_LABEL.test(line)) return { value: line, confidence: CONF_STRONG }
+      // Prefer the labeled supplier line when it also carries the suffix — recorded
+      // WITHOUT its own label, so the register reads `Acme Traders Pvt Ltd` and not
+      // `Sold By: Acme Traders Pvt Ltd`.
+      if (VENDOR_LABEL.test(line)) {
+        return { value: stripVendorLabel(line) ?? line, confidence: CONF_STRONG }
+      }
       if (!labelled) labelled = { value: line, confidence: CONF_STRONG }
     }
     if (!labelled && VENDOR_LABEL.test(line)) {
-      const after = line.replace(VENDOR_LABEL, '').replace(/[:\s]+/g, ' ').replace(/(GSTIN|GST|UIN|Address|Date).*/i, '').trim()
-      if (after.length >= 2 && after.length <= 80) labelled = { value: after, confidence: CONF_WEAK }
+      const after = stripVendorLabel(line)
+      if (after) labelled = { value: after, confidence: CONF_WEAK }
+    }
+    // Last-resort tier: a name-shaped trading-house line, kept only if nothing
+    // stronger turned up anywhere on the page.
+    if (!tradingHouse && line.length <= 80 && !/\d/.test(line)
+      && !TAX_TABLE_SECTION.test(line) && VENDOR_SUFFIX_WEAK.test(line)) {
+      tradingHouse = line
     }
   }
-  return labelled
+  return labelled ?? (tradingHouse ? { value: tradingHouse, confidence: CONF_WEAK } : null)
 }
 
 /**

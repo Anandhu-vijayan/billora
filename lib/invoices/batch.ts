@@ -163,7 +163,10 @@ export async function resolveInvoiceBatch(
         if (moveErr || !moved) throw new Error(`BATCH_ENSURE_ERROR: ${moveErr?.message ?? 'no batch id'}`)
         batchId = String(moved)
         await args.assertLease?.()
-        const { error: relinkErr } = await db.from('invoices').update({ batch_id: batchId })
+        // §register-scope: keep the cross-batch scope key in lock-step with the
+        // batch link — both are derived from the SAME reliably-parsed date, so an
+        // invoice can never sit in a batch whose period disagrees with its month.
+        const { error: relinkErr } = await db.from('invoices').update({ batch_id: batchId, invoice_month: iso.slice(0, 7) })
           .eq('workspace_id', workspaceId).eq('id', invoiceId)
         if (relinkErr) throw new Error(`BATCH_LINK_ERROR: ${relinkErr.message}`)
         // Rebuild the destination period AND the abandoned one — both changed.
@@ -182,7 +185,9 @@ export async function resolveInvoiceBatch(
     if (batchError || !batch) throw new Error(`BATCH_ENSURE_ERROR: ${batchError?.message ?? 'no batch id'}`)
     batchId = String(batch)
     await args.assertLease?.()
-    const { error: linkErr } = await db.from('invoices').update({ batch_id: batchId })
+    // §register-scope: stamp the canonical accounting month alongside the batch link
+    // (both from `iso`, so the cross-batch scope gather always agrees with the batch).
+    const { error: linkErr } = await db.from('invoices').update({ batch_id: batchId, invoice_month: iso.slice(0, 7) })
       .eq('workspace_id', workspaceId).eq('id', invoiceId)
     if (linkErr) throw new Error(`BATCH_LINK_ERROR: ${linkErr.message}`)
   }

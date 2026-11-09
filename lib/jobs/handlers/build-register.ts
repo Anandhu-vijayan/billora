@@ -1,8 +1,9 @@
 // lib/jobs/handlers/build-register.ts — register_generation job handler.
 //
 // Builds one batch's GSTR-2B purchase register from its APPROVED extracted
-// rows, stores the workbook privately, and records a handoff so the register is
-// delivered to the owner's chat as an Excel document on their next inbound reply
+// rows, stores the workbook privately, and records a durable outbox row per file
+// so the delivery consumer can hand it to the owner's chat — pushed at completion
+// when the owner opted into proactive delivery, otherwise on their next inbound
 // (best-effort). It never claims delivery it did not achieve (rule 6) and a
 // failed send never fails the job (rule 5).
 //
@@ -35,13 +36,17 @@ import {
   type TallyImportRowInput,
 } from '@/lib/excel/generator'
 import { resolveLedgerName, resolveSliceLedgerName, tallyDefaultLedgerName, type TallyLedgerMapping } from '@/lib/tally/ledger-mapping'
+// §content-fingerprint: the exact-content rule that decides whether a rebuild is new
+// information lives in its own dependency-free module so the publisher and the tests
+// execute the SAME code.
+import { fingerprintSourceKeys, parseStoredFingerprint } from '@/lib/jobs/handlers/register-fingerprint'
 import { deriveSlicesFromInvoiceHeads, isMixedRate, normalizeSlices, validateTaxSlices, type InvoiceTaxSlice } from '@/lib/ocr/tax-slices'
 // §delivery-decoupling: build-register now records a DURABLE outbox row per
 // workbook and never touches whatsapp_sessions.pending_reply_body (the old single
 // slot whose lost-update race dropped a concurrent month's register). The actual
 // send lives in the delivery consumer (lib/jobs/handlers/deliver-register.ts), so
 // a register's generation is fully independent of its delivery outcome.
-import { categoryFileToken } from '@/lib/exports/naming'
+import { categoryFileToken, monthToken } from '@/lib/exports/naming'
 import { enqueueWorkbookDelivery } from '@/lib/whatsapp/delivery-outbox'
 import type { LedgerRow } from '@/lib/ocr/ledger'
 
@@ -102,6 +107,42 @@ async function markRetiredAt(db: Db, workspaceId: string, batchId: string): Prom
   } catch {
     // provenance must never block a retire that already made the register stale.
   }
+}
+
+/**
+ * The batch's LIVE per-category content fingerprints, keyed by accounting category.
+ * An EMPTY map (or a missing entry) means "cannot prove sameness", so the category is
+ * rebuilt exactly as before — a missing provenance migration, an unreadable bytea form
+ * or a legacy NULL-category row can never suppress a legitimate register.
+ */
+async function readLiveFingerprints(
+  db: Db, workspaceId: string, batchId: string,
+): Promise<Map<string, { hash: string; rowCount: number }>> {
+  const out = new Map<string, { hash: string; rowCount: number }>()
+  try {
+    const { data, error } = await db.from('generated_workbooks')
+      .select('accounting_category,version,source_membership_hash,source_dataset_revision,source_row_count')
+      .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+      .in('status', ['ready', 'sent']).order('version', { ascending: false }).limit(40)
+    if (error) return out
+    for (const r of (data ?? []) as Array<{
+      accounting_category: string | null; source_membership_hash: string | null
+      source_dataset_revision: string | null; source_row_count: number | null
+    }>) {
+      const cat = r.accounting_category
+      if (!cat || out.has(cat)) continue // newest version per category wins (ordered desc)
+      // Either stored fingerprint form proves sameness: the per-category membership
+      // hash, or (for a single-category month) the whole-set dataset revision, which is
+      // the identical key construction. Unknown/unparseable -> no entry -> a rebuild.
+      const hash = parseStoredFingerprint(r.source_membership_hash)
+        || parseStoredFingerprint(r.source_dataset_revision)
+      if (!hash || typeof r.source_row_count !== 'number') continue
+      out.set(cat, { hash, rowCount: r.source_row_count })
+    }
+  } catch {
+    // fail OPEN: no fingerprints -> a full rebuild, the pre-fix behaviour.
+  }
+  return out
 }
 
 /** The WhatsApp sender identity that owns a workspace (for reply linkage). */
@@ -240,10 +281,25 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 
   // Tenant check first: the batch must belong to this job's workspace.
   const { data: batchRow, error: batchErr } = await db
-    .from('invoice_batches').select('id,workspace_id,status')
+    .from('invoice_batches').select('id,workspace_id,status,client_id,period_start,period_end')
     .eq('workspace_id', workspaceId).eq('id', batchId).maybeSingle()
   if (batchErr) throw new Error(`BATCH_READ_ERROR: ${batchErr.message}`)
   if (!batchRow) throw new PermanentJobError('REGISTER_BATCH_NOT_FOUND')
+  // §register-scope: the batch is the SCOPE ANCHOR, not the source of truth. The
+  // intended register scope is (workspace, client, month) — the month is the batch's
+  // period rendered as a canonical YYYY-MM, the client is the batch's own client (null
+  // = the individual, client-less tenant). We then GATHER every approved invoice for
+  // that scope ACROSS batches and VALIDATE each invoice's own decrypted date against
+  // the month before it ships, so a mis-tagged batch_id can neither drop an invoice
+  // out of its month nor pull a foreign-month invoice in. An unresolvable period
+  // (legacy batch with no period_start) keeps the batch-anchored gather + the generic
+  // filename — we never stamp a guessed month.
+  const batch = batchRow as {
+    id: string; workspace_id: string; status: string | null
+    client_id: string | null; period_start: string | null; period_end: string | null
+  }
+  const scopeMonth = monthToken(batch.period_start)
+  const scopeClientId = batch.client_id ?? null
 
   // Batch readiness gate. Extraction schedules this job unconditionally (so no
   // batch is ever left unscheduled by a finish-together race); this is the
@@ -262,7 +318,34 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     .from('invoices').select('id')
     .eq('workspace_id', workspaceId).eq('batch_id', batchId).neq('status', 'deleted')
   if (invErr) throw new Error(`BATCH_INVOICES_ERROR: ${invErr.message}`)
-  const invoiceIds = (invoiceRows ?? []).map((r) => (r as { id: string }).id)
+  // Start from the batch's own membership (always has batch_id, so a row whose
+  // invoice_month was never backfilled is never lost), then UNION the cross-batch
+  // scope gather so a correctly-dated invoice filed under a DIFFERENT batch_id this
+  // same month still rides into this register. Readiness + review accounting below
+  // operate on this union, so a foreign-month stray can't be built while its own
+  // extraction is still in flight. Every candidate is then re-validated against its
+  // decrypted date before it renders, so adding a scope candidate here can only ever
+  // pull in an invoice that truly belongs to this month.
+  const scopeIdSet = new Set<string>((invoiceRows ?? []).map((r) => (r as { id: string }).id))
+  if (scopeMonth) {
+    const scopeBase = db
+      .from('invoices').select('id')
+      .eq('workspace_id', workspaceId).eq('invoice_month', scopeMonth).neq('status', 'deleted')
+    const { data: scopeRows, error: scopeErr } = await (scopeClientId === null
+      ? scopeBase.is('client_id', null)
+      : scopeBase.eq('client_id', scopeClientId))
+    // A scope-index read failure degrades SOFT to the batch-anchored set: the batch
+    // gather above already gives a correct (if possibly narrower) register, and we
+    // would rather ship the batch's own month than fail the job on an additive read.
+    if (scopeErr) {
+      logger.warn('[Register] cross-batch scope gather unavailable; using batch membership', {
+        batchId, code: scopeErr.code ?? 'unknown',
+      })
+    } else {
+      for (const r of (scopeRows ?? []) as Array<{ id: string }>) scopeIdSet.add(r.id)
+    }
+  }
+  const invoiceIds = [...scopeIdSet]
 
   const { count: outstandingByBatch, error: outErr } = await db
     .from('processing_jobs').select('id', { count: 'exact', head: true })
@@ -304,23 +387,46 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
 
   // §6 capture the EXACT approved source fingerprint BEFORE the (potentially slow)
   // build so publish can prove nothing a reviewer changed mid-build ships as
-  // current. `membershipHash` is a one-way SHA-256 of the SORTED approved invoice-id
-  // set (never the ids -> no new PII); `sourceRevision` additionally folds each
-  // record's updated_at, so an approval/rejection/correction/re-date is detected.
-  // Both are computed over already-fetched rows (no extra round-trip) using ONLY
-  // base-schema columns, so the concurrency re-check works even before the additive
-  // metadata migration is applied.
+  // current. `sourceRevision` folds each record's invoice id with its own updated_at,
+  // so an approval/rejection/correction/re-date is detected, and the same key set is
+  // what the per-category `source_membership_hash` fingerprint is built from (see
+  // §no-op-when-unchanged). Both are computed over already-fetched rows (no extra
+  // round-trip) using ONLY base-schema columns, so the concurrency re-check works even
+  // before the additive metadata migration is applied. No invoice number, no amount,
+  // no row content is ever encoded.
   const recList = (records ?? []) as Array<{ invoice_id: string; updated_at?: string | null }>
-  const membershipHashHex = createHash('sha256')
-    .update(recList.map((r) => r.invoice_id).sort().join('\n')).digest('hex')
   const sourceRevision = createHash('sha256')
     .update(recList.map((r) => `${r.invoice_id}\u0000${r.updated_at ?? ''}`).sort().join('\n')).digest('hex')
 
   const rows: Array<LedgerRow & { _classification?: { accountingCategory?: unknown; itcEligibility?: unknown } }> = []
-  for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown }>) {
+  // §content-fingerprint: one key per RENDERED row — the invoice id plus that record's
+  // own `updated_at`, so an approval, rejection, correction or re-date always moves it.
+  // Pushed in lockstep with `rows` (an excluded or undecryptable record adds neither),
+  // and hashed per category into a fingerprint: an id/amount-free value that proves a
+  // rebuild would produce byte-for-byte the register the owner already has.
+  const rowSourceKeys: string[] = []
+  let excludedWrongMonth = 0
+  for (const rec of (records ?? []) as Array<{ invoice_id: string; encrypted_payload: unknown; updated_at?: string | null }>) {
     try {
       const plain = decryptExtractedPayload(byteaToBuffer(rec.encrypted_payload), masterKeyHex)
-      rows.push(JSON.parse(plain) as LedgerRow & { _classification?: { accountingCategory?: unknown; itcEligibility?: unknown } })
+      const row = JSON.parse(plain) as LedgerRow & { _classification?: { accountingCategory?: unknown; itcEligibility?: unknown } }
+      // §register-scope: validate the invoice's OWN decrypted date against the scope
+      // month before it can render. The stored, decrypted date is the authority — a
+      // row whose canonical invoice_date falls in a different month is EXCLUDED, so a
+      // mis-tagged batch_id or stale invoice_month can never file it into the wrong
+      // register. When the scope is unresolvable (legacy batch, no period_start) we
+      // cannot validate, so every approved row renders as before — never drop data
+      // over a missing anchor.
+      const rowMonth = monthToken(typeof row.invoice_date === 'string' ? row.invoice_date : null)
+      if (scopeMonth && rowMonth !== scopeMonth) {
+        excludedWrongMonth += 1
+        logger.warn('[Register] excluding approved invoice outside the scope month', {
+          batchId, jobId: job.id, invoice: rec.invoice_id.slice(0, 8), scopeMonth, actualMonth: rowMonth,
+        })
+        continue
+      }
+      rows.push(row)
+      rowSourceKeys.push(`${rec.invoice_id}\u0000${rec.updated_at ?? ''}`)
     } catch (e) {
       // A corrupt stored payload is unexpected, but never emit a partial/garbage
       // workbook: skip that one row and record it. The batch still ships cleanly.
@@ -328,6 +434,11 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
         invoice: rec.invoice_id.slice(0, 8), error: e instanceof Error ? e.message : String(e),
       })
     }
+  }
+  if (excludedWrongMonth > 0) {
+    logger.info('[Register] scope validation dropped out-of-month invoices', {
+      batchId, jobId: job.id, scopeMonth, excluded: excludedWrongMonth, kept: rows.length,
+    })
   }
 
   if (rows.length === 0) {
@@ -430,10 +541,15 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   // deterministic order. The queue's one-live-register-job-per-batch invariant is
   // the scope lock, so two generations of the same month never overlap.
   const byCategory = new Map<string, RegisterInvoiceInput[]>()
-  for (const inv of invoices) {
+  const sourceKeysByCategory = new Map<string, string[]>()
+  for (let i = 0; i < invoices.length; i++) {
+    const inv = invoices[i]
     const cat = normalizeRegisterCategory(inv.accountingCategory)
     const bucket = byCategory.get(cat)
     if (bucket) bucket.push(inv); else byCategory.set(cat, [inv])
+    const keys = sourceKeysByCategory.get(cat)
+    const key = rowSourceKeys[i] ?? ''
+    if (keys) keys.push(key); else sourceKeysByCategory.set(cat, [key])
   }
   const presentCategories = REGISTER_CATEGORY_ORDER.filter((c) => byCategory.has(c))
   const bucketedCount = presentCategories.reduce((n, c) => n + (byCategory.get(c)?.length ?? 0), 0)
@@ -442,10 +558,43 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     // invoice fall outside the buckets must never silently drop it from a register.
     throw new Error(`REGISTER_BUCKET_ERROR: ${invoices.length - bucketedCount} invoice(s) fell outside the category buckets`)
   }
+  // §no-op-when-unchanged: a category whose exact-content fingerprint matches the LIVE
+  // workbook is not new information. Re-publishing it used to mint a fresh version, a
+  // fresh owed delivery and a FRESH COPY of the identical file in the owner's chat — the
+  // field symptom of the same one-row register arriving several times for a month that
+  // had not changed. Only categories that actually moved are rebuilt, re-published and
+  // re-owed; an unchanged one keeps its live workbook, its stored file and its already
+  // recorded delivery. The fingerprint folds each row's `updated_at`, so a correction or
+  // a re-approval always rebuilds, and an unavailable fingerprint always rebuilds too:
+  // this gate can only ever skip a duplicate, never a change.
+  const liveFingerprints = await readLiveFingerprints(db, workspaceId, batchId)
+  const changedCategories: string[] = []
+  const retainedCategories: string[] = []
+  for (const category of presentCategories) {
+    const fingerprint = fingerprintSourceKeys(sourceKeysByCategory.get(category) ?? [])
+    const live = liveFingerprints.get(category)
+    const unchanged = !!live
+      && live.hash === fingerprint
+      && live.rowCount === (byCategory.get(category)?.length ?? -1)
+    if (unchanged) retainedCategories.push(category); else changedCategories.push(category)
+  }
+  if (changedCategories.length === 0) {
+    logger.info('[Register] live register already matches the approved source; nothing re-published', {
+      batchId, jobId: job.id, categories: retainedCategories.length, rowCount: rows.length,
+    })
+    // No new version, no new owed delivery, no duplicate file — and NO retire: the
+    // register the owner can already download stays live and untouched.
+    return
+  }
+  if (retainedCategories.length > 0) {
+    logger.info('[Register] unchanged category kept live; rebuilding only what moved', {
+      batchId, jobId: job.id, retained: retainedCategories.length, rebuilt: changedCategories.length,
+    })
+  }
   const exportsBucket = bucketFor('exports')
   logger.info('[Register] ledger mapping resolved', {
     batchId, jobId: job.id, mapped, mappingRequired, unresolvedRate,
-    categories: presentCategories.length,
+    categories: changedCategories.length,
   })
 
   // PHASE 1 — build + validate + encrypt + upload EVERY category file before any
@@ -453,11 +602,11 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
   // current live register fully intact (a failed generation never discards or
   // retires the last valid workbook). No row data is ever logged.
   type PendingPublish = {
-    category: string; sheetName: string; rowCount: number;
+    category: string; sheetName: string; rowCount: number; fingerprint: string;
     exportPath: string; sizeBytes: number; keyVersion: string; checksumHex: string;
   }
   const pending: PendingPublish[] = []
-  for (const category of presentCategories) {
+  for (const category of changedCategories) {
     const bucket = byCategory.get(category) ?? []
     const sheetName = registerSheetNameForCategory(category)
     const catImportCount = bucket.reduce((n, inv) => n + inv.importRows.length, 0)
@@ -494,7 +643,11 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     if (!verErr && !(seen ?? []).some((e) => (e as { name?: string }).name === objName)) {
       throw new Error('WORKBOOK_OBJECT_VERIFY_ERROR: uploaded object not present after write; requeue to re-upload')
     }
-    pending.push({ category, sheetName, rowCount: bucket.length, exportPath, sizeBytes: enc.sizeBytes, keyVersion: enc.keyVersion, checksumHex })
+    pending.push({
+      category, sheetName, rowCount: bucket.length,
+      fingerprint: fingerprintSourceKeys(sourceKeysByCategory.get(category) ?? []),
+      exportPath, sizeBytes: enc.sizeBytes, keyVersion: enc.keyVersion, checksumHex,
+    })
   }
   logger.info('[Register] category workbooks built & stored', {
     batchId, jobId: job.id, files: pending.length, rowCount: rows.length,
@@ -543,6 +696,13 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     const { data: inserted, error: gwErr } = await db.from('generated_workbooks').insert({
       workspace_id: workspaceId, batch_id: batchId, file_object_path: p.exportPath,
       accounting_category: p.category,
+      // §register-scope: the file carries the VALIDATED period it was built for (the
+      // scope month every included invoice was confirmed to fall in), NOT a value the
+      // reader later copies from the batch. When the scope month is unresolvable we
+      // store NULL so the download/delivery/Done readers fall back to the batch period
+      // exactly as before — a filename is only ever stamped from a period we validated.
+      period_start: scopeMonth ? (batch.period_start ? String(batch.period_start).slice(0, 10) : null) : null,
+      period_end: scopeMonth ? (batch.period_end ? String(batch.period_end).slice(0, 10) : null) : null,
       file_encryption_key_version: p.keyVersion, size_bytes: p.sizeBytes,
       status: 'ready', version: newVersion, generated_at: new Date().toISOString(), expires_at: expiresAt,
     }).select('id').single()
@@ -557,7 +717,10 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
       const { error: metaErr } = await db.from('generated_workbooks').update({
         source_dataset_revision: sourceRevision,
         source_row_count: p.rowCount,
-        source_membership_hash: `\\x${membershipHashHex}`,
+        // §content-fingerprint: the exact-content fingerprint of THIS category's
+        // bucket, so the next generation of the same month can prove sameness and skip
+        // re-publishing (and re-sending) a register that has not changed.
+        source_membership_hash: `\\x${p.fingerprint}`,
         workbook_checksum: `\\x${p.checksumHex}`,
       }).eq('workspace_id', workspaceId).eq('id', workbookId)
       if (metaErr) {
@@ -570,11 +733,23 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
     }
   }
 
-  // NOW supersede the prior versions (never the rows just written).
+  // NOW supersede the prior versions of the categories we REBUILT — never the rows
+  // just written, and never a category retained as unchanged (its live workbook stays
+  // live, still downloadable, and its already-recorded delivery is not re-owed).
   await assertLease()
+  for (const category of changedCategories) {
+    await db.from('generated_workbooks')
+      .update({ status: 'expired' })
+      .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+      .eq('accounting_category', category)
+      .lt('version', newVersion).in('status', ['ready', 'sent'])
+  }
+  // A register published before the per-category split carries a NULL category; any
+  // publish of the month supersedes that legacy file so it can never be served again.
   await db.from('generated_workbooks')
     .update({ status: 'expired' })
     .eq('workspace_id', workspaceId).eq('batch_id', batchId)
+    .is('accounting_category', null)
     .lt('version', newVersion).in('status', ['ready', 'sent'])
   await markRetiredAt(db, workspaceId, batchId)
 
@@ -622,6 +797,10 @@ async function enqueueRegisterDeliveries(
           workbookId, batchId, jobId, category, rowCount,
         })
     }
+    // The register is now owed, not sent. The hand-over itself belongs to the
+    // delivery consumer, which pushes it once THIS job has settled (a build cannot
+    // judge "the queue is quiet" while it is still the queue's own live row) — see
+    // pushReadyRegistersForWorkspace, called from the worker after completion.
   } catch (e) {
     // Delivery is orthogonal to generation; swallow so the job still completes.
     logger.warn('[Register] SEND_DEFERRED: delivery enqueue failed', {

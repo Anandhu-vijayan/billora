@@ -34,8 +34,8 @@ import { wakeWorker } from '@/lib/jobs/wake';
 // store seals/clears the owner's wa_id under the SEPARATE proactive key. Consent is
 // only ever persisted when BOTH the feature flag AND the key are configured, and the
 // raw number is never logged on any path.
-import { proactiveDeliveryEnabled, proactiveKeyConfigured } from '@/lib/whatsapp/proactive';
-import { setProactiveConsent } from '@/lib/whatsapp/proactive-store';
+import { proactiveDeliveryEnabled, proactiveKeyConfigured, canProactivelyPush } from '@/lib/whatsapp/proactive';
+import { setProactiveConsent, loadProactiveIdentity, openWaId } from '@/lib/whatsapp/proactive-store';
 import { suggestOwnGstin } from '@/lib/invoices/own-gstin-suggest';
 import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
 import { flushPendingDeliveries } from '@/lib/jobs/handlers/deliver-register';
@@ -393,22 +393,25 @@ async function handleOnboardingSideEffects(
     else await updateSessionDeliveryState(db, hmac, { pending_reply_body: body, last_reply_error_code: o });
     track(o);
   };
-  // Deliver the owner's completed register(s) into THIS chat as documents. The
-  // web link path is unreachable for a WhatsApp-only user (no login exists), so
-  // the promised "sent here" means the file itself. Idempotent: a workbook is
-  // only pushed while status='ready' and flips to 'sent' after a confirmed send,
-  // so repeated Done/Review never re-sends. Returns how many are in the chat.
-  // Each push gets a correlation log (§delivery audit): which exact workbook
-  // landed for this sender, so a wrong-month report is traceable to one row.
-  const deliverRegisterDocuments = async (workbookIds: string[]): Promise<number> => {
-    let delivered = 0;
-    for (const id of workbookIds.slice(0, 5)) {
-      const r = await deliverWorkbookToWhatsApp(db, { workbookId: id, to });
-      if (r.delivered) delivered += 1;
-      logger.info('[WhatsApp] register delivery attempt', { sender: label, workbookId: id, outcome: r.outcome });
-      if (r.outcome === 'blocked' || r.outcome === 'transient') track(r.outcome);
+  // §one-delivery-path: Done/Review used to hand-send EVERY workbook it could
+  // find at status='ready', in parallel with the durable outbox flush. That second
+  // path is what buried owners in copies of the same month (a 2-invoice file, then
+  // a 3-invoice one, then the real one) and shipped them with the generic caption,
+  // because it never read the register's own month or row count. Both commands now
+  // go through the single outbox consumer, which holds an intermediate register
+  // while work is still running, sends only the newest file per (month, category),
+  // captions it with its real month and invoice count, and records every attempt —
+  // including why a send did not land — in workbook_deliveries. Returns how many
+  // files reached this chat.
+  const deliverOwedRegisters = async (): Promise<number> => {
+    try {
+      const delivered = await flushPendingDeliveries(db, hmac, to);
+      logger.info('[WhatsApp] register outbox flush', { sender: label, delivered });
+      return delivered;
+    } catch (e) {
+      logger.warn('[WhatsApp] register outbox flush failed', { sender: label, error: e instanceof Error ? e.message : 'unknown' });
+      return 0;
     }
-    return delivered;
   };
   // Menu/list/button sends are re-derivable, so a failed one records only the
   // error code (no body resend); a failed interactive list degrades to text.
@@ -460,9 +463,14 @@ async function handleOnboardingSideEffects(
   // still ATTACH the Excel in this very reply, instead of only reaching the chat on
   // the next inbound. If a register is still running after the window we keep the
   // truthful "still working" reply and the outbox flush delivers on the next inbound.
+  // §never-partial: the window ends on QUIESCENCE, not on "a workbook exists". Mid-burst
+  // there is always some live register, but it is a PARTIAL snapshot of the month — and
+  // the delivery consumer deliberately holds a flush while any job is live, so returning
+  // early here attached nothing and taught the owner to type Done twice. A workspace with
+  // extraction or register work still running is never "ready" for this reply.
   const waitForRegisterReady = async (scope: DeliveryScope, first: FinalizeCounts): Promise<FinalizeCounts> => {
     if (!workspaceId) return first;
-    if (first.readyWorkbookIds.length > 0 || first.compiling === 0) return first;
+    if (first.outstanding === 0 && first.compiling === 0) return first;
     // Nudge the worker so the queued register gets a tick inside this window
     // (ensureBatchRegisters only wakes when it newly scheduled one).
     wakeWorker();
@@ -475,10 +483,30 @@ async function handleOnboardingSideEffects(
       } catch {
         return latest;
       }
-      if (latest.readyWorkbookIds.length > 0) return latest;
-      if (latest.compiling === 0) return latest;
+      if (latest.outstanding === 0 && latest.compiling === 0) return latest;
     }
     return latest;
+  };
+  // §truthful-promise: the Done reply may only promise an unprompted handover when
+  // the SANCTIONED opt-in path can actually deliver it — consent + the separate
+  // sealing key + inside Meta's 24h window (canProactivelyPush), with the sealed
+  // number still opening. `pushOffer` is the honest middle state: the operator
+  // turned the feature on but this owner has not opted in yet, so naming the
+  // "Proactive on" keyword is real help instead of a dead end. Never leaks the
+  // phone or the sealed value — only two booleans leave here.
+  const proactivePushState = async (): Promise<{ pushOk: boolean; pushOffer: boolean }> => {
+    if (!proactiveDeliveryEnabled() || !proactiveKeyConfigured()) {
+      return { pushOk: false, pushOffer: false };
+    }
+    try {
+      const id = await loadProactiveIdentity(db, hmac);
+      if (!id) return { pushOk: false, pushOffer: false };
+      const pushOk = canProactivelyPush({ consent: id.consent, lastActivityMs: id.lastActivityMs })
+        && openWaId(id.sealed) != null;
+      return { pushOk, pushOffer: !id.consent };
+    } catch {
+      return { pushOk: false, pushOffer: false };
+    }
   };
   const deliverDone = async (): Promise<void> => {
     if (!workspaceId) { await deliverText('Nothing to finalize yet — send Hi to start, or just send an invoice.'); return; }
@@ -489,7 +517,7 @@ async function handleOnboardingSideEffects(
     try {
       await ensureBatchRegisters(db, workspaceId, scope);
       const counts = await waitForRegisterReady(scope, await collectFinalizeState(db, workspaceId, scope));
-      const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
+      const delivered = await deliverOwedRegisters();
       const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
       // Deterministic link: the LATEST accounting period among the scoped ready
       // registers — never an arbitrary first row (the wrong-month leak path).
@@ -497,7 +525,8 @@ async function handleOnboardingSideEffects(
       const link = base && primary
         ? `${base}/api/exports/${primary}/download`
         : null;
-      await deliverText(composeDoneMessage(counts, { link, delivered: delivered > 0 }));
+      const { pushOk, pushOffer } = await proactivePushState();
+      await deliverText(composeDoneMessage(counts, { link, delivered: delivered > 0, pushOk, pushOffer }));
     } catch (e) {
       // Finalization is read/schedule only; a failure here must never lose work or
       // rewind intake. Fall back to an honest "queued" message (no ready claim).
@@ -564,7 +593,7 @@ async function handleOnboardingSideEffects(
           // sender's own client's ready registers, latest period first.
           const scope = { clientId: clientId ?? null };
           const counts = await collectFinalizeState(db, workspaceId, scope);
-          const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
+          const delivered = await deliverOwedRegisters();
           const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
           const primary = pickPrimaryWorkbook(counts.readyMonths ?? [])?.workbookId ?? null;
           const link = base && primary
