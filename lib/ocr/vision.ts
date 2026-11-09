@@ -20,6 +20,7 @@ import { GoogleGenAI, Type } from '@google/genai'
 import { logger } from '@/lib/logger'
 import type { LedgerCandidate } from '@/lib/ocr/ledger'
 import { buildGeminiInvoiceRequest } from '@/lib/ocr/gemini-request'
+import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
 
 // Per-call Gemini ceiling. A throttled/free-tier key can take 25s+ for a single
 // read, so this is operator-configurable (VISION_TIMEOUT_MS) instead of pinned
@@ -96,11 +97,13 @@ const VISION_PROMPT = [
   'return 0 for igst_amount.',
   'Give every extracted field a confidence (0.0-1.0; never default to high).',
   'PARTIES: The SUPPLIER is the seller who issued this invoice.',
-  'Identify the supplier primarily from the invoice header, company letterhead,',
-  'seller name and supplier GSTIN. The RECIPIENT is the buyer.',
-  'The supplier name usually appears near the top of the invoice, before the',
-  'Bill To / Buyer section. Never identify the supplier using the buyer name',
-  'or buyer GSTIN. IMPORTANT FOOTER RULE: Text such as "For Supplier",',
+  'Identify the supplier from the issuer company name in the top header,',
+  'colored header bar or company letterhead when present, and corroborate it',
+  'with the seller name and supplier GSTIN. The RECIPIENT is the buyer.',
+  'Copy only the company name itself: do not append invoice titles, dates,',
+  'addresses or adjacent lines. Never identify the supplier from the Bill To,',
+  'Buyer or Ship To box, even when it contains a company name. IMPORTANT',
+  'FOOTER RULE: Text such as "For Supplier",',
   '"For Seller", "For Vendor", "For and on behalf of [Company]",',
   '"Authorised Signatory", or signature declarations is a footer/signature',
   'declaration, NOT the supplier name. Do not extract the word "For" or a',
@@ -121,15 +124,20 @@ const VISION_PROMPT = [
   'rates, not percentages); total_amount is the final payable invoice total',
   'including tax and round-off (labelled Total Invoice Value / Grand Total /',
   'Net Payable). A row labelled just "Total Amount" or "Sales Amount" is often the',
-  'PRE-TAX subtotal, not the invoice total. Use plain numbers (no currency symbol, no',
-  'thousands separators). If the tax-rate percentages are explicitly printed,',
+  'PRE-TAX subtotal, not the invoice total. Return EVERY money amount as a JSON',
+  'STRING copied from the printed amount, preserving the decimal point, all',
+  'decimal digits including trailing zeroes, and digits exactly. For example,',
+  'printed 4850.00 must be "4850.00", never "485000"; printed 832.50 must be',
+  '"832.50", never "832550". Do not convert amounts to paise, round them,',
+  'drop a decimal point, or join digits across a decimal point. Indian comma',
+  'grouping and a printed currency symbol are accepted. If the tax-rate percentages are explicitly printed,',
   'return them as strings without the percent sign; otherwise return an empty',
   'string. Copy the printed total amount-in-words exactly, or return an empty',
   'string when it is absent. Never infer a rate or amount-in-words.',
   'TOTAL CHECK: the printed total in words and the numeric grand total are the',
   'same figure; read both and make sure total_amount matches the words line.',
   'OPTIONAL COMPONENTS: when the invoice EXPLICITLY prints any of these amounts,',
-  'return them (plain numbers); otherwise return null for each. discount_amount',
+  'return them as decimal strings copied exactly; otherwise return null for each. discount_amount',
   'is a line or invoice-level discount; shipping_amount is freight / packaging /',
   'handling / other charges; cess_amount is a GST cess; deduction_amount is an',
   'explicit deduction (e.g. advance or TDS on payment); round_off is the final',
@@ -149,7 +157,8 @@ const VISION_PROMPT = [
   'RATE-WISE BREAKDOWN: if the document PRINTS a rate-wise / slab-wise tax summary',
   '(a table or block grouping the taxable value and the tax amounts by GST rate,',
   'e.g. "18% 7,500.00 675.00 675.00"), return tax_slices with ONE entry per',
-  'printed rate line: rate_percent and the amounts as plain numbers, treatment',
+  'printed rate line: rate_percent and the amounts as decimal strings copied',
+  'exactly from the document, treatment',
   '"local" when that row prints CGST and SGST and "interstate" when it prints',
   'IGST. Copy those rows exactly — never split a single-rate invoice, never',
   'derive a slab from an item line, never compute an amount the document does',
@@ -189,11 +198,11 @@ const taxSliceSchema = {
   type: Type.OBJECT,
   properties: {
     rate_percent: { type: Type.NUMBER, nullable: true },
-    taxable_value: { type: Type.NUMBER, nullable: true },
-    cgst_amount: { type: Type.NUMBER, nullable: true },
-    sgst_amount: { type: Type.NUMBER, nullable: true },
-    igst_amount: { type: Type.NUMBER, nullable: true },
-    cess_amount: { type: Type.NUMBER, nullable: true },
+    taxable_value: { type: Type.STRING, nullable: true },
+    cgst_amount: { type: Type.STRING, nullable: true },
+    sgst_amount: { type: Type.STRING, nullable: true },
+    igst_amount: { type: Type.STRING, nullable: true },
+    cess_amount: { type: Type.STRING, nullable: true },
     treatment: { type: Type.STRING, nullable: true },
   },
   propertyOrdering: [
@@ -210,16 +219,16 @@ const LEDGER_SCHEMA = {
     vendor_name: { type: Type.STRING },
     supplier_gstin: { type: Type.STRING },
     recipient_gstin: { type: Type.STRING, nullable: true },
-    taxable_value: { type: Type.NUMBER },
-    cgst_amount: { type: Type.NUMBER },
-    sgst_amount: { type: Type.NUMBER },
-    igst_amount: { type: Type.NUMBER },
-    total_amount: { type: Type.NUMBER },
-    cess_amount: { type: Type.NUMBER, nullable: true },
-    shipping_amount: { type: Type.NUMBER, nullable: true },
-    discount_amount: { type: Type.NUMBER, nullable: true },
-    deduction_amount: { type: Type.NUMBER, nullable: true },
-    round_off: { type: Type.NUMBER, nullable: true },
+    taxable_value: { type: Type.STRING, nullable: true },
+    cgst_amount: { type: Type.STRING, nullable: true },
+    sgst_amount: { type: Type.STRING, nullable: true },
+    igst_amount: { type: Type.STRING, nullable: true },
+    total_amount: { type: Type.STRING, nullable: true },
+    cess_amount: { type: Type.STRING, nullable: true },
+    shipping_amount: { type: Type.STRING, nullable: true },
+    discount_amount: { type: Type.STRING, nullable: true },
+    deduction_amount: { type: Type.STRING, nullable: true },
+    round_off: { type: Type.STRING, nullable: true },
     cgst_rate_percent: { type: Type.STRING, nullable: true },
     sgst_rate_percent: { type: Type.STRING, nullable: true },
     igst_rate_percent: { type: Type.STRING, nullable: true },
@@ -322,16 +331,24 @@ export function parseVisionJson(text: string): LedgerCandidate {
   }
   for (const field of AMOUNT_FIELDS) {
     const value = candidate[field]
-    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) {
+    if (value === null) continue
+    if (typeof value !== 'string' && typeof value !== 'number') {
       throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     }
+    const minorUnits = moneyToMinorUnits(value)
+    if (minorUnits === null) throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    candidate[field] = minorUnitsToNumber(minorUnits)
   }
   // Optional structural components: absent or malformed is tolerated as null,
   // never a permanent failure — they only assist reconciliation.
   for (const field of OPTIONAL_AMOUNT_FIELDS) {
     const value = candidate[field]
     if (value === undefined) { candidate[field] = null; continue }
-    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) candidate[field] = null
+    if (value === null) continue
+    const minorUnits = typeof value === 'string' || typeof value === 'number'
+      ? moneyToMinorUnits(value)
+      : null
+    candidate[field] = minorUnits === null ? null : minorUnitsToNumber(minorUnits)
   }
   // §multi-rate: a rate-wise breakdown is OPTIONAL AI evidence. Preserve it when
   // the model returns a well-formed array of slice objects, but NEVER fail the
@@ -344,8 +361,11 @@ export function parseVisionJson(text: string): LedgerCandidate {
     const slices = (candidate.tax_slices as unknown[])
       .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object' && !Array.isArray(s))
       .map((s) => {
-        const money = (v: unknown): number | null =>
-          typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+        const money = (v: unknown): number | null => {
+          if (typeof v !== 'string' && typeof v !== 'number') return null
+          const minorUnits = moneyToMinorUnits(v)
+          return minorUnits === null || minorUnits < BigInt(0) ? null : minorUnitsToNumber(minorUnits)
+        }
         const rate = typeof s.rate_percent === 'number' && Number.isFinite(s.rate_percent)
           && s.rate_percent >= 0 && s.rate_percent <= 100 ? s.rate_percent : null
         const treat = s.treatment === 'interstate' ? 'interstate'

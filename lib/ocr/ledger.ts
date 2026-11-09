@@ -973,7 +973,11 @@ export function retryHintFor(
     if (r === 'gstin-checksum-failed' || r === 'gstin-invalid' || r === 'gstin-state-invalid') {
       lines.push('The supplier_gstin you returned is not a valid GSTIN; re-read it character by character (watch O/0, I/1, S/5, B/8) and make sure it is the SELLER\'s, not the buyer\'s.');
     } else if (r.startsWith('total-mismatch')) {
-      lines.push('taxable_value + cgst_amount + sgst_amount + igst_amount did not equal total_amount (within 1 rupee); re-read each amount from the tax summary and the grand total.');
+      const mismatch = /^total-mismatch:([^!]+)!=(.+)$/.exec(r)
+      const values = mismatch
+        ? ` The extracted components reconciled to ${mismatch[1]}, but total_amount was read as ${mismatch[2]}.`
+        : ''
+      lines.push(`taxable_value + cgst_amount + sgst_amount + igst_amount did not equal total_amount (within 1 rupee).${values} Re-read taxable value, each printed tax/charge, and the Grand Total / Net Payable independently from the document. Preserve decimal points and trailing zeroes exactly; do not convert to paise or choose an amount from arithmetic alone.`)
     } else if (r === 'total-zero') {
       lines.push('total_amount came back as 0; locate the grand total / amount payable.');
     } else if (r === 'igst-with-cgst-sgst' || r === 'cgst-sgst-unequal') {

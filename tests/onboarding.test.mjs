@@ -2300,6 +2300,9 @@ test('P7 retryHintFor: only re-readable failures produce a re-ask, and it forbid
   assert.match(hint, /valid GSTIN/)
   assert.match(hint, /did not equal total_amount/)
   assert.match(hint, /only if the printed document supports it/)
+  assert.match(hint, /components reconciled to 1180\.00, but total_amount was read as 1990\.00/)
+  assert.match(hint, /Preserve decimal points and trailing zeroes exactly/)
+  assert.match(hint, /do not convert to paise or choose an amount from arithmetic alone/)
 })
 
 test('P8 extract handler wiring: engine drives review/status and failures are classified for retry', () => {

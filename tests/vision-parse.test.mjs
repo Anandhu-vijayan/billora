@@ -20,6 +20,15 @@ const src = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8
   .replace(/import \{ logger \} from '@\/lib\/logger'/, 'const logger = { info() {}, warn() {}, error() {} }')
   .replace(/import type \{ LedgerCandidate \} from '@\/lib\/ocr\/ledger'/, 'type LedgerCandidate = any')
   .replace(/import \{ buildGeminiInvoiceRequest \} from '@\/lib\/ocr\/gemini-request'/, 'const buildGeminiInvoiceRequest: any = () => ({})')
+  .replace(/import \{ minorUnitsToNumber, moneyToMinorUnits \} from '\.\/validators\/money'/, `
+    const moneyToMinorUnits = (value: string | number) => {
+      const raw = String(value).replace(/[₹,\\s]/g, '').replace(/^(?:INR|Rs\\.?)\\s*/i, '')
+      if (!/^[+-]?\\d+(?:\\.\\d+)?$/.test(raw)) return null
+      const [whole, fraction = ''] = raw.split('.')
+      return (whole.startsWith('-') ? -1n : 1n) * (BigInt(whole.replace(/^[+-]/, '')) * 100n + BigInt(fraction.slice(0, 2).padEnd(2, '0')))
+    }
+    const minorUnitsToNumber = (value: bigint) => Number(value) / 100
+  `)
 writeFileSync(new URL(`../${STUB_PATH}`, import.meta.url), src)
 const { parseVisionJson, VisionPermanentError } = await importTs(STUB_PATH)
 after(() => rmSync(new URL(`../${STUB_PATH}`, import.meta.url), { force: true }))
@@ -28,7 +37,7 @@ after(() => rmSync(new URL(`../${STUB_PATH}`, import.meta.url), { force: true })
 const good = () => ({
   invoice_date: '2025-04-22', invoice_number: 'PPP/0001/25-26', vendor_name: 'Add Company Name',
   supplier_gstin: '29AAAAA1234F000', recipient_gstin: '',
-  taxable_value: 100000, cgst_amount: 0, sgst_amount: 0, igst_amount: 18000, total_amount: 116800,
+  taxable_value: '1,00,000.00', cgst_amount: '0.00', sgst_amount: '0.00', igst_amount: '18,000.00', total_amount: '1,18,000.00',
   cgst_rate_percent: null, sgst_rate_percent: null, igst_rate_percent: '18', total_amount_in_words: 'One Lakh Sixteen Thousand Eight Hundred Only',
   confidence: {
     invoice_date: 0.9, invoice_number: 0.9, vendor_name: 0.6, supplier_gstin: 0.8,
@@ -40,7 +49,8 @@ const failsWith = (o, code) => assert.throws(() => parse(o), (e) => e instanceof
 
 test('V1 the exact response shape the schema requests is ACCEPTED (was VISION_CONFIDENCE_KEYS_INVALID)', () => {
   const c = parse(good())
-  assert.equal(c.total_amount, 116800)
+  assert.equal(c.total_amount, 118000)
+  assert.equal(c.taxable_value, 100000)
   assert.deepEqual(Object.keys(c.confidence).sort(), [
     'cgst_amount', 'igst_amount', 'invoice_date', 'invoice_number', 'sgst_amount',
     'supplier_gstin', 'taxable_value', 'total_amount', 'vendor_name',
@@ -68,8 +78,10 @@ test('V4 genuine problems are still rejected', () => {
   failsWith(outOfRange, 'VISION_CONFIDENCE_INVALID:invoice_date')
   const nullTextConf = good(); nullTextConf.confidence.invoice_number = null
   failsWith(nullTextConf, 'VISION_CONFIDENCE_INVALID:invoice_number')
-  const badType = good(); badType.taxable_value = '100000'
+  const badType = good(); badType.taxable_value = { amount: 100000 }
   failsWith(badType, 'VISION_FIELD_TYPE_INVALID:taxable_value')
+  const malformedMoney = good(); malformedMoney.total_amount = '4.850.00'
+  failsWith(malformedMoney, 'VISION_FIELD_TYPE_INVALID:total_amount')
   const badEvidence = good(); badEvidence.igst_rate_percent = 18
   failsWith(badEvidence, 'VISION_FIELD_TYPE_INVALID:igst_rate_percent')
   assert.throws(() => parseVisionJson('not json'), (e) => e.message === 'UNPARSEABLE_VISION_JSON')
@@ -79,6 +91,20 @@ test('V4 genuine problems are still rejected', () => {
 test('V5 the prompt tells the model the tax regime rule so absent heads come back as explicit 0', () => {
   assert.match(src, /EITHER IGST OR CGST\+SGST/)
   assert.match(src, /return 0 for cgst_amount and sgst_amount/)
+})
+
+test('V5 amount strings preserve decimal points and vendor extraction excludes buyer/header spillover', () => {
+  const o = good()
+  o.taxable_value = '4,850.00'
+  o.cgst_amount = '291.00'
+  o.sgst_amount = '291.00'
+  o.total_amount = '5,432.00'
+  const c = parse(o)
+  assert.equal(c.taxable_value, 4850)
+  assert.equal(c.cgst_amount, 291)
+  assert.equal(c.total_amount, 5432)
+  assert.match(src, /must be "4850\.00", never "485000"/)
+  assert.match(src, /Never identify the supplier from the Bill To/)
 })
 
 // ---- extractor / worker wiring --------------------------------------------------
