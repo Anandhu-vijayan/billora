@@ -55,12 +55,20 @@ const MONEY_FMT = '#,##0.00';
 const RATE_FMT = '0.##"%"';
 const DATE_FMT = 'DD-MM-YYYY';
 
-/** Parse a canonical `YYYY-MM-DD` date into a local Date, or null if unparseable. */
+/**
+ * Parse a canonical `YYYY-MM-DD` date into a Date carrying that EXACT calendar
+ * day, or null if unparseable. Built at UTC midnight on purpose: ExcelJS
+ * serializes a date cell from the Date's absolute epoch (`getTime()`), so a
+ * LOCAL-midnight Date would shift by the machine offset and Excel would render
+ * the previous day at, say, 18:30 (an IST +05:30 regression). Anchoring to UTC
+ * makes the serial a whole day (fraction .0) that displays identically no matter
+ * where the workbook is produced or opened.
+ */
 function toExcelDate(iso: string | null): Date | null {
   if (typeof iso !== 'string') return null;
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso.trim());
   if (!m) return null;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
   return Number.isNaN(d.getTime()) ? null : d;
 }
 

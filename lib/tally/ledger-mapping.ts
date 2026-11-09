@@ -23,6 +23,7 @@
 //     error and would overwrite the source's own printed figure).
 import type { LedgerRow } from '../ocr/ledger'
 import type { InvoiceTaxSlice } from '../ocr/tax-slices'
+import { resolveOverallLocalRatePercent } from '../ocr/validators/tax-rates'
 
 /** How a purchase invoice's tax is structured, from which heads are non-zero. */
 export type TaxTreatment = 'local' | 'interstate' | 'unknown'
@@ -86,18 +87,17 @@ export function overallGstRatePercent(row: LedgerRow, treatment: TaxTreatment): 
       : null
   }
   if (treatment === 'local') {
-    const c = row.cgst_rate_percent
-    const s = row.sgst_rate_percent
-    if (typeof c === 'number' && Number.isFinite(c) && typeof s === 'number' && Number.isFinite(s)) {
-      // §P3-15: CGST and SGST are legally equal halves. If they disagree beyond
-      // a tiny epsilon the row represents a MIXED-RATE document (or a misread),
-      // and no single overall rate can faithfully classify it. Return null so
-      // the mapping status becomes 'unresolved-rate' and the operator must handle
-      // this line explicitly, rather than importing a confidently-wrong voucher.
-      if (Math.abs(c - s) > 0.001) return null
-      return c + s
-    }
-    return null
+    // Equal printed halves sum to the overall rate; the shared resolver also
+    // recognises the combined-rate annotation (a single printed "GST(%)" copied
+    // into both heads) so a 5% bill is never exported as 10%. Unequal halves
+    // (a genuine mixed/misread bill) still resolve to null -> 'unresolved-rate'.
+    return resolveOverallLocalRatePercent({
+      taxableValue: row.taxable_value,
+      cgstAmount: row.cgst_amount,
+      sgstAmount: row.sgst_amount,
+      cgstRate: row.cgst_rate_percent,
+      sgstRate: row.sgst_rate_percent,
+    })
   }
   return null
 }

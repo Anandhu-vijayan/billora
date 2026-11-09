@@ -26,8 +26,10 @@ import {
 import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
   composeConfirmResultMessage, pickPrimaryWorkbook, type ConfirmOutcome,
+  type FinalizeCounts, type DeliveryScope,
 } from '@/lib/whatsapp/finalize';
 import { listPendingReviewPage, confirmInvoice, approveAllPending, loadInvoiceForEdit, applyInvoiceEdit } from '@/lib/whatsapp/review-confirm';
+import { wakeWorker } from '@/lib/jobs/wake';
 // Opt-in proactive delivery (§P1-6). The pure gate reads the flag/key/window; the
 // store seals/clears the owner's wa_id under the SEPARATE proactive key. Consent is
 // only ever persisted when BOTH the feature flag AND the key are configured, and the
@@ -81,6 +83,16 @@ function describeFieldErrors(label: string, errors: Array<{ field: string; code:
  * of forwarded PDFs without going quiet for a fresh working session.
  */
 const UPLOAD_ACK_COALESCE_MS = 5 * 60 * 1000;
+
+/**
+ * §immediate-register: how long a "Done" turn waits (bounded) for a still-compiling
+ * register to land before replying. Register generation is an async worker job, so
+ * an approve-then-Done flow often has the workbook a few seconds from ready; waiting
+ * briefly lets the SAME reply attach the Excel instead of deferring to the next
+ * inbound. Capped well under Meta's webhook budget so a slow/failed job still falls
+ * back to the truthful "still working" reply (delivered later via the outbox flush).
+ */
+const REGISTER_READY_WAIT_MS = 9000;
 
 interface IncomingMedia { id?: string; mime_type?: string; caption?: string; filename?: string }
 interface InteractiveReply { id?: string; title?: string }
@@ -442,6 +454,32 @@ async function handleOnboardingSideEffects(
   // While extraction/register jobs are still running it says "still working" and
   // defers the final result to the register job's delivery. Repeated Done is
   // idempotent: scheduling is deduped and the reads never mutate processing state.
+  // §immediate-register: register generation is an async worker job, so a Done
+  // tapped right after approval often finds the workbook still compiling. Wait a
+  // SHORT, bounded window for it to land so the common "approve then Done" path can
+  // still ATTACH the Excel in this very reply, instead of only reaching the chat on
+  // the next inbound. If a register is still running after the window we keep the
+  // truthful "still working" reply and the outbox flush delivers on the next inbound.
+  const waitForRegisterReady = async (scope: DeliveryScope, first: FinalizeCounts): Promise<FinalizeCounts> => {
+    if (!workspaceId) return first;
+    if (first.readyWorkbookIds.length > 0 || first.compiling === 0) return first;
+    // Nudge the worker so the queued register gets a tick inside this window
+    // (ensureBatchRegisters only wakes when it newly scheduled one).
+    wakeWorker();
+    let latest = first;
+    const deadline = Date.now() + REGISTER_READY_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1200));
+      try {
+        latest = await collectFinalizeState(db, workspaceId, scope);
+      } catch {
+        return latest;
+      }
+      if (latest.readyWorkbookIds.length > 0) return latest;
+      if (latest.compiling === 0) return latest;
+    }
+    return latest;
+  };
   const deliverDone = async (): Promise<void> => {
     if (!workspaceId) { await deliverText('Nothing to finalize yet — send Hi to start, or just send an invoice.'); return; }
     // Serve ONLY this sender's tenant: individuals see client-less batches,
@@ -450,7 +488,7 @@ async function handleOnboardingSideEffects(
     const scope = { clientId: clientId ?? null };
     try {
       await ensureBatchRegisters(db, workspaceId, scope);
-      const counts = await collectFinalizeState(db, workspaceId, scope);
+      const counts = await waitForRegisterReady(scope, await collectFinalizeState(db, workspaceId, scope));
       const delivered = await deliverRegisterDocuments(counts.readyWorkbookIds);
       const base = (process.env.PUBLIC_APP_URL ?? '').replace(/\/$/, '');
       // Deterministic link: the LATEST accounting period among the scoped ready

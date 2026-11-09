@@ -31,6 +31,70 @@ export function expectedTaxMinorUnits(taxable: number | string, ratePercent: Tax
   return roundedDivide(taxableMinor * basisPoints, BigInt(10_000))
 }
 
+/** Parse a printed rate (a number, or "5.00"/"5%") into a finite 0..100 number. */
+function rateToNumber(raw: TaxRateInput | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : null
+  const text = raw.trim().replace(/%$/, '')
+  if (text === '') return null
+  const n = Number(text)
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null
+}
+
+const withinTolerance = (a: bigint, b: bigint, tol: bigint): boolean => {
+  const diff = a > b ? a - b : b - a
+  return diff <= tol
+}
+
+/**
+ * Resolve the OVERALL GST rate percent for a LOCAL (CGST+SGST) invoice, applying
+ * the SAME combined-rate disambiguation `checkPrintedTaxRates` already accepts.
+ *
+ * An intra-state bill that prints only ONE "GST(%)" header (e.g. 5%) is often
+ * copied by the reader into BOTH per-head rate fields (cgst = sgst = 5), while the
+ * printed CGST/SGST amounts are the true halves (2.5% each). Blindly summing the
+ * copied halves reports 10% — a confidently-wrong slab that would then name the
+ * ledger "Purchase @ 10%". We let the already-reconciled tax amounts decide:
+ *   * if the printed CGST+SGST tie to the SUM of the halves, the halves are
+ *     genuine and the overall is their sum (UNCHANGED behaviour);
+ *   * only when the sum does NOT tie but the SINGLE printed value DOES do we
+ *     treat that value as the combined total.
+ * This NEVER invents a rate from amounts alone: with no full rate evidence it
+ * returns null, and it never overrides the documented halves-sum when that sum
+ * already reconciles. It simply disambiguates which field a printed rate belongs
+ * in, using amounts the total-reconciliation has already validated.
+ */
+export function resolveOverallLocalRatePercent(args: {
+  taxableValue: number | string | null | undefined
+  cgstAmount: number | string | null | undefined
+  sgstAmount: number | string | null | undefined
+  cgstRate: TaxRateInput | null | undefined
+  sgstRate: TaxRateInput | null | undefined
+  toleranceMinorUnits?: bigint
+}): number | null {
+  const c = rateToNumber(args.cgstRate)
+  const s = rateToNumber(args.sgstRate)
+  if (c === null || s === null) return null          // no full rate evidence -> unresolved, never guess
+  if (Math.abs(c - s) > 0.001) return null           // unequal halves -> mixed/misread, no single overall rate
+  const sumRate = Number((c + s).toFixed(2))         // documented contract: equal halves sum to the overall rate
+  const tol = args.toleranceMinorUnits ?? BigInt(101)
+  const taxableMinor = moneyToMinorUnits(args.taxableValue)
+  const cgstMinor = moneyToMinorUnits(args.cgstAmount)
+  const sgstMinor = moneyToMinorUnits(args.sgstAmount)
+  if (taxableMinor === null || taxableMinor <= BigInt(0) || cgstMinor === null || sgstMinor === null) {
+    return sumRate                                   // nothing to corroborate against -> keep documented behaviour
+  }
+  const actual = cgstMinor + sgstMinor
+  // Safe: we returned above when taxableMinor was null, so args.taxableValue here
+  // is a real number|string, which is what expectedTaxMinorUnits requires.
+  const taxable = args.taxableValue as number | string
+  const sumExpected = expectedTaxMinorUnits(taxable, sumRate)
+  if (sumExpected !== null && withinTolerance(actual, sumExpected, tol)) return sumRate
+  const combinedExpected = expectedTaxMinorUnits(taxable, c) // printed value read as the combined total
+  if (combinedExpected !== null && withinTolerance(actual, combinedExpected, tol)) return Number(c.toFixed(2))
+  return sumRate                                     // neither interpretation ties -> documented behaviour; validators flag it
+}
+
 /** Compare printed tax rates with extracted amounts; never computes replacement values. */
 export function checkPrintedTaxRates(args: {
   taxableValue: number | string

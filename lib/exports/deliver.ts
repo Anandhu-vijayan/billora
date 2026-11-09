@@ -90,8 +90,20 @@ export async function deliverWorkbookToWhatsApp(
       .from(bucketFor('exports'))
       .download(wb.file_object_path)
     if (dlErr || !blob) {
-      logger.error('[Deliver] storage read failed', { code: 'DELIVER_STORAGE_ERROR' })
-      return { delivered: false, outcome: 'transient' }
+      // A MISSING object is permanent for this row — a retry can never resurrect it
+      // — so it must NOT be reported 'transient' (which parks it 'failed' with a
+      // future next_attempt_at and re-loops forever on every inbound, burying the
+      // real fault). '404'/'NoSuchKey' is surfaced as 'skipped', which the consumer
+      // parks as a terminal 'unknown' for reconciliation; a network/5xx read stays
+      // 'transient'. Log only a bounded provider status/code — never the path or PII.
+      const status = (dlErr as { statusCode?: number | string } | null)?.statusCode
+      const pcode = (dlErr as { code?: string } | null)?.code
+      const missing = String(status) === '404' || pcode === 'NoSuchKey'
+      logger.error('[Deliver] storage read failed', {
+        code: missing ? 'DELIVER_OBJECT_MISSING' : 'DELIVER_STORAGE_ERROR',
+        status: status ?? null, providerCode: pcode ?? null, workbookId,
+      })
+      return { delivered: false, outcome: missing ? 'skipped' : 'transient' }
     }
     const container = Buffer.from(await blob.arrayBuffer())
     // A tampered / wrong-key container throws (never emits plaintext); we surface

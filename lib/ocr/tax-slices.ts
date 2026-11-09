@@ -29,7 +29,7 @@
 // Kept pure + alias-free (only relative dependency-free imports) so the test
 // harness (`scripts/_ts-import.mjs`) exercises the REAL logic in-process.
 import { moneyToMinorUnits, minorUnitsToString } from './validators/money'
-import { expectedTaxMinorUnits } from './validators/tax-rates'
+import { expectedTaxMinorUnits, resolveOverallLocalRatePercent } from './validators/tax-rates'
 
 /** How a slice's tax is structured. Mirrors the export-side treatment vocabulary. */
 export type SliceTreatment = 'local' | 'interstate' | 'unknown'
@@ -138,21 +138,10 @@ export function isMixedRate(slices: readonly InvoiceTaxSlice[] | null | undefine
 }
 
 /**
- * Combine two per-head tax components that must be EQUAL halves of a local
- * (CGST+SGST) split. Returns the shared half-rate, or null when they disagree —
- * the same discipline `tally/ledger-mapping.overallGstRatePercent` applies.
- */
-function equalLocalHalf(cgstRate: number | null, sgstRate: number | null): number | null {
-  if (cgstRate === null || sgstRate === null) return null
-  if (!Number.isFinite(cgstRate) || !Number.isFinite(sgstRate)) return null
-  if (Math.abs(cgstRate - sgstRate) > 0.001) return null
-  return cgstRate
-}
-
-/**
  * The single rate for a clean single-rate invoice, taken ONLY from printed rate
- * evidence. Local requires both halves printed AND equal (their sum is the
- * overall rate); interstate uses the printed IGST rate. Returns null for a mixed
+ * evidence. Local delegates to the shared resolver (equal printed halves sum to
+ * the overall, with the combined-rate annotation recognised so a 5% bill is never
+ * doubled to 10%); interstate uses the printed IGST rate. Returns null for a mixed
  * or unevidenced bill — the caller must then rely on explicit slices or leave the
  * breakdown unresolved (never invent a rate).
  */
@@ -161,11 +150,19 @@ export function overallInvoiceRate(args: {
   cgstRate: number | null
   sgstRate: number | null
   igstRate: number | null
+  taxableValue?: number | null
+  cgstAmount?: number | null
+  sgstAmount?: number | null
 }): number | null {
   if (args.treatment === 'interstate') return isRateValue(args.igstRate) ? args.igstRate : null
   if (args.treatment === 'local') {
-    const half = equalLocalHalf(args.cgstRate, args.sgstRate)
-    return half === null ? null : Number((half * 2).toFixed(2))
+    return resolveOverallLocalRatePercent({
+      taxableValue: args.taxableValue ?? null,
+      cgstAmount: args.cgstAmount ?? null,
+      sgstAmount: args.sgstAmount ?? null,
+      cgstRate: args.cgstRate,
+      sgstRate: args.sgstRate,
+    })
   }
   return null
 }
@@ -201,6 +198,9 @@ export function deriveSlicesFromInvoiceHeads(row: {
     cgstRate: isRateValue(row.cgst_rate_percent) ? row.cgst_rate_percent : null,
     sgstRate: isRateValue(row.sgst_rate_percent) ? row.sgst_rate_percent : null,
     igstRate: isRateValue(row.igst_rate_percent) ? row.igst_rate_percent : null,
+    taxableValue: isFiniteOrNull(row.taxable_value) ? row.taxable_value : null,
+    cgstAmount: isFiniteOrNull(row.cgst_amount) ? row.cgst_amount : null,
+    sgstAmount: isFiniteOrNull(row.sgst_amount) ? row.sgst_amount : null,
   })
   // No reliably evidenced single rate: a mixed or unevidenced bill. Never guess.
   if (rate === null) return null

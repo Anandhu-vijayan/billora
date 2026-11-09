@@ -30,6 +30,13 @@
 -- ---------------------------------------------------------------------------
 -- 1) The outbox table.
 -- ---------------------------------------------------------------------------
+-- The composite FK below references generated_workbooks(id, workspace_id), which
+-- Postgres requires to be covered by a unique index. `id` alone is the PK, so we
+-- add the (id, workspace_id) composite — this is ALSO the integrity guarantee that
+-- a delivery row can never reference a workbook belonging to a DIFFERENT workspace.
+create unique index if not exists generated_workbooks_id_workspace_key
+  on public.generated_workbooks (id, workspace_id);
+
 create table if not exists public.workbook_deliveries (
   id                     uuid primary key default gen_random_uuid(),
   workspace_id           uuid not null references public.workspaces(id) on delete cascade,

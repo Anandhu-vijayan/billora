@@ -479,6 +479,21 @@ export async function buildRegister(ctx: JobContext): Promise<void> {
         metadata: { original_mime: SPREADSHEET_MIME, original_extension: 'xlsx' },
       })
     if (upErr) throw new Error(`WORKBOOK_UPLOAD_ERROR: ${upErr.message}`)
+    // Defense-in-depth against the "ready row, missing object" inconsistency:
+    // finalize.ts's contract is that a 'ready' workbook ALWAYS has a stored file,
+    // yet an .upload() that returns no error is only IMPLICIT proof. We now VERIFY
+    // the object is actually present at its deterministic path before publishing.
+    // A DEFINITE absence is a transient throw — the coalesced requeue re-uploads
+    // and re-checks, and NO ready row is written for a file that isn't there. A
+    // list that itself ERRORS degrades SOFT (we already have an error-free upload)
+    // so a storage-probe hiccup never fails an otherwise-good register.
+    const objFolder = exportPath.slice(0, exportPath.lastIndexOf('/'))
+    const objName = exportPath.slice(exportPath.lastIndexOf('/') + 1)
+    const { data: seen, error: verErr } = await db.storage.from(exportsBucket)
+      .list(objFolder, { limit: 5, search: objName })
+    if (!verErr && !(seen ?? []).some((e) => (e as { name?: string }).name === objName)) {
+      throw new Error('WORKBOOK_OBJECT_VERIFY_ERROR: uploaded object not present after write; requeue to re-upload')
+    }
     pending.push({ category, sheetName, rowCount: bucket.length, exportPath, sizeBytes: enc.sizeBytes, keyVersion: enc.keyVersion, checksumHex })
   }
   logger.info('[Register] category workbooks built & stored', {

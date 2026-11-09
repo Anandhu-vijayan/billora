@@ -2416,7 +2416,14 @@ test('T2 dates are REAL date cells (DD-MM-YYYY) and amounts/rate are NUMERIC cel
   const dateCell = row.getCell(1)
   assert.ok(dateCell.value instanceof Date, 'Date column is a genuine Excel date, not text')
   assert.equal(dateCell.numFmt, 'DD-MM-YYYY', 'date is displayed DD-MM-YYYY')
-  assert.equal(dateCell.value.getFullYear(), 2026); assert.equal(dateCell.value.getMonth(), 8); assert.equal(dateCell.value.getDate(), 5)
+  // Read back timezone-INDEPENDENTLY: the cell must be the exact calendar day at
+  // UTC midnight (fraction .0 serial), so Excel renders DD-MM-YYYY correctly no
+  // matter the producing/opening machine's offset. Local getters here would let
+  // a same-TZ round-trip mask the shift while Excel's serial-based display would
+  // still show the previous day at 18:30 (the IST regression).
+  assert.equal(dateCell.value.getUTCFullYear(), 2026); assert.equal(dateCell.value.getUTCMonth(), 8); assert.equal(dateCell.value.getUTCDate(), 5)
+  assert.equal(dateCell.value.getUTCHours(), 0, 'date cell is a whole day, no time-of-day drift')
+  assert.equal(dateCell.value.getUTCMinutes(), 0)
   assert.equal(typeof row.getCell(6).value, 'number', 'Taxable Amount is numeric')
   assert.equal(row.getCell(6).value, 1000)
   assert.equal(typeof row.getCell(7).value, 'number', 'Tax Rate is numeric')
@@ -3484,4 +3491,24 @@ test('P1-7 route: paging + bulk approval are wired to the shared, re-validating 
   assert.ok(/sendReviewPage\(1\)/.test(src), 'Review and post-approve re-show show the first confirmable page')
   // approve-all must never claim a row was approved that is still flagged.
   assert.ok(/stillPending[\s\S]*?nothing was forced through/.test(src), 'the reply states a bad row was not forced')
+})
+
+test('P1-8 Done waits (bounded) for a still-compiling register so the Excel lands in the SAME reply', () => {
+  const src = routeSrc()
+  // A register is an async worker job; tapping Done must not just say "queued" and
+  // wait for the NEXT inbound. It polls for readiness for a bounded window, then
+  // delivers inline via the existing ready-workbook path.
+  assert.ok(/const REGISTER_READY_WAIT_MS = \d+;/.test(src), 'the wait is a bounded named window')
+  assert.ok(/const waitForRegisterReady = async \(scope: DeliveryScope, first: FinalizeCounts\)/.test(src), 'a bounded readiness poll exists')
+  assert.ok(/await ensureBatchRegisters\(db, workspaceId, scope\)[\s\S]*?await waitForRegisterReady\(scope, await collectFinalizeState\(db, workspaceId, scope\)\)[\s\S]*?deliverRegisterDocuments\(counts\.readyWorkbookIds\)/.test(src),
+    'Done: schedule -> wait-for-ready -> deliver inline, in that order')
+  // The poll must break early once ready, stop when nothing is compiling, and never
+  // loop unbounded (deadline + a try/catch that returns the last truthful counts).
+  const poll = src.slice(src.indexOf('const waitForRegisterReady'), src.indexOf('const deliverDone'))
+  assert.ok(/if \(first\.readyWorkbookIds\.length > 0 \|\| first\.compiling === 0\) return first;/.test(poll), 'no wait when already ready or nothing compiling')
+  assert.ok(/const deadline = Date\.now\(\) \+ REGISTER_READY_WAIT_MS;/.test(poll), 'poll is bounded by the deadline')
+  assert.ok(/while \(Date\.now\(\) < deadline\)/.test(poll), 'a bounded while loop, never an unbounded/while(true)')
+  assert.ok(/catch \{\s*return latest;/.test(poll), 'a read fault returns the truthful counts (never hangs the webhook)')
+  // It stays scoped to THIS sender's tenant on every re-read (no cross-client leak).
+  assert.ok(/collectFinalizeState\(db, workspaceId, scope\)/.test(poll), 'each re-read honors the tenant scope')
 })

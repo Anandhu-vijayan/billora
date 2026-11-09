@@ -18,6 +18,8 @@ const outboxSrc = () => readFileSync(new URL('../lib/whatsapp/delivery-outbox.ts
 const consumerSrc = () => readFileSync(new URL('../lib/jobs/handlers/deliver-register.ts', import.meta.url), 'utf8')
 const routeSrc = () => readFileSync(new URL('../app/api/whatsapp/route.ts', import.meta.url), 'utf8')
 const workerSrc = () => readFileSync(new URL('../lib/jobs/worker.ts', import.meta.url), 'utf8')
+const deliverSrc = () => readFileSync(new URL('../lib/exports/deliver.ts', import.meta.url), 'utf8')
+const registerSrc = () => readFileSync(new URL('../lib/jobs/handlers/build-register.ts', import.meta.url), 'utf8')
 
 // Executable SQL only (drop `--` comment lines) so prose never satisfies a check.
 const execSql = (s) => s.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n')
@@ -183,7 +185,7 @@ test('DELIVERY-12 a lapsed worker can NEVER double-settle: recovery nulls the fe
   const rec = s.slice(s.indexOf('function public.recover_expired_delivery_leases'),
     s.indexOf('$$;', s.indexOf('as $$', s.indexOf('function public.recover_expired_delivery_leases'))))
   assert.match(rec, /status\s+= 'unknown'/, 'lapsed sending parks as unknown')
-  assert.match(rec, /claim_token\s+null/, 'recovery clears the ownership fence')
+  assert.match(rec, /claim_token\s*=\s*null/, 'recovery clears the ownership fence')
   const mk = s.slice(s.indexOf('function public.mark_workbook_delivery_sent'))
   assert.match(mk, /claim_token = p_claim_token[\s\S]*and status = 'sending'/, 'settle is fenced by token AND still-sending; a cleared/unknown row cannot be settled by anyone')
 })
@@ -271,4 +273,93 @@ test('DELIVERY-LIVE claim -> settle -> fenced-replay -> lease-recovery behave co
     // Cascade removes the workbook's delivery rows; drop the fixture workbook.
     await db.from('generated_workbooks').delete().eq('id', workbookId)
   }
+})
+
+test('DELIVERY-LIVE-02 TWO months for ONE owner: both outbox rows exist, are claimed independently, and neither is lost', {
+  skip: !liveAvailable, timeout: 60_000,
+}, async () => {
+  // This is the EXACT production race the fix targets: with the old single
+  // whatsapp_sessions.pending_reply_body slot, two concurrent per-batch builds
+  // clobbered each other's [[deliver:<id>]] token and only the LAST workbook ever
+  // reached the chat. Here one owner is owed TWO independent files (Sep + Oct) and
+  // BOTH must survive to 'sent'.
+  const db = await adminClient()
+  const { data: ws } = await db.from('workspaces').select('id').limit(1)
+  const workspaceId = ws?.[0]?.id
+  assert.ok(workspaceId, 'live DB must contain at least one workspace to scope a fixture')
+  const probe = await db.from('workbook_deliveries').select('id').limit(1)
+  assert.ok(!probe.error, `workbook_deliveries must exist (run npx supabase db push): ${probe.error?.message}`)
+
+  const mkWorkbook = async () => {
+    const { data: wb, error } = await db.from('generated_workbooks').insert({
+      workspace_id: workspaceId, file_object_path: `__test__/multi-${crypto.randomUUID()}.xlsx`, status: 'ready',
+    }).select('id').single()
+    assert.ok(!error && wb, `fixture workbook insert failed: ${error?.message}`)
+    return wb.id
+  }
+
+  const recipient = `test-hmac-multi:${crypto.randomUUID()}`
+  const sep = await mkWorkbook()
+  const oct = await mkWorkbook()
+  try {
+    const { enqueueWorkbookDelivery, claimDueDeliveries, markDeliverySent } =
+      await (await import('../scripts/_ts-import.mjs')).importTs('lib/whatsapp/delivery-outbox.ts')
+
+    assert.equal(await enqueueWorkbookDelivery(db, { workspaceId, workbookId: sep, recipientSenderHmac: recipient }), true)
+    assert.equal(await enqueueWorkbookDelivery(db, { workspaceId, workbookId: oct, recipientSenderHmac: recipient }), true)
+
+    const { count } = await db.from('workbook_deliveries')
+      .select('id', { count: 'exact', head: true }).eq('recipient_sender_hmac', recipient)
+    assert.equal(count, 2, 'BOTH months get their own durable row — no shared slot to clobber')
+
+    // A single claim hands back BOTH independent rows (each with its own fence).
+    const claimed = await claimDueDeliveries(db, recipient, 5, 120)
+    assert.equal(claimed.length, 2, 'both due deliveries are claimed in one pass')
+    assert.notEqual(claimed[0].claim_token, claimed[1].claim_token, 'each row carries a distinct ownership token')
+    assert.deepEqual(new Set(claimed.map((c) => c.workbook_id)).size, 2, 'the two rows point at two distinct workbooks')
+
+    // Settling one does NOT disturb the other (proving independence, not last-write-wins).
+    const first = claimed.find((c) => c.workbook_id === sep)
+    const second = claimed.find((c) => c.workbook_id === oct)
+    assert.equal(await markDeliverySent(db, first.id, first.claim_token, 'wa-sep'), true, 'September settles sent')
+    const stillSending = await db.from('workbook_deliveries').select('status').eq('id', second.id).single()
+    assert.equal(stillSending.data.status, 'sending', 'October is untouched by September\'s settle')
+    assert.equal(await markDeliverySent(db, second.id, second.claim_token, 'wa-oct'), true, 'October settles sent under its own token')
+
+    const rows = await db.from('workbook_deliveries').select('status,workbook_id,provider_message_id').eq('recipient_sender_hmac', recipient)
+    const byWb = Object.fromEntries(rows.data.map((r) => [r.workbook_id, r]))
+    assert.equal(byWb[sep].status, 'sent'); assert.equal(byWb[sep].provider_message_id, 'wa-sep')
+    assert.equal(byWb[oct].status, 'sent'); assert.equal(byWb[oct].provider_message_id, 'wa-oct')
+    assert.equal((await claimDueDeliveries(db, recipient, 5, 120)).length, 0, 'both sent -> nothing left to (re)send; neither file lost nor duplicated')
+  } finally {
+    await db.from('generated_workbooks').delete().in('id', [sep, oct])
+  }
+})
+
+test('DELIVERY-13 a permanently-missing workbook object is NOT retried forever (404 -> terminal, not transient)', () => {
+  const s = deliverSrc()
+  // Read the storage-download branch specifically, so the prose elsewhere can't match.
+  const dl = s.slice(s.indexOf('.download(wb.file_object_path)'), s.indexOf('const container ='))
+  assert.match(dl, /statusCode/, 'the provider status is inspected (bounded, never the path)')
+  assert.match(dl, /NoSuchKey/, 'a 404/NoSuchKey is recognised as a DEFINITIVELY missing object')
+  assert.match(dl, /DELIVER_OBJECT_MISSING/, 'a missing object logs a distinct code from a generic read fault')
+  // The crux: a missing object must NOT return 'transient' (which parks 'failed'
+  // with a future next_attempt_at and re-loops on every inbound). It returns the
+  // non-servable path the consumer parks terminally as 'unknown'.
+  assert.match(dl, /outcome:\s*missing \? 'skipped' : 'transient'/, '404 -> skipped (terminal park); only a real transient stays transient')
+  assert.ok(!/return \{ delivered: false, outcome: 'transient' \}/.test(dl), 'no blanket transient return for any storage error')
+})
+
+test('DELIVERY-14 build-register VERIFIES the object exists before marking a workbook ready', () => {
+  const s = registerSrc()
+  const flat = s.replace(/\s+/g, ' ')
+  const up = s.indexOf('.upload(exportPath')
+  const verify = s.indexOf('WORKBOOK_OBJECT_VERIFY_ERROR')
+  const push = s.indexOf('pending.push(')
+  assert.ok(up > -1 && verify > up && verify < push, 'upload -> verify -> only-then queue for publish')
+  // Exact, whitespace-collapsed substrings (regex on `{`/`}` quantifiers is brittle).
+  assert.ok(flat.includes('list(objFolder, { limit: 5, search: objName })'), 'existence is checked against the exact deterministic object name')
+  assert.ok(flat.includes('if (!verErr && !(seen ?? []).some((e) => (e as { name?: string }).name === objName))'),
+    'a DEFINITE absence (list succeeded, name not present) is the only throw')
+  assert.ok(!flat.includes('if (verErr) throw'), 'a list ERROR never throws (degrades soft, trusts the error-free upload)')
 })

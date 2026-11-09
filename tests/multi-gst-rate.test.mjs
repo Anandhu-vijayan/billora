@@ -66,6 +66,41 @@ test('mixed or unevidenced heads derive NOTHING — no invented rate, never zero
   }), null)
 })
 
+// ---- combined "GST(%)" header copied into both halves: 5% must NOT export 10% ----
+
+test('a combined-rate annotation (5% in both heads) resolves to 5%, never 10% — Devamatha regression', () => {
+  // Real hospital bill S24425: the item line prints only a total "GST(%) = 5.00";
+  // the reader copies 5 into BOTH per-head rate fields, while the printed CGST/SGST
+  // AMOUNTS (6.33 each on ~253 taxable) are the true 2.5% halves. The register must
+  // export 5% / "Purchase @ 5%", NOT the doubled 10%.
+  const dev = {
+    taxable_value: 253.41, cgst_amount: 6.33, sgst_amount: 6.33, igst_amount: 0,
+    cgst_rate_percent: 5, sgst_rate_percent: 5,
+  }
+  assert.equal(tallyMap.overallGstRatePercent(dev, 'local'), 5, 'combined 5% stays 5%, not 10%')
+  assert.equal(tallyMap.tallyDefaultLedgerName(tallyMap.overallGstRatePercent(dev, 'local')), 'Purchase @ 5%')
+  const derived = slices.deriveSlicesFromInvoiceHeads(dev)
+  assert.equal(derived.length, 1)
+  assert.equal(derived[0].rate_percent, 5, 'the derived slice carries the printed combined rate')
+  assert.equal(derived[0].treatment, 'local')
+  // Robust to the small taxable misread the export showed (252.68 vs 253.41).
+  assert.equal(tallyMap.overallGstRatePercent({ ...dev, taxable_value: 252.68 }, 'local'), 5)
+})
+
+test('genuine equal halves still sum, and a real 10% bill is never wrongly halved', () => {
+  // A true 18% intra-state bill (9% + 9%, amounts 90/90 on 1000) still resolves 18.
+  assert.equal(tallyMap.overallGstRatePercent({
+    taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0,
+    cgst_rate_percent: 9, sgst_rate_percent: 9,
+  }, 'local'), 18, 'halves tie to the amounts -> keep the sum')
+  // A true 10% bill (5% + 5%, amounts 50/50 on 1000) must NOT collapse to 5%: the
+  // halves sum ties to the printed amounts, so the sum wins over the combined read.
+  assert.equal(tallyMap.overallGstRatePercent({
+    taxable_value: 1000, cgst_amount: 50, sgst_amount: 50, igst_amount: 0,
+    cgst_rate_percent: 5, sgst_rate_percent: 5,
+  }, 'local'), 10, 'a genuine 10% (5+5) is not mistaken for a copied 5% total')
+})
+
 // ---- validation: decimal-safe, additive, fail-toward-review ----
 
 test('a consistent mixed-rate breakdown validates with zero reasons', () => {
