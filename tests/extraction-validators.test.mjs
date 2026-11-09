@@ -284,3 +284,65 @@ test('GSTIN printed with a space after the state code is still found', async () 
   const hits = gstin.findAllGstins('GSTIN: 32 ADRPJ8730C1ZN\nGSTIN 32ACXPV2326B1ZL')
   assert.deepEqual(hits.map((h) => h.value), ['32ADRPJ8730C1ZN', '32ACXPV2326B1ZL'])
 })
+
+test('supplier header wins over For Supplier footer', () => {
+  const candidate = textParser.parseInvoiceText([
+    'TAX INVOICE',
+    'Blue Ridge Industries',
+    'Kozhikode, Kerala - 673001',
+    'GSTIN: 32AAEFG1234C1Z9 | State: 32-Kerala',
+    'Bill To: Anandhu Enterprises',
+    'Thrissur, Kerala - 680005',
+    'GSTIN: 32AABCT1234G1ZX',
+    'Invoice No: INV-2026-10-103',
+    'Invoice Date: 20-Oct-2026',
+    'Taxable Value: 25000.00',
+    'CGST: 3125.00',
+    'SGST: 3125.00',
+    'Grand Total: 31250.00',
+    'Declaration: This is a computer generated invoice.',
+    'For Supplier',
+  ].join('\n'))
+
+  assert.equal(candidate.vendor_name, 'Blue Ridge Industries')
+})
+
+test('merge rejects generic local supplier and preserves valid AI supplier', () => {
+  const merged = ledger.mergeCandidates(
+    { vendor_name: 'For' },
+    { vendor_name: 'Blue Ridge Industries' },
+  )
+
+  assert.equal(merged.vendor_name, 'Blue Ridge Industries')
+})
+
+test('merge preserves valid local supplier over generic AI supplier', () => {
+  const merged = ledger.mergeCandidates(
+    { vendor_name: 'Blue Ridge Industries' },
+    { vendor_name: 'For' },
+  )
+
+  assert.equal(merged.vendor_name, 'Blue Ridge Industries')
+})
+
+test('generic For supplier name is rejected', () => {
+  const result = ledger.evaluateLedger(
+    {
+      ...BASE,
+      vendor_name: 'For',
+    },
+    { minConfidence: 0.8, now: NOW },
+  )
+
+  assert.equal(result.review, 'needs_review')
+  assert.ok(result.reasons.includes('vendor-name-placeholder'))
+})
+
+test('different valid supplier names are detected as a conflict', () => {
+  const conflicts = ledger.detectCandidateConflicts(
+    { vendor_name: 'Blue Ridge Industries' },
+    { vendor_name: 'Green Valley Traders' },
+  )
+
+  assert.ok(conflicts.includes('vendor_name'))
+})

@@ -172,6 +172,12 @@ const VENDOR_SUFFIX =
 const VENDOR_SUFFIX_WEAK =
   /\b(supplies|associates|agencies|merchants|distributors|ventures|industries)\b/i
 const VENDOR_LABEL = /\b(supplier|seller|vendor|from|billed by|invoice from|sold by)\b/i
+// Footer/signatory declarations are not supplier names. Examples: "For Supplier",
+// "For Seller", "For and on behalf of Blue Ridge Industries", and signature lines.
+const FOOTER_DECLARATION =
+  /^for\s+(?:(?:and\s+on\s+behalf\s+of)\s+)?(?:the\s+)?(?:supplier|seller|vendor)\s*:?$/i
+const SIGNATORY_FOOTER =
+  /^(?:authori[sz]ed\s+signatory|authori[sz]ed\s+representative|signature|declaration)\b/i
 // §supplier/recipient: the BUYER block is never the supplier. A registered-firm
 // suffix (Enterprises / Traders / Pvt Ltd) is carried by the CUSTOMER's name just
 // as often as the supplier's, so a suffix match alone cannot decide the party —
@@ -209,41 +215,56 @@ function stripVendorLabel(line: string): string | null {
  * one ships silently in the register).
  */
 function findVendor(text: string): { value: string; confidence: number } | null {
-  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
   let labelled: { value: string; confidence: number } | null = null
   let tradingHouse: string | null = null
   let inBuyerBlock = false
+  let inFooter = false
+
   for (const line of lines) {
     if (line.toUpperCase().includes('GSTIN') || line.toUpperCase().includes('UIN')) continue
-    // Track the buyer region: everything from a "Bill To"/"Buyer"/"To:" heading
-    // until a supplier heading or the tax table belongs to the CUSTOMER.
-    if (BUYER_HEADING.test(line)) { inBuyerBlock = true; continue }
+
+    if (SIGNATORY_FOOTER.test(line)) {
+      inFooter = true
+      continue
+    }
+
+    if (inFooter) continue
+    if (FOOTER_DECLARATION.test(line)) continue
+
+    if (BUYER_HEADING.test(line)) {
+      inBuyerBlock = true
+      continue
+    }
     if (inBuyerBlock) {
       if (VENDOR_LABEL.test(line) || TAX_TABLE_SECTION.test(line)) inBuyerBlock = false
       else continue
     }
-    // A line that itself names a recipient role is buyer-side wherever it prints.
+
     if (BUYER_LABEL.test(line)) continue
     if (VENDOR_SUFFIX.test(line) && line.length <= 80) {
-      // Prefer the labeled supplier line when it also carries the suffix — recorded
-      // WITHOUT its own label, so the register reads `Acme Traders Pvt Ltd` and not
-      // `Sold By: Acme Traders Pvt Ltd`.
       if (VENDOR_LABEL.test(line)) {
-        return { value: stripVendorLabel(line) ?? line, confidence: CONF_STRONG }
+        const value = stripVendorLabel(line)
+        if (value) return { value, confidence: CONF_STRONG }
       }
       if (!labelled) labelled = { value: line, confidence: CONF_STRONG }
     }
     if (!labelled && VENDOR_LABEL.test(line)) {
-      const after = stripVendorLabel(line)
-      if (after) labelled = { value: after, confidence: CONF_WEAK }
+      const value = stripVendorLabel(line)
+      if (value && !/^for$/i.test(value)) {
+        labelled = { value, confidence: CONF_WEAK }
+      }
     }
-    // Last-resort tier: a name-shaped trading-house line, kept only if nothing
-    // stronger turned up anywhere on the page.
     if (!tradingHouse && line.length <= 80 && !/\d/.test(line)
       && !TAX_TABLE_SECTION.test(line) && VENDOR_SUFFIX_WEAK.test(line)) {
       tradingHouse = line
     }
   }
+
   return labelled ?? (tradingHouse ? { value: tradingHouse, confidence: CONF_WEAK } : null)
 }
 

@@ -196,6 +196,15 @@ function isPlaceholderText(value: string): boolean {
   return PLACEHOLDER_TEXT.test(value.trim().replace(/[:._-]+/g, ' ').replace(/\s+/g, ' '))
 }
 
+function isValidVendorName(value: string | null | undefined): boolean {
+  const name = (value ?? '').trim()
+  if (!name || isPlaceholderText(name)) return false
+  if (/^(?:for|supplier|seller|vendor|buyer|customer|recipient)$/i.test(name)) {
+    return false
+  }
+  return /[A-Za-z]/.test(name)
+}
+
 /**
  * Month names accepted for textual invoice dates. ONLY an exact 3-letter
  * abbreviation, the common `sept`, or a full English name — never a fuzzy
@@ -377,7 +386,7 @@ export function mergeCandidates(
     }
   }
   copyText('invoice_number', isTextValid)
-  copyText('vendor_name', isTextValid)
+  copyText('vendor_name', isValidVendorName)
 
   if (isDateValid(primary.invoice_date)) {
     merged.invoice_date = (primary.invoice_date ?? '').trim()
@@ -526,7 +535,7 @@ export function evaluateLedger(
   else if (!invoiceNumberValid) reasons.push('invoice-number-placeholder')
 
   const vendorName = (candidate.vendor_name ?? '').trim();
-  const vendorNameValid = vendorName !== '' && !isPlaceholderText(vendorName)
+  const vendorNameValid = isValidVendorName(vendorName)
   if (!vendorName) reasons.push('vendor-name-missing')
   else if (!vendorNameValid) reasons.push('vendor-name-placeholder')
 
@@ -784,13 +793,14 @@ export function evaluateLedger(
  * when BOTH sources produced an independently VALID, materially different value —
  * a repair of a value one source left missing/garbage is NOT a conflict.
  */
-const CRITICAL_CONFLICT_FIELDS = ['invoice_date', 'invoice_number', 'supplier_gstin', 'total_amount'] as const
+const CRITICAL_CONFLICT_FIELDS = ['invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'total_amount'] as const
 
 const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v))
 
 function fieldIndependentlyValid(field: string, raw: unknown): boolean {
   switch (field) {
     case 'invoice_date': return parseInvoiceDate(asText(raw)) !== null
+    case 'vendor_name': return isValidVendorName(asText(raw))
     case 'supplier_gstin': return gstinFullyValid(asText(raw).trim().toUpperCase())
     case 'invoice_number': { const s = asText(raw).trim(); return s !== '' && !isPlaceholderText(s) }
     case 'total_amount': return moneyToMinorUnits(raw as number | string | null | undefined) !== null
