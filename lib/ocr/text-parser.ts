@@ -210,10 +210,32 @@ function stripVendorLabel(line: string): string | null {
  */
 function findVendor(text: string): { value: string; confidence: number } | null {
   const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
+
+  // Prefer the issuer block immediately below the TAX INVOICE heading. Footer
+  // signature text such as "For Supplier" is not a supplier label/value and
+  // must never override a plausible issuer printed in the header.
+  const titleIndex = lines.findIndex((line) => /\btax\s+invoice\b/i.test(line))
+  if (titleIndex >= 0) {
+    for (const raw of lines.slice(titleIndex + 1)) {
+      const line = raw.replace(/^TAX\s+INVOICE\s*/i, '').trim()
+      if (!line) continue
+      if (BUYER_HEADING.test(line) || BUYER_LABEL.test(line)) break
+      if (/\b(?:gstin|uin|invoice\s*(?:no|number|date)|place\s+of\s+supply|reverse\s+charge)\b/i.test(line)) continue
+      if (/^for\b/i.test(line) || /^(?:authori[sz]ed|signature|declaration|e\.?\s*&\s*o\.?\s*e\.?)\b/i.test(line)) continue
+      if (/\d/.test(line) || TAX_TABLE_SECTION.test(line)) continue
+      if (VENDOR_SUFFIX.test(line) || VENDOR_SUFFIX_WEAK.test(line)) {
+        return { value: line.slice(0, 80).trim(), confidence: CONF_STRONG }
+      }
+    }
+  }
+
   let labelled: { value: string; confidence: number } | null = null
   let tradingHouse: string | null = null
   let inBuyerBlock = false
   for (const line of lines) {
+    // "For Supplier", "For M/s ...", authorised-signatory and declaration
+    // footer lines describe the signature block, not the seller identity.
+    if (/^for\b/i.test(line) || /^(?:authori[sz]ed|signature|declaration|e\.?\s*&\s*o\.?\s*e\.?)\b/i.test(line)) continue
     if (line.toUpperCase().includes('GSTIN') || line.toUpperCase().includes('UIN')) continue
     // Track the buyer region: everything from a "Bill To"/"Buyer"/"To:" heading
     // until a supplier heading or the tax table belongs to the CUSTOMER.
@@ -298,6 +320,87 @@ export function detectDocumentType(
  * no-slice path untouched. The slices are then validated/reconciled downstream in
  * ledger.ts; a bad parse can only force review, never fabricate a value here.
  */
+/**
+ * Parse item-table rows that carry their GST rate inline in the description,
+ * for example:
+ *   1 Steel Rods - HSN 7214 @ 18% 100 75.00 7500.00 675.00 675.00 8850.00
+ *
+ * Only accept a row when its trailing monetary columns independently satisfy
+ * BOTH the printed percentage and the line total. This deliberately avoids
+ * treating HSN codes, quantities, unit prices or arbitrary percentages as tax
+ * evidence. The invoice-level validator later reconciles the aggregated slices
+ * against the printed taxable/CGST/SGST/IGST/grand-total heads.
+ */
+export function parseItemLevelTaxSlices(text: string): InvoiceTaxSlice[] | null {
+  const byRate = new Map<number, {
+    rate: number; taxable: number; cgst: number; sgst: number; igst: number;
+    treatment: 'local' | 'interstate'
+  }>()
+  const amountTokens = (value: string): number[] =>
+    (value.match(/\d[\d,]*(?:\.\d{1,2})?/g) ?? [])
+      .map((token) => Number(token.replace(/,/g, '')))
+      .filter((n) => Number.isFinite(n) && n >= 0)
+  const close = (a: number, b: number): boolean => Math.abs(a - b) <= 1.01
+
+  for (const raw of (text ?? '').replace(/\r/g, '').split('\n')) {
+    const rateMatch = /@\s*(\d{1,2}(?:\.\d{1,2})?)\s*%/i.exec(raw)
+    if (!rateMatch) continue
+    const rate = Number(rateMatch[1])
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) continue
+    const values = amountTokens(raw.slice(rateMatch.index + rateMatch[0].length))
+    let treatment: 'local' | 'interstate' | null = null
+    let taxable = 0, cgst = 0, sgst = 0, igst = 0
+
+    // Intra-state item row: ... qty, unit rate, taxable, CGST, SGST, line total.
+    if (values.length >= 6) {
+      const tail = values.slice(-4)
+      const [base, central, state, total] = tail
+      if (close(central, base * rate / 200)
+        && close(state, base * rate / 200)
+        && close(total, base + central + state)) {
+        treatment = 'local'
+        taxable = base; cgst = central; sgst = state
+      }
+    }
+
+    // Interstate item row: ... qty, unit rate, taxable, IGST, line total.
+    if (!treatment && values.length >= 5) {
+      const tail = values.slice(-3)
+      const [base, integrated, total] = tail
+      if (close(integrated, base * rate / 100)
+        && close(total, base + integrated)) {
+        treatment = 'interstate'
+        taxable = base; igst = integrated
+      }
+    }
+    if (!treatment) continue
+
+    const key = Number(rate.toFixed(2))
+    const prior = byRate.get(key)
+    if (prior && prior.treatment !== treatment) return null
+    const agg = prior ?? { rate: key, taxable: 0, cgst: 0, sgst: 0, igst: 0, treatment }
+    agg.taxable += taxable
+    agg.cgst += cgst
+    agg.sgst += sgst
+    agg.igst += igst
+    byRate.set(key, agg)
+  }
+
+  if (byRate.size < 2) return null
+  return [...byRate.values()].sort((a, b) => a.rate - b.rate).map((agg) => ({
+    rate_percent: agg.rate,
+    taxable_value: round2(agg.taxable),
+    cgst_amount: agg.treatment === 'local' ? round2(agg.cgst) : null,
+    sgst_amount: agg.treatment === 'local' ? round2(agg.sgst) : null,
+    igst_amount: agg.treatment === 'interstate' ? round2(agg.igst) : null,
+    cess_amount: null,
+    treatment: agg.treatment,
+    provenance: 'printed-summary',
+    confidence: CONF_STRONG,
+    validation_status: 'unvalidated',
+  }))
+}
+
 export function parseRateWiseSummary(text: string): InvoiceTaxSlice[] | null {
   const numTokens = (s: string): number[] =>
     (s.match(/\d[\d,]*(?:\.\d{1,2})?/g) ?? [])
@@ -454,7 +557,8 @@ export function parseInvoiceText(
   // §multi-rate: attach a printed rate-wise breakdown ONLY when the summary clearly
   // evidenced two or more distinct rates. A single-rate bill yields null here and
   // behaves exactly as before.
-  const summarySlices = parseRateWiseSummary(normalized)
+  const itemSlices = parseItemLevelTaxSlices(normalized)
+  const summarySlices = itemSlices ?? parseRateWiseSummary(normalized)
   if (summarySlices) candidate.tax_slices = summarySlices
 
   return candidate

@@ -577,3 +577,34 @@ test('the vision schema ASKS for the printed rate-wise breakdown, and keeps it o
   assert.ok(requiredLists.length > 0, 'the schema declares a required list')
   assert.ok(requiredLists.every((r) => !r.includes('tax_slices')), 'tax_slices stays optional')
 })
+
+test('item-level inline GST rates parse mixed slabs and reconcile the attached invoice', () => {
+  const raw = [
+    'TAX INVOICE',
+    'Blue Ridge Industries',
+    'Bill To: Anandhu Enterprises',
+    'GSTIN: 32AAEFG1234C1Z9 | State: 32-Kerala',
+    'Invoice No: INV-2026-10-103',
+    'Invoice Date: 20-Oct-2026',
+    '1 Steel Rods - HSN 7214 @ 18% 100 75.00 7500.00 675.00 675.00 8850.00',
+    '2 Cement Bags - HSN 2523 @ 28% 50 350.00 17500.00 2450.00 2450.00 22400.00',
+    'TOTAL 25000.00 3125.00 3125.00 31250.00',
+    'For Supplier',
+  ].join('\\n')
+  const candidate = textParser.parseInvoiceText(raw)
+  assert.equal(candidate.vendor_name, 'Blue Ridge Industries')
+  assert.deepEqual(candidate.tax_slices.map((s) => ({
+    rate: s.rate_percent, taxable: s.taxable_value, cgst: s.cgst_amount, sgst: s.sgst_amount,
+  })), [
+    { rate: 18, taxable: 7500, cgst: 675, sgst: 675 },
+    { rate: 28, taxable: 17500, cgst: 2450, sgst: 2450 },
+  ])
+  const evaluated = ledger.evaluateLedger({
+    invoice_date: '20-Oct-2026', invoice_number: 'INV-2026-10-103',
+    vendor_name: candidate.vendor_name, supplier_gstin: '32AAEFG1234C1Z9',
+    taxable_value: 25000, cgst_amount: 3125, sgst_amount: 3125, igst_amount: 0,
+    total_amount: 31250, tax_slices: candidate.tax_slices,
+  }, { minConfidence: 0.8, now: NOW })
+  assert.equal(evaluated.breakdownValidated, true)
+  assert.equal(evaluated.review, 'approved')
+})
