@@ -590,7 +590,7 @@ test('item-level inline GST rates parse mixed slabs and reconcile the attached i
     '2 Cement Bags - HSN 2523 @ 28% 50 350.00 17500.00 2450.00 2450.00 22400.00',
     'TOTAL 25000.00 3125.00 3125.00 31250.00',
     'For Supplier',
-  ].join('\\n')
+  ].join('\n')
   const candidate = textParser.parseInvoiceText(raw)
   assert.equal(candidate.vendor_name, 'Blue Ridge Industries')
   assert.deepEqual(candidate.tax_slices.map((s) => ({
