@@ -615,12 +615,9 @@ async function extractScannedPdf(
 }
 
 /**
- * The image Gemini receives. NOT the OCR copy: normalizeImageToPng() makes a
- * greyscale, contrast-stretched, up-to-2400px PNG for Tesseract (3.0 MB for a
- * 126 KB phone JPEG), and uploading that 4 MB payload is what timed the call out.
- * Vision models want the colour page at a modest size: EXIF-rotated, long edge
- * <= 1600 px, JPEG q82 (typically 100-400 KB). Still decodes anything sharp can
- * (HEIC/TIFF/WebP...), so unsupported-type handling is unchanged.
+ * Gemini receives a separate bounded colour JPEG. Tesseract receives a
+ * lossless, original-resolution PNG so local OCR does not lose decimal points
+ * or trailing zeroes through resizing, sharpening or contrast transforms.
  */
 const VISION_MAX_EDGE = 1600
 const VISION_JPEG_QUALITY = 82
@@ -894,12 +891,10 @@ export async function extractInvoice(
 
       let aiEvaluation = evaluateLedger(assisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
       let secondPass = false
-      // Bounded second pass: a targeted re-read can fix a misread digit, a
-      // swapped party or a wrong total — but a field simply absent from the
-      // page is never "fixed" by asking again (retryHintFor returns null for
-      // those reasons). Exactly one extra provider call, same model; the hint
-      // still forbids guessing and the merge below can never downgrade a
-      // validated local approval.
+      // Bounded second pass: only a printed total mismatch can trigger it.
+      // Tesseract must first locate the Grand Total / Net Payable row; Gemini
+      // receives that crop and is asked to transcribe one field only. If the
+      // region is absent or unreadable, no repeat full-page question is sent.
       if (aiEvaluation.review === 'needs_review') {
         const totalMismatch = aiEvaluation.reasons.some((reason) => reason.startsWith('total-mismatch'))
         const hint = totalMismatch ? retryHintFor(aiEvaluation.reasons, { buyerGstin }) : null
