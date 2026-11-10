@@ -2726,8 +2726,10 @@ test('P17 the 17 Oct failure: fewer hard failures outrank completeness', () => {
   assert.equal(chosen.evaluation.review, 'needs_review', 'the merge still requires review (nothing weakened)')
   assert.ok(mergedEval.reasons.some((r) => r.startsWith('total-mismatch')), 'the rejected richer candidate retains its total contradiction')
   assert.ok(mergedEval.reasons.some((r) => r.startsWith('amount-words-total-mismatch')), 'the rejected richer candidate retains its words mismatch')
-  // And the resolved month-name date lets it batch into the right month.
-  assert.equal(chosen.evaluation.invoiceDateResolved, true)
+  // The sparse local candidate has no date; the richer contradictory candidate's
+  // date is not copied across because missing fields stay missing when rejected.
+  assert.equal(chosen.evaluation.invoiceDateResolved, false)
+  assert.equal(mergedEval.invoiceDateResolved, true)
 })
 
 test('P18 completeness-first is bounded: at equal completeness a contradiction loses to a clean row', () => {
