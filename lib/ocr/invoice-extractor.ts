@@ -358,11 +358,11 @@ async function cropGrandTotalRegion(png: Buffer, data: unknown): Promise<Buffer 
   } catch { return null }
 }
 
-async function recognizeText(png: Buffer, worker: OcrWorker): Promise<OcrRecognition> {
+async function recognizeText(png: Buffer, worker: OcrWorker, captureGrandTotalCrop = false): Promise<OcrRecognition> {
   try {
     const result = await worker.recognize(png)
     const text = result.data.text || ''
-    const grandTotalCrop = await cropGrandTotalRegion(png, result.data)
+    const grandTotalCrop = captureGrandTotalCrop ? await cropGrandTotalRegion(png, result.data) : null
     logger.info('[OCR] recognize complete', { chars: text.length, sourceBytes: png.length, grandTotalRegionFound: grandTotalCrop !== null })
     return { text, grandTotalCrop }
   } catch (error) {
@@ -663,6 +663,7 @@ async function extractLocal(
   mimeType: string,
   maxPdfPages: number,
   buyerGstin: string | null,
+  captureGrandTotalCrop: boolean,
 ): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean; text: string; grandTotalCrop: Buffer | null }> {
   if (mimeType === PDF_MIME) {
     // Prefer genuine embedded text before spending CPU on OCR. Read it PAGE BY
@@ -708,7 +709,7 @@ async function extractLocal(
 
   const originalMeta = await sharp(buffer, { limitInputPixels: MAX_IMAGE_PIXELS, animated: false, failOn: 'error' }).metadata()
   const png = await normalizeImageToPng(buffer)
-  const recognition = await withOcrWorker((worker) => recognizeText(png, worker))
+  const recognition = await withOcrWorker((worker) => recognizeText(png, worker, captureGrandTotalCrop))
   const text = recognition.text
   const ocrMeta = await sharp(png).metadata()
   logger.info('[OCR] image input diagnostics', {
@@ -802,7 +803,7 @@ export async function extractInvoice(
   const localStartedAt = Date.now()
 
   try {
-    const local = await extractLocal(buffer, mimeType, maxPdfPages, buyerGstin)
+    const local = await extractLocal(buffer, mimeType, maxPdfPages, buyerGstin, allowAI)
     candidate = local.candidate
     pagesProcessed = local.pagesProcessed
     multiInvoiceDetected = local.multiInvoiceDetected
