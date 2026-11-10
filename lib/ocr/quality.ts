@@ -184,6 +184,6 @@ export function checkLedgerRowAnomalies(row: {
       reasons.push('total could not be reconciled from the available components')
     }
   }
-  if (reasons.length > 0) logger.warn('ledger row anomaly', { reasons })
+  if (reasons.length > 0) logger.warn('ledger row anomaly', { reasonCodes: reasons.map((reason) => reason.split(':')[0]) })
   return { ok: reasons.length === 0, reasons, score: reasons.length === 0 ? 1 : 0 }
 }
