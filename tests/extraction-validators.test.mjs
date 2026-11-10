@@ -7,6 +7,8 @@ const words = await importTs('lib/ocr/validators/amount-words.ts')
 const taxRates = await importTs('lib/ocr/validators/tax-rates.ts')
 const textParser = await importTs('lib/ocr/text-parser.ts')
 const ledger = await importTs('lib/ocr/ledger.ts')
+const gstin = await importTs('lib/ocr/gstin.ts')
+const ocrRaster = await importTs('lib/ocr/ocr-raster.ts')
 
 const NOW = new Date('2026-10-16T00:00:00Z')
 const BASE = {
@@ -27,6 +29,55 @@ test('money validator uses integer paise and rejects malformed values', () => {
   assert.equal(money.moneyToMinorUnits('1.005'), 101n)
   assert.equal(money.moneyToMinorUnits('not money'), null)
   assert.equal(money.minorUnitsToString(-123n), '-1.23')
+})
+
+test('OCR raster sizing enlarges small WhatsApp images without exceeding hard bounds', () => {
+  assert.deepEqual(ocrRaster.getOcrRasterSize(1240, 1754), { width: 2480, height: 3508 })
+  assert.deepEqual(ocrRaster.getOcrRasterSize(4000, 3000), { width: 4000, height: 3000 })
+  const bounded = ocrRaster.getOcrRasterSize(3000, 3000, 8_000_000, 3508, 2)
+  assert.ok(bounded.width * bounded.height <= 8_000_000)
+  assert.ok(Math.max(bounded.width, bounded.height) <= 3508)
+})
+
+test('OCR month aliases are surfaced as a proposed date and always require review', () => {
+  const corrected = ledger.evaluateLedger(
+    { ...BASE, invoice_date: '02 Not 2026' },
+    { minConfidence: 0.8, now: new Date('2026-11-10T00:00:00Z') },
+  )
+  assert.ok(corrected.reasons.includes('invoice-date-ocr-normalized'))
+  assert.equal(corrected.review, 'needs_review')
+
+  const future = ledger.evaluateLedger(
+    { ...BASE, invoice_date: '20-0ct.2028' },
+    { minConfidence: 0.8, now: new Date('2026-11-10T00:00:00Z') },
+  )
+  assert.ok(future.reasons.includes('invoice-date-ocr-normalized'))
+  assert.ok(future.reasons.includes('invoice-date-future'))
+  assert.equal(future.review, 'needs_review')
+})
+
+test('GSTIN extraction tolerates OCR spaces between printed character groups', () => {
+  const hits = gstin.findAllGstins('GSTIN: 32 AAEFG 1234 C1Z9')
+  assert.deepEqual(hits.map((hit) => hit.value), ['32AAEFG1234C1Z9'])
+})
+
+test('local money parser preserves a printed decimal and never invents one when OCR drops it', () => {
+  const parsed = textParser.parseInvoiceText([
+    'TAX INVOICE',
+    'ACME TRADERS PVT LTD',
+    'GSTIN: 27AAPFU0939F1ZV',
+    'Invoice No: INV-42',
+    'Invoice Date: 05/09/2026',
+    'Taxable Value: 4,850.00',
+    'CGST: 291.00',
+    'SGST: 291.00',
+    'Grand Total: 5,432.00',
+  ].join('\\n'))
+  assert.equal(parsed.taxable_value, 4850)
+  assert.equal(parsed.total_amount, 5432)
+
+  const lostDecimal = textParser.parseInvoiceText('Grand Total: 543200')
+  assert.equal(lostDecimal.total_amount, 543200)
 })
 
 test('ledger arithmetic is exact for decimal fractions', () => {
