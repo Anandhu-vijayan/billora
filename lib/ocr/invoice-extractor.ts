@@ -286,6 +286,9 @@ async function normalizeImageToPng(buffer: Buffer): Promise<Buffer> {
       throw new InvoiceExtractionError('IMAGE_PIXEL_LIMIT_EXCEEDED')
     }
 
+    // Keep the source pixel grid intact for Tesseract. Resizing, contrast
+    // stretching and sharpening can erase decimal points or merge zeroes.
+    // Rotate/flatten only and encode losslessly; never resample this OCR copy.
     return await sharp(buffer, {
       limitInputPixels: MAX_IMAGE_PIXELS,
       animated: false,
@@ -293,15 +296,6 @@ async function normalizeImageToPng(buffer: Buffer): Promise<Buffer> {
     })
       .rotate()
       .flatten({ background: '#ffffff' })
-      .greyscale()
-      .normalize()
-      .sharpen()
-      .resize({
-        width: MAX_RENDER_DIMENSION,
-        height: MAX_RENDER_DIMENSION,
-        fit: 'inside',
-        withoutEnlargement: false,
-      })
       .png()
       .toBuffer()
   } catch (error) {
@@ -354,6 +348,43 @@ async function recognizeText(png: Buffer, worker: OcrWorker): Promise<string> {
   }
 }
 
+interface OcrRecognition {
+  text: string
+  grandTotalCrop: Buffer | null
+}
+
+async function cropGrandTotalRegion(png: Buffer, data: unknown): Promise<Buffer | null> {
+  const lines = (data as { lines?: Array<{ text?: string; bbox?: { x0?: number; y0?: number; x1?: number; y1?: number } }> })?.lines
+  if (!Array.isArray(lines)) return null
+  const target = lines.find((line) => /\\b(?:grand\\s*total|net\\s*payable|total\\s*invoice\\s*value|invoice\\s*total|amount\\s*payable)\\b/i.test(line.text ?? ''))
+  const box = target?.bbox
+  if (!box || ![box.x0, box.y0, box.x1, box.y1].every((n) => typeof n === 'number' && Number.isFinite(n))) return null
+  const meta = await sharp(png).metadata()
+  if (!meta.width || !meta.height) return null
+  const lineHeight = Math.max(1, (box.y1 as number) - (box.y0 as number))
+  const cropHeight = Math.min(meta.height, Math.max(160, Math.ceil(lineHeight * 9)))
+  const top = Math.max(0, Math.min(meta.height - cropHeight, Math.floor((box.y0 as number) - lineHeight * 2)))
+  try {
+    return await sharp(png)
+      .extract({ left: 0, top, width: meta.width, height: cropHeight })
+      .resize({ width: meta.width * 2, height: cropHeight * 2, fit: 'fill' })
+      .png()
+      .toBuffer()
+  } catch { return null }
+}
+
+async function recognizeText(png: Buffer, worker: OcrWorker): Promise<OcrRecognition> {
+  try {
+    const result = await worker.recognize(png)
+    const text = result.data.text || ''
+    const grandTotalCrop = await cropGrandTotalRegion(png, result.data)
+    logger.info('[OCR] recognize complete', { chars: text.length, sourceBytes: png.length, grandTotalRegionFound: grandTotalCrop !== null })
+    return { text, grandTotalCrop }
+  } catch (error) {
+    logger.warn('[OCR] tesseract worker failed', { error: error instanceof Error ? error.message : String(error) })
+    throw new InvoiceExtractionError('LOCAL_OCR_FAILED', true)
+  }
+}
 function candidateHasUsefulFields(candidate: LedgerCandidate): boolean {
   return Boolean(
     candidate.invoice_date ||
@@ -563,7 +594,8 @@ async function extractScannedPdf(
         }).promise
 
         const png = await normalizeImageToPng(surface.toBuffer('image/png'))
-        const text = await recognizeText(png, worker)
+        const recognition = await recognizeText(png, worker)
+        const text = recognition.text
 
         if (hasMeaningfulText(text)) {
           texts.push(text)
@@ -649,7 +681,7 @@ async function extractLocal(
   mimeType: string,
   maxPdfPages: number,
   buyerGstin: string | null,
-): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean; text: string }> {
+): Promise<{ candidate: LedgerCandidate | null; pagesProcessed: number; multiInvoiceDetected: boolean; text: string; grandTotalCrop: Buffer | null }> {
   if (mimeType === PDF_MIME) {
     // Prefer genuine embedded text before spending CPU on OCR. Read it PAGE BY
     // PAGE and group by invoice number (§P3-14), so a digital PDF holding two
@@ -672,6 +704,7 @@ async function extractLocal(
           pagesProcessed: 0,
           multiInvoiceDetected: combined.multiInvoiceDetected,
           text: meaningfulPages.join('\n'),
+          grandTotalCrop: null,
         }
       }
     } catch {
@@ -687,11 +720,20 @@ async function extractLocal(
       pagesProcessed: scanned.pagesProcessed,
       multiInvoiceDetected: combined.multiInvoiceDetected,
       text: scanned.text,
+      grandTotalCrop: null,
     }
   }
 
+  const originalMeta = await sharp(buffer, { limitInputPixels: MAX_IMAGE_PIXELS, animated: false, failOn: 'error' }).metadata()
   const png = await normalizeImageToPng(buffer)
-  const text = await withOcrWorker((worker) => recognizeText(png, worker))
+  const recognition = await withOcrWorker((worker) => recognizeText(png, worker))
+  const text = recognition.text
+  const ocrMeta = await sharp(png).metadata()
+  logger.info('[OCR] image input diagnostics', {
+    inputBytes: buffer.length, inputWidth: originalMeta.width ?? null, inputHeight: originalMeta.height ?? null,
+    inputDensity: originalMeta.density ?? null, ocrWidth: ocrMeta.width ?? null,
+    ocrHeight: ocrMeta.height ?? null, ocrBytes: png.length,
+  })
   const meaningful = hasMeaningfulText(text)
   if (!meaningful) {
     // An image that OCRs to almost nothing is the exact silent failure that
@@ -710,6 +752,7 @@ async function extractLocal(
     pagesProcessed: 1,
     multiInvoiceDetected: false,
     text: meaningful ? text : '',
+    grandTotalCrop: recognition.grandTotalCrop,
   }
 }
 
@@ -755,6 +798,7 @@ export async function extractInvoice(
   // §Part-2 the local raw text (heading evidence for classification). Empty when
   // local OCR produced nothing usable or the read came only from the AI path.
   let localText = ''
+  let grandTotalCrop: Buffer | null = null
 
   // OPT-IN PARALLEL VISION (§P2-11). Off unless the caller AND the operator enable
   // it, so the default local-first posture is untouched: Gemini is contacted only
@@ -781,6 +825,7 @@ export async function extractInvoice(
     pagesProcessed = local.pagesProcessed
     multiInvoiceDetected = local.multiInvoiceDetected
     localText = local.text
+    grandTotalCrop = local.grandTotalCrop
 
     if (candidate) source = 'local'
   } catch (error) {
@@ -809,7 +854,7 @@ export async function extractInvoice(
     presentFieldNames: candidatePresentFields(candidate),
     review: evaluation?.review ?? 'no_candidate',
     confidence: evaluation?.confidence ?? null,
-    reasonCodes: evaluation?.reasons.slice(0, 8) ?? [],
+    reasonCodes: evaluation ? evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8) : [],
     localErrorCode,
     pagesProcessed,
   })
@@ -828,7 +873,7 @@ export async function extractInvoice(
       model,
       localFieldCount: candidateFieldCount(candidate),
       localFieldNames: candidatePresentFields(candidate),
-      reasonCodes: evaluation?.reasons.slice(0, 8) ?? ['local-candidate-missing'],
+      reasonCodes: evaluation ? evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8) : ['local-candidate-missing'],
       localErrorCode,
     })
     if (!aiStartedAt) aiStartedAt = Date.now()
@@ -856,7 +901,8 @@ export async function extractInvoice(
       // still forbids guessing and the merge below can never downgrade a
       // validated local approval.
       if (aiEvaluation.review === 'needs_review') {
-        const hint = retryHintFor(aiEvaluation.reasons, { buyerGstin })
+        const totalMismatch = aiEvaluation.reasons.some((reason) => reason.startsWith('total-mismatch'))
+        const hint = totalMismatch ? retryHintFor(aiEvaluation.reasons, { buyerGstin }) : null
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
         // The second read runs only if elapsed AI time plus one more ceiling fits
@@ -867,7 +913,9 @@ export async function extractInvoice(
           return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 50_000
         })()
         const budgetLeftForRetry = aiTotalBudgetMs - (Date.now() - aiStartedAt)
-        if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
+        if (hint && !grandTotalCrop) {
+          logger.info('[Extract] AI second pass skipped: Grand Total region not confidently located', { model })
+        } else if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
           logger.info('[Extract] AI second pass skipped: insufficient time budget', {
             model, elapsedMs: Date.now() - aiStartedAt,
             budgetLeftMs: budgetLeftForRetry, neededMs: visionCallTimeoutMs(),
@@ -877,13 +925,12 @@ export async function extractInvoice(
           logger.info('[Extract] AI second pass started', {
             model,
             durationMs: Date.now() - aiStartedAt,
-            reasonCodes: aiEvaluation.reasons.slice(0, 8),
+            reasonCodes: aiEvaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
           })
-          const retryCandidate = await extractInvoiceFields(
-            mimeType === PDF_MIME
-              ? { buffer, mimeType: PDF_MIME, apiKey, model, hint }
-              : { buffer: await prepareImageForVision(buffer), mimeType: 'image/jpeg', apiKey, model, hint },
-          )
+          const retryCandidate = await extractInvoiceFields({
+            buffer: grandTotalCrop as Buffer, mimeType: 'image/png', apiKey, model, hint,
+            targetField: 'total_amount',
+          })
           const retryAssisted = candidate
             ? mergeCandidates(candidate, retryCandidate)
             : retryCandidate
@@ -895,7 +942,7 @@ export async function extractInvoice(
             fieldNames: candidatePresentFields(retryCandidate),
             review: retryEvaluation.review,
             confidence: retryEvaluation.confidence,
-            reasonCodes: retryEvaluation.reasons.slice(0, 8),
+            reasonCodes: retryEvaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
           })
           // Adopt the re-read only when it is the BETTER merged result under the
           // SAME ranking the final decision uses (approval, then completeness, then
@@ -919,7 +966,7 @@ export async function extractInvoice(
         fieldNames: candidatePresentFields(aiCandidate),
         review: aiEvaluation.review,
         confidence: aiEvaluation.confidence,
-        reasonCodes: aiEvaluation.reasons.slice(0, 8),
+        reasonCodes: aiEvaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
         secondPass,
       })
 
@@ -960,20 +1007,20 @@ export async function extractInvoice(
       logger.info('[Extract] candidate selected', {
         model,
         chosenSource: source,
-        selectionBasis: 'approved>completeness>hardFailures>confidence',
+        selectionBasis: 'approved>hardFailures>completeness>confidence',
         localFieldCount: candidateFieldCount(localCandidate),
         localFieldNames: candidatePresentFields(localCandidate),
         localRowCompleteness: localEvaluation ? presentFieldCount(localEvaluation.row) : 0,
         localHardFailures: localEvaluation ? hardValidationFailureCount(localEvaluation.reasons) : 0,
         aiFieldCount: candidateFieldCount(aiCandidate),
         aiFieldNames: candidatePresentFields(aiCandidate),
-        aiRowCompleteness: presentFieldCount(evaluation.row),
-        aiHardFailures: hardValidationFailureCount(evaluation.reasons),
+        aiRowCompleteness: presentFieldCount(aiEvaluation.row),
+        aiHardFailures: hardValidationFailureCount(aiEvaluation.reasons),
         selectedFieldCount: candidateFieldCount(candidate),
         conflictFields,
         review: evaluation.review,
         confidence: evaluation.confidence,
-        reasonCodes: evaluation.reasons.slice(0, 8),
+        reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
       })
     } catch (error) {
       if (error instanceof VisionTransientError) {
