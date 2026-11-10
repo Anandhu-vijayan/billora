@@ -191,9 +191,16 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     // so never auto-approve over it: downgrade to needs_review and make the reasons
     // name the exact fields, so the persisted status describes the selected candidate.
     const conflictFields = result.conflictFields ?? []
-    if (conflictFields.length > 0 && evaluation.review === 'approved') {
+    if (conflictFields.length > 0) {
       evaluation.review = 'needs_review'
-      evaluation.reasons = [...evaluation.reasons, ...conflictFields.map((f) => `candidate-conflict:${f}`)]
+      evaluation.reasons = evaluation.reasons.filter((reason) => !reason.startsWith('money-field-conflict:'))
+      const conflictReasons = conflictFields.map((field) => {
+        const values = result.candidate.field_conflicts?.[field]
+        return values
+          ? `money-field-conflict:${field}:local=${values.local}:ai=${values.ai}`
+          : `candidate-conflict:${field}`
+      })
+      evaluation.reasons = [...new Set([...evaluation.reasons, ...conflictReasons])]
       logger.info('[Extract] sources conflict on critical fields; forcing review', {
         invoiceId, jobId: job.id, source: confidenceSource, conflictFields,
       })
@@ -344,7 +351,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         invoiceId, jobId: job.id,
         mime: invoice.content_type,
         aiGate: env.EXTRACTION_ALLOW_AI !== true ? 'EXTRACTION_ALLOW_AI is not true' : 'EXTRACTION_AI_TIER is not paid',
-        reasons: evaluation.reasons.slice(0, 4),
+        reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 4),
       })
     }
 
@@ -389,7 +396,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         const value = result.candidate[field as keyof typeof result.candidate]
         return value !== undefined && value !== null && value !== ''
       }),
-      reasonCodes: evaluation.reasons.slice(0, 8),
+      reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
     })
     timing.mark('persist')
 
@@ -410,7 +417,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
         confidence: evaluation.confidence,
         rawCandidate: present(result.candidate as unknown as Record<string, unknown>),
         normalizedRow: present(evaluation.row as unknown as Record<string, unknown>),
-        reasonCodes: evaluation.reasons,
+        reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]),
       })
     }
 
@@ -452,7 +459,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       logger.info('[Extract] batch assignment complete', { invoiceId, jobId: job.id, batchId })
     } else {
       logger.info('[Extract] no reliable invoice date; left unbatched for review', {
-        invoiceId, jobId: job.id, reasonCodes: evaluation.reasons.slice(0, 8),
+        invoiceId, jobId: job.id, reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
       })
     }
     if (evaluation.review === 'needs_review') {
@@ -463,7 +470,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     logger.info('[Extract] stage timing', { invoiceId, jobId: job.id, ...timing.summary() })
     logger.info('[Extract] complete', {
       invoiceId, jobId: job.id, review: evaluation.review,
-      source: confidenceSource, reasonCodes: evaluation.reasons.slice(0, 8),
+      source: confidenceSource, reasonCodes: evaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
       mimeType: invoice.content_type, pagesProcessed: result.pagesProcessed,
     })
   } finally {
