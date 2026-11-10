@@ -47,6 +47,11 @@ test('amount-in-words parser supports Indian lakh/crore and paise values', () =>
   assert.equal(words.parseIndianAmountWords('INR One Thousand and Paise Fifty Only'), 100050n)
   assert.equal(words.parseIndianAmountWords('Rupees One Crore Only'), 1_000_000_000n)
   assert.equal(words.parseIndianAmountWords('Rupees One Banana Only'), null)
+  assert.deepEqual(words.parseNumericEquation('9000.00 + 225.00 + 225.00 = 9450.00'), {
+    parts: ['9000.00', '225.00', '225.00'], result: '9450.00',
+    isEquation: true, isIndependentEvidence: false,
+  })
+  assert.equal(words.parseIndianAmountWords('9000.00 + 225.00 + 225.00 = 9450.00'), null)
   assert.equal(words.amountWordsMatchNumeric('Rupees One Thousand One Hundred Eighty Only', 1180), true)
   assert.equal(words.amountWordsMatchNumeric('Rupees One Thousand Only', 1180), false)
 })
@@ -203,7 +208,7 @@ test('amount-in-words tolerates "Indian Rupee only" and paise-before-word format
   assert.equal(words.parseIndianAmountWords('INR One Thousand and Paise Fifty Only'), 100050n)
 })
 
-test('misread numeric total is repaired from the amount-in-words when the words tie to the components', () => {
+test('a misread total is repaired only when genuine words and components have independent local provenance', () => {
   // Real case from the 21 Oct 2026 log: Akkara Gold, total misread as 558502.93.
   const cand = {
     ...BASE,
@@ -217,11 +222,104 @@ test('misread numeric total is repaired from the amount-in-words when the words 
     total_amount: 558502.93,
     round_off: 0.29,
     total_amount_in_words: 'Five Lakh Seventy Five Thousand Three Hundred and Fifty One Indian Rupee only.',
+    field_sources: {
+      taxable_value: 'local', cgst_amount: 'local', sgst_amount: 'local', igst_amount: 'local',
+      total_amount_in_words: 'local',
+    },
   }
   const out = ledger.evaluateLedger(cand, { minConfidence: 0.8, now: NOW })
-  assert.equal(out.row.total_amount, 575351)
-  assert.deepEqual(out.repairs, ['total-from-words'])
+  assert.equal(out.row.total_amount, 575350.71)
+  assert.deepEqual(out.repairs, [{
+    field: 'total_amount', oldValue: 558502.93, newValue: 575350.71,
+    provenance: 'repaired: local genuine-words + local components agree',
+  }])
+  assert.equal(out.moneyReconciliation.printedTotal, 558502.93)
+  assert.equal(out.moneyReconciliation.derivedTotal, 575350.71)
+  assert.equal(out.moneyReconciliation.independentEvidence[0].independent, true)
+  assert.equal(out.moneyReconciliation.provenance, 'repaired: local genuine-words + local components agree')
   assert.ok(!out.reasons.some((r) => r.startsWith('total-mismatch')))
+})
+
+test('a numeric equation in total_amount_in_words is not independent evidence and never repairs', () => {
+  const out = ledger.evaluateLedger({
+    ...BASE, taxable_value: 9000, cgst_amount: 225, sgst_amount: 225,
+    total_amount: 900000, total_amount_in_words: '9000.00 + 225.00 + 225.00 = 9450.00',
+    field_sources: { taxable_value: 'ai-pass1', cgst_amount: 'ai-pass1', sgst_amount: 'ai-pass1',
+      igst_amount: 'ai-pass1', total_amount: 'ai-pass1', total_amount_in_words: 'ai-pass1' },
+  }, { minConfidence: 0.8, now: NOW })
+  assert.equal(out.review, 'needs_review')
+  assert.equal(out.row.total_amount, 900000)
+  assert.deepEqual(out.repairs, [])
+  assert.ok(out.reasons.includes('amount-words-equation-not-evidence'))
+  assert.ok(out.reasons.some((reason) => reason.startsWith('total-mismatch')))
+  assert.equal(out.moneyReconciliation.printedTotal, 900000)
+  assert.equal(out.moneyReconciliation.independentEvidence[0].independent, false)
+})
+
+test('hard arithmetic failure outranks candidate completeness', () => {
+  const sparse = ledger.evaluateLedger({ ...BASE, invoice_number: '' }, { minConfidence: 0.8, now: NOW })
+  const contradictory = ledger.evaluateLedger({
+    ...BASE, total_amount: 999999, invoice_date: '05/09/2026', invoice_number: 'INV-42',
+  }, { minConfidence: 0.8, now: NOW })
+  const selected = ledger.selectBestCandidate([
+    { candidate: { ...BASE, invoice_number: '' }, evaluation: sparse, source: 'local' },
+    { candidate: { ...BASE, total_amount: 999999 }, evaluation: contradictory, source: 'ai' },
+  ])
+  assert.equal(selected?.source, 'local')
+})
+
+test('a stripped-decimal-scale AI total remains raw, flagged, and in review', () => {
+  const candidate = {
+    ...BASE, taxable_value: '4850.00', cgst_amount: '291.00', sgst_amount: '291.00',
+    total_amount: '485000',
+    field_sources: Object.fromEntries(['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount']
+      .map((field) => [field, 'ai-pass1'])),
+  }
+  const result = ledger.evaluateLedger(candidate, { minConfidence: 0.8, now: NOW })
+  assert.equal(result.row.total_amount, 485000)
+  assert.equal(result.review, 'needs_review')
+  assert.ok(result.reasons.includes('amount-scale-suspect:total_amount'))
+  assert.ok(result.reasons.some((reason) => reason.startsWith('total-mismatch')))
+  assert.deepEqual(result.repairs, [])
+})
+
+test('AI supplier name without OCR corroboration is ambiguous and cannot approve', () => {
+  const ai = {
+    ...BASE,
+    vendor_name: 'Anandhu Enterprises',
+    vendor_name_ambiguous: true,
+    field_sources: Object.fromEntries(['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount', 'vendor_name']
+      .map((field) => [field, 'ai-pass1'])),
+  }
+  const merged = ledger.mergeCandidates({}, ai)
+  const result = ledger.evaluateLedger(merged, { minConfidence: 0.8, now: NOW })
+  assert.equal(result.review, 'needs_review')
+  assert.ok(result.reasons.includes('vendor-ambiguous'))
+})
+
+test('AI-only invoice number, date, and GSTIN cannot be the sole basis for approval', () => {
+  const local = {
+    vendor_name: 'Acme Traders Pvt Ltd', vendor_name_source: 'local',
+    taxable_value: 1000, cgst_amount: 90, sgst_amount: 90, igst_amount: 0, total_amount: 1180,
+    field_sources: Object.fromEntries(['vendor_name', 'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount']
+      .map((field) => [field, 'local'])),
+  }
+  const ai = {
+    invoice_number: 'INV-42', invoice_date: '05/09/2026', supplier_gstin: BASE.supplier_gstin,
+    field_sources: { invoice_number: 'ai-pass1', invoice_date: 'ai-pass1', supplier_gstin: 'ai-pass1' },
+  }
+  const result = ledger.evaluateLedger(ledger.mergeCandidates(local, ai), { minConfidence: 0.8, now: NOW })
+  assert.equal(result.review, 'needs_review')
+  assert.ok(result.reasons.includes('ai-identity-unverified:invoice_number'))
+  assert.ok(result.reasons.includes('ai-identity-unverified:invoice_date'))
+  assert.ok(result.reasons.includes('ai-identity-unverified:supplier_gstin'))
+})
+
+test('unequal local CGST and SGST stays in review without arithmetic repair', () => {
+  const result = ledger.evaluateLedger({ ...BASE, cgst_amount: 90, sgst_amount: 89 }, { minConfidence: 0.8, now: NOW })
+  assert.equal(result.review, 'needs_review')
+  assert.ok(result.reasons.includes('cgst-sgst-unequal'))
+  assert.deepEqual(result.repairs, [])
 })
 
 test('total is NOT repaired when the words do not tie to the components either', () => {
@@ -305,6 +403,24 @@ test('supplier header wins over For Supplier footer', () => {
   ].join('\n'))
 
   assert.equal(candidate.vendor_name, 'Blue Ridge Industries')
+})
+
+test('supplier parsing removes TAX INVOICE/date spill and excludes Bill To company names', () => {
+  const parsed = textParser.parseInvoiceText([
+    'METRO TECH SOLUTIONS TAX INVOICE',
+    'Invoice Date: 02-Nov-2026',
+    'Bill To:',
+    'Anandhu Enterprises',
+    'Address: 10 Buyer Street',
+    'GSTIN: 27AAPFU0939F1ZV',
+    'Taxable Value: 1000.00', 'CGST: 90.00', 'SGST: 90.00', 'Total: 1180.00',
+  ].join('\n'))
+  assert.equal(parsed.vendor_name, 'METRO TECH SOLUTIONS')
+  assert.equal(parsed.vendor_name_source, 'local')
+  assert.equal(ledger.mergeCandidates({}, {
+    ...BASE, vendor_name: 'Anandhu Enterprises Invoice Date: 02-Nov-2026',
+    field_sources: { vendor_name: 'ai-pass1' },
+  }).vendor_name_ambiguous, true)
 })
 
 test('merge rejects generic local supplier and preserves valid AI supplier', () => {

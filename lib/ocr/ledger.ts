@@ -14,12 +14,11 @@
 //   * The shape matches lib/excel/generator.ts `IndianLedgerRowInput` exactly
 //     (structural typing keeps the two in sync without a runtime import).
 import { gstinChecksumOk, gstinFullyValid, gstinStateCodeValid } from './gstin';
-import { parseIndianAmountWords, validateInvoiceCrossChecks } from './validators'
+import { parseIndianAmountWords, parseNumericEquation, validateInvoiceCrossChecks } from './validators'
 import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
 import { reconcileInvoiceTotal } from './calc/reconcile'
 import {
   MIXED_GST_REASONS,
-  deriveSlicesFromInvoiceHeads,
   distinctTaxRates,
   mergeSlices,
   normalizeSlices,
@@ -120,6 +119,34 @@ export interface LedgerCandidate {
    */
   tax_slices?: InvoiceTaxSlice[] | null;
   confidence?: Record<string, number> | null;
+  field_sources?: Partial<Record<string, 'local' | 'ai-pass1' | 'ai-pass2' | 'human'>>;
+  vendor_name_ambiguous?: boolean;
+  vendor_name_source?: 'local' | 'ai-pass1' | 'ai-pass2' | 'human' | null;
+}
+
+export interface MoneyRepair {
+  field: 'total_amount'
+  oldValue: number
+  newValue: number
+  provenance: string
+}
+
+export interface MoneyEvidence {
+  kind: 'natural-words' | 'numeric-equation' | 'validated-slices'
+  value: number | null
+  source: string
+  independent: boolean
+}
+
+export interface MoneyReconciliation {
+  printedTotal: number | null
+  derivedTotal: number | null
+  independentEvidence: MoneyEvidence[]
+  repairedTotal: number | null
+  provenance: string | null
+  passes: boolean
+  reasonCodes: string[]
+  repairs: MoneyRepair[]
 }
 
 export type LedgerReview = 'approved' | 'needs_review';
@@ -142,7 +169,8 @@ export interface LedgerEvaluation {
    * Deterministic repairs applied to the candidate before scoring (e.g.
    * `total-from-words`). Empty when the candidate was scored exactly as given.
    */
-  repairs?: string[];
+  repairs?: MoneyRepair[];
+  moneyReconciliation?: MoneyReconciliation;
   /**
    * True only when the invoice evidenced a MULTI-rate breakdown AND every slice
    * reconciled to the invoice-level heads. A single-rate invoice is `null` (no
@@ -173,6 +201,7 @@ const REQUIRED_FIELDS = [
 const GST_EPOCH = '2017-07-01';
 
 const money = (n: number): number | null => Number.isFinite(n) ? n : null
+const absDiff = (a: bigint, b: bigint): bigint => (a > b ? a - b : b - a)
 
 /**
  * Parse a printed tax-rate PERCENTAGE (0..100) to a finite number, or null when
@@ -202,6 +231,8 @@ function isValidVendorName(value: string | null | undefined): boolean {
   if (/^(?:for|supplier|seller|vendor|buyer|customer|recipient)$/i.test(name)) {
     return false
   }
+  if (/\b(?:tax\s+invoice|invoice\s+date|bill\s*to|ship\s*to|customer|buyer|authori[sz]ed|address)\b/i.test(name)
+    || /\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{2,4}\b/.test(name)) return false
   return /[A-Za-z]/.test(name)
 }
 
@@ -368,6 +399,7 @@ export function mergeCandidates(
 ): LedgerCandidate {
   const merged: LedgerCandidate = { ...(fallback ?? {}) }
   const confidence: Record<string, number> = { ...(fallback?.confidence ?? {}) }
+  const fieldSources: NonNullable<LedgerCandidate['field_sources']> = { ...(fallback?.field_sources ?? {}) }
   const isTextValid = (raw: string | null | undefined): boolean => (raw ?? '').trim() !== ''
   // Full validity (shape + state code + checksum): a local GSTIN that fails the
   // checksum is an OCR/parse error and must be replaceable by the AI's read.
@@ -382,23 +414,50 @@ export function mergeCandidates(
     const pv = primary[field]
     if (typeof pv === 'string' && valid(pv)) {
       ;(merged as Record<string, unknown>)[field] = pv.trim()
+      fieldSources[field] = primary.field_sources?.[field] ?? 'local'
       if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
     }
   }
   copyText('invoice_number', isTextValid)
-  copyText('vendor_name', isValidVendorName)
+  const primaryVendor = (primary.vendor_name ?? '').trim()
+  const fallbackVendor = (fallback?.vendor_name ?? '').trim()
+  const primaryVendorTrusted = primary.field_sources?.vendor_name === 'local'
+  if (isValidVendorName(primaryVendor) && (primaryVendorTrusted || !isValidVendorName(fallbackVendor))) {
+    merged.vendor_name = primaryVendor
+    fieldSources.vendor_name = primary.field_sources?.vendor_name ?? 'local'
+    merged.vendor_name_ambiguous = fieldSources.vendor_name !== 'local'
+    merged.vendor_name_source = fieldSources.vendor_name
+    if (primary.confidence?.vendor_name !== undefined) confidence.vendor_name = primary.confidence.vendor_name
+  } else if (isValidVendorName(fallbackVendor)) {
+    merged.vendor_name = fallbackVendor
+    fieldSources.vendor_name = fallback?.field_sources?.vendor_name ?? 'ai-pass1'
+    merged.vendor_name_ambiguous = true
+    merged.vendor_name_source = fieldSources.vendor_name
+  } else if (isValidVendorName(primaryVendor)) {
+    merged.vendor_name = primaryVendor
+    fieldSources.vendor_name = primary.field_sources?.vendor_name ?? 'local'
+    merged.vendor_name_ambiguous = true
+    merged.vendor_name_source = fieldSources.vendor_name
+  } else {
+    merged.vendor_name = null
+    merged.vendor_name_ambiguous = Boolean(primaryVendor || fallbackVendor)
+    merged.vendor_name_source = null
+  }
 
   if (isDateValid(primary.invoice_date)) {
     merged.invoice_date = (primary.invoice_date ?? '').trim()
+    fieldSources.invoice_date = primary.field_sources?.invoice_date ?? 'local'
     if (primary.confidence?.invoice_date !== undefined) confidence.invoice_date = primary.confidence.invoice_date
   }
   if (isGstinValid(primary.supplier_gstin)) {
     merged.supplier_gstin = (primary.supplier_gstin ?? '').trim().toUpperCase()
+    fieldSources.supplier_gstin = primary.field_sources?.supplier_gstin ?? 'local'
     if (primary.confidence?.supplier_gstin !== undefined) confidence.supplier_gstin = primary.confidence.supplier_gstin
   }
   for (const field of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) {
     if (isAmountValid(primary[field])) {
       ;(merged as Record<string, unknown>)[field] = primary[field]
+      fieldSources[field] = primary.field_sources?.[field] ?? 'local'
       if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
     }
   }
@@ -411,6 +470,7 @@ export function mergeCandidates(
   for (const field of ['cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off'] as const) {
     if (carriesAmount(primary[field])) {
       ;(merged as Record<string, unknown>)[field] = primary[field]
+      fieldSources[field] = primary.field_sources?.[field] ?? 'local'
     }
   }
   if (!(merged.recipient_gstin ?? '').trim() && (primary.recipient_gstin ?? '').trim()) {
@@ -421,8 +481,10 @@ export function mergeCandidates(
     const fallbackValue = fallback?.[field]
     if (primaryValue !== undefined && primaryValue !== null && primaryValue !== '') {
       ;(merged as Record<string, unknown>)[field] = primaryValue
+      fieldSources[field] = primary.field_sources?.[field] ?? 'local'
     } else if (fallbackValue !== undefined) {
       ;(merged as Record<string, unknown>)[field] = fallbackValue
+      fieldSources[field] = fallback?.field_sources?.[field] ?? 'ai-pass1'
     }
   }
   // §P3-16 document type is a LOCAL structural signal (a printed Credit/Debit Note
@@ -434,8 +496,14 @@ export function mergeCandidates(
   // breakdown wins, and the merge never silently discards a slice either side
   // printed. A conflicting rate is left for evaluateLedger's validation to flag.
   const mergedSlices = mergeSlices(primary.tax_slices, fallback?.tax_slices)
-  if (mergedSlices) merged.tax_slices = mergedSlices
+  if (mergedSlices) {
+    merged.tax_slices = mergedSlices
+    fieldSources.tax_slices = primary.tax_slices?.length
+      ? primary.field_sources?.tax_slices ?? 'local'
+      : fallback?.field_sources?.tax_slices ?? 'ai-pass1'
+  }
   merged.confidence = confidence
+  merged.field_sources = fieldSources
   return merged
 }
 
@@ -450,42 +518,135 @@ export function mergeCandidates(
  * figure. Nothing is invented — if the words do not tie out either, the
  * candidate is returned untouched and the mismatch routes to review as before.
  */
-function repairTotalFromWords(
+export function reconcileMoney(
   candidate: LedgerCandidate,
   toleranceMinor: bigint,
-  repairs: string[],
-): LedgerCandidate {
-  const words = (candidate.total_amount_in_words ?? '').trim()
-  if (!words) return candidate
-  const wordsMinor = parseIndianAmountWords(words)
-  if (wordsMinor === null) return candidate
+): MoneyReconciliation {
+  const repairs: MoneyRepair[] = []
+  const reasonCodes: string[] = []
   const printedMinor = moneyToMinorUnits(candidate.total_amount)
-  const absDiff = (a: bigint, b: bigint): bigint => (a > b ? a - b : b - a)
-  if (printedMinor !== null && absDiff(printedMinor, wordsMinor) <= toleranceMinor) return candidate
-
+  const printedTotal = printedMinor === null ? null : minorUnitsToNumber(printedMinor)
   const taxable = moneyToMinorUnits(candidate.taxable_value)
-  if (taxable === null) return candidate
-  const components = {
-    taxable,
-    cgst: moneyToMinorUnits(candidate.cgst_amount),
-    sgst: moneyToMinorUnits(candidate.sgst_amount),
-    igst: moneyToMinorUnits(candidate.igst_amount),
-    cess: moneyToMinorUnits(candidate.cess_amount),
-    shipping: moneyToMinorUnits(candidate.shipping_amount),
-    discount: moneyToMinorUnits(candidate.discount_amount),
-    deduction: moneyToMinorUnits(candidate.deduction_amount),
-    roundOff: moneyToMinorUnits(candidate.round_off),
+  const cgst = moneyToMinorUnits(candidate.cgst_amount)
+  const sgst = moneyToMinorUnits(candidate.sgst_amount)
+  const igst = moneyToMinorUnits(candidate.igst_amount)
+  const words = (candidate.total_amount_in_words ?? '').trim()
+  const equation = parseNumericEquation(words)
+  const wordsMinor = equation ? null : parseIndianAmountWords(words)
+  const independentEvidence: MoneyEvidence[] = []
+  if (equation) {
+    const equationMinor = moneyToMinorUnits(equation.result)
+    independentEvidence.push({
+      kind: 'numeric-equation',
+      value: equationMinor === null ? null : minorUnitsToNumber(equationMinor),
+      source: candidate.field_sources?.total_amount_in_words ?? 'unknown',
+      independent: false,
+    })
+  } else if (wordsMinor !== null) {
+    const source = candidate.field_sources?.total_amount_in_words ?? 'unknown'
+    independentEvidence.push({
+      kind: 'natural-words', value: minorUnitsToNumber(wordsMinor), source, independent: source === 'local',
+    })
   }
-  // The numeric total must itself FAIL to tie (otherwise the words are the odd
-  // one out and the existing amount-words-total-mismatch review flag applies).
-  if (printedMinor !== null
-    && reconcileInvoiceTotal({ ...components, printedTotal: printedMinor }, toleranceMinor).status === 'reconciles') {
-    return candidate
+  if ([printedMinor, taxable, cgst, sgst, igst].some((value) => value === null)) {
+    return {
+      printedTotal, derivedTotal: null, independentEvidence,
+      repairedTotal: null, provenance: null, passes: false,
+      reasonCodes: ['non-finite-amount'], repairs,
+    }
   }
-  const viaWords = reconcileInvoiceTotal({ ...components, printedTotal: wordsMinor }, toleranceMinor)
-  if (viaWords.status !== 'reconciles') return candidate
-  repairs.push('total-from-words')
-  return { ...candidate, total_amount: minorUnitsToNumber(wordsMinor) }
+
+  const optional = (field: 'cess_amount' | 'shipping_amount' | 'discount_amount' | 'deduction_amount' | 'round_off') =>
+    moneyToMinorUnits(candidate[field])
+  const reconciliation = reconcileInvoiceTotal({
+    taxable: taxable as bigint,
+    cgst: cgst as bigint,
+    sgst: sgst as bigint,
+    igst: igst as bigint,
+    cess: optional('cess_amount'),
+    shipping: optional('shipping_amount'),
+    discount: optional('discount_amount'),
+    deduction: optional('deduction_amount'),
+    roundOff: optional('round_off'),
+    printedTotal: printedMinor as bigint,
+  }, toleranceMinor)
+  let derivedMinor = reconciliation.expectedMinor
+  if (reconciliation.status === 'reconciles') {
+    return {
+      printedTotal,
+      derivedTotal: derivedMinor === null ? null : minorUnitsToNumber(derivedMinor),
+      independentEvidence, repairedTotal: null, provenance: null,
+      passes: true, reasonCodes: [], repairs,
+    }
+  }
+  const allComponentsLocal = ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount']
+    .every((field) => candidate.field_sources?.[field] === 'local')
+  const wordsLocal = candidate.field_sources?.total_amount_in_words === 'local'
+  const wordsReconciliation = wordsMinor === null ? null : reconcileInvoiceTotal({
+    taxable: taxable as bigint,
+    cgst: cgst as bigint,
+    sgst: sgst as bigint,
+    igst: igst as bigint,
+    cess: optional('cess_amount'),
+    shipping: optional('shipping_amount'),
+    discount: optional('discount_amount'),
+    deduction: optional('deduction_amount'),
+    roundOff: optional('round_off'),
+    printedTotal: wordsMinor,
+  }, toleranceMinor)
+  const wordsDerivedMinor = wordsReconciliation?.expectedMinor ?? null
+  if (wordsMinor !== null && wordsReconciliation?.status === 'reconciles'
+    && wordsLocal && allComponentsLocal && wordsDerivedMinor !== null) {
+    derivedMinor = wordsDerivedMinor
+    const oldValue = minorUnitsToNumber(printedMinor as bigint)
+    const newValue = minorUnitsToNumber(wordsDerivedMinor)
+    const provenance = 'repaired: local genuine-words + local components agree'
+    repairs.push({ field: 'total_amount', oldValue, newValue, provenance })
+    return {
+      printedTotal, derivedTotal: newValue, independentEvidence,
+      repairedTotal: newValue, provenance, passes: true, reasonCodes: [], repairs,
+    }
+  }
+
+  const slices = normalizeSlices(candidate.tax_slices)
+  if (slices && candidate.field_sources?.tax_slices === 'local'
+    && slices.every((slice) => slice.provenance === 'printed-summary')) {
+    const validated = validateTaxSlices(slices, {
+      taxable_value: minorUnitsToNumber(taxable as bigint),
+      cgst_amount: minorUnitsToNumber(cgst as bigint),
+      sgst_amount: minorUnitsToNumber(sgst as bigint),
+      igst_amount: minorUnitsToNumber(igst as bigint),
+      total_amount: minorUnitsToNumber(printedMinor as bigint),
+    }, toleranceMinor)
+    const sliceMinor = slices.reduce((sum, slice) => sum
+      + (moneyToMinorUnits(slice.taxable_value) ?? BigInt(0))
+      + (moneyToMinorUnits(slice.cgst_amount) ?? BigInt(0))
+      + (moneyToMinorUnits(slice.sgst_amount) ?? BigInt(0))
+      + (moneyToMinorUnits(slice.igst_amount) ?? BigInt(0)), BigInt(0))
+    if (validated.breakdownValidated) {
+      independentEvidence.push({ kind: 'validated-slices', value: minorUnitsToNumber(sliceMinor), source: 'local', independent: true })
+    }
+    if (validated.breakdownValidated && derivedMinor !== null && absDiff(sliceMinor, derivedMinor) <= toleranceMinor) {
+      const oldValue = minorUnitsToNumber(printedMinor as bigint)
+      const newValue = minorUnitsToNumber(derivedMinor)
+      const provenance = 'repaired: validated local printed-slices + local components agree'
+      repairs.push({ field: 'total_amount', oldValue, newValue, provenance })
+      return {
+        printedTotal, derivedTotal: minorUnitsToNumber(derivedMinor), independentEvidence,
+        repairedTotal: newValue, provenance, passes: true, reasonCodes: [], repairs,
+      }
+    }
+  }
+
+  reasonCodes.push(...reconciliation.reasons)
+  if (typeof candidate.total_amount === 'string' && /^\d{5,}$/.test(candidate.total_amount.trim())) {
+    reasonCodes.push('amount-scale-suspect:total_amount')
+  }
+  return {
+    printedTotal, derivedTotal: derivedMinor === null ? null : minorUnitsToNumber(derivedMinor),
+    independentEvidence, repairedTotal: null, provenance: null,
+    passes: false, reasonCodes, repairs,
+  }
 }
 
 /**
@@ -509,12 +670,15 @@ export function evaluateLedger(
   },
 ): LedgerEvaluation {
   const reasons: string[] = [];
-  const repairs: string[] = [];
-  const candidate = repairTotalFromWords(
+  const moneyDecision = reconcileMoney(
     rawCandidate,
     BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101))),
-    repairs,
-  );
+  )
+  const repairs = moneyDecision.repairs
+  const candidate = moneyDecision.repairedTotal === null
+    ? rawCandidate
+    : { ...rawCandidate, total_amount: moneyDecision.repairedTotal }
+  reasons.push(...moneyDecision.reasonCodes.filter((reason) => reason.startsWith('amount-scale-suspect:')))
 
   const parsedDate = parseInvoiceDate(candidate.invoice_date);
   if (!parsedDate) reasons.push('invoice-date-unresolved');
@@ -538,6 +702,18 @@ export function evaluateLedger(
   const vendorNameValid = isValidVendorName(vendorName)
   if (!vendorName) reasons.push('vendor-name-missing')
   else if (!vendorNameValid) reasons.push('vendor-name-placeholder')
+  if (candidate.vendor_name_ambiguous) reasons.push('vendor-ambiguous')
+  for (const field of ['invoice_date', 'invoice_number', 'supplier_gstin'] as const) {
+    const source = candidate.field_sources?.[field]
+    if (source === 'ai-pass1' || source === 'ai-pass2') reasons.push(`ai-identity-unverified:${field}`)
+  }
+  for (const field of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) {
+    const source = candidate.field_sources?.[field]
+    if (source === 'ai-pass1' || source === 'ai-pass2') reasons.push(`ai-money-unverified:${field}`)
+  }
+  if (parseNumericEquation(candidate.total_amount_in_words ?? '')) {
+    reasons.push('amount-words-equation-not-evidence')
+  }
 
   const gstin = (candidate.supplier_gstin ?? '').trim().toUpperCase();
   let gstinOk = false;
@@ -743,8 +919,7 @@ export function evaluateLedger(
   // pre-existing test keeps its outcome. Only a genuine MULTI-rate bill (two or
   // more distinct rates in explicit parsed/human slices) is validated here.
   const explicitSlices = normalizeSlices(candidate.tax_slices)
-  const derivedSlices = deriveSlicesFromInvoiceHeads(row)
-  const candidateSlices = explicitSlices ?? derivedSlices
+  const candidateSlices = explicitSlices
   let breakdownValidated: boolean | null = null
   if (candidateSlices && candidateSlices.length > 0) {
     const tolMinor = BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101)))
@@ -783,6 +958,7 @@ export function evaluateLedger(
     measuredConfidence,
     invoiceDateResolved: iso !== null,
     repairs,
+    moneyReconciliation: moneyDecision,
     breakdownValidated,
   };
 }
@@ -869,7 +1045,8 @@ export function detectCandidateConflicts(
 const HARD_VALIDATION_FAILURES = new Set([
   'invoice-date-future', 'invoice-date-before-gst', 'gstin-invalid', 'gstin-state-invalid',
   'gstin-checksum-failed', 'invoice-number-placeholder', 'vendor-name-placeholder',
-  'non-finite-amount', 'negative-amount', 'total-mismatch', 'total-zero',
+  'vendor-ambiguous', 'ai-identity-unverified', 'ai-money-unverified', 'amount-words-equation-not-evidence',
+  'non-finite-amount', 'negative-amount', 'total-mismatch', 'amount-scale-suspect', 'total-zero',
   'igst-with-cgst-sgst', 'cgst-sgst-unequal', 'igst-on-intrastate', 'cgst-sgst-on-interstate',
   'supplier-equals-recipient', 'tax-rate-mismatch', 'tax-rate-amount-missing', 'tax-rate-invalid',
   'tax-rate-cgst-sgst-unequal', 'tax-rate-igst-with-cgst-sgst', 'amount-words-total-mismatch',
@@ -919,15 +1096,9 @@ export interface CandidateAssessment {
  *   1. an approved (all-checks-passed) row beats a needs_review row — a clean,
  *      fully-valid candidate is never displaced by a richer but contradictory
  *      merge (this is the "don't auto-accept conflicting AI" guard);
- *   2. greater field completeness — between two rows that BOTH still need
- *      review, prefer the one that carries more of the invoice. The 17 Oct bug
- *      was a sparse local row (missing heads => one `non-finite-amount` code)
- *      beating a far fuller merge simply because it happened to carry FEWER
- *      reason codes; a partial row is not "safer", it is just less useful, so
- *      completeness is judged BEFORE the failure count;
- *   3. fewer hard validation failures — at EQUAL completeness, the less
- *      self-contradictory candidate wins (so a fuller row can never bury an
- *      equally-full clean one on field count alone);
+ *   2. fewer hard validation failures — a candidate with a monetary contradiction
+ *      must never win merely because it contains more fields;
+ *   3. greater field completeness, consulted only when integrity is tied;
  *   4. higher independently MEASURED confidence (never the model's self-report,
  *      which only ever lowers trust);
  *   5. full tie keeps the EARLIER candidate — stable, so a non-destructive merge
@@ -943,12 +1114,12 @@ export function selectBestCandidate(
     const aApproved = a.evaluation.review === 'approved' ? 1 : 0
     const bApproved = b.evaluation.review === 'approved' ? 1 : 0
     if (aApproved !== bApproved) return aApproved > bApproved
-    const aCount = presentFieldCount(a.evaluation.row)
-    const bCount = presentFieldCount(b.evaluation.row)
-    if (aCount !== bCount) return aCount > bCount
     const aHard = hardValidationFailureCount(a.evaluation.reasons)
     const bHard = hardValidationFailureCount(b.evaluation.reasons)
     if (aHard !== bHard) return aHard < bHard
+    const aCount = presentFieldCount(a.evaluation.row)
+    const bCount = presentFieldCount(b.evaluation.row)
+    if (aCount !== bCount) return aCount > bCount
     if (a.evaluation.measuredConfidence !== b.evaluation.measuredConfidence) {
       return a.evaluation.measuredConfidence > b.evaluation.measuredConfidence
     }
@@ -978,6 +1149,14 @@ export function retryHintFor(
         ? ` The extracted components reconciled to ${mismatch[1]}, but total_amount was read as ${mismatch[2]}.`
         : ''
       lines.push(`taxable_value + cgst_amount + sgst_amount + igst_amount did not equal total_amount (within 1 rupee).${values} Re-read taxable value, each printed tax/charge, and the Grand Total / Net Payable independently from the document. Preserve decimal points and trailing zeroes exactly; do not convert to paise or choose an amount from arithmetic alone.`)
+    } else if (r.startsWith('ai-money-unverified:')) {
+      const field = r.slice('ai-money-unverified:'.length)
+      lines.push(`The ${field} value is not independently corroborated by local document reading; re-read ONLY ${field} from the printed document, preserving decimal formatting.`)
+    } else if (r.startsWith('ai-identity-unverified:')) {
+      const field = r.slice('ai-identity-unverified:'.length)
+      lines.push(`The ${field} value is not independently corroborated by local document reading; re-read ONLY ${field} from its printed field on the invoice.`)
+    } else if (r === 'vendor-ambiguous') {
+      lines.push('The supplier name is not independently corroborated outside the buyer section; re-read ONLY the company name in the top supplier letterhead / Supplier / Sold By / Invoice From area. Never use Bill To / Buyer / Customer.')
     } else if (r === 'total-zero') {
       lines.push('total_amount came back as 0; locate the grand total / amount payable.');
     } else if (r === 'igst-with-cgst-sgst' || r === 'cgst-sgst-unequal') {
@@ -997,10 +1176,37 @@ export function retryHintFor(
       lines.push('The printed tax rates conflict with the tax-head structure; re-read the rate and tax summary without inferring values.');
     } else if (r === 'amount-words-total-mismatch') {
       lines.push('The printed total in words disagrees with the numeric total; re-read both and do not choose one unless the document is clear.');
+    } else if (r === 'amount-words-equation-not-evidence') {
+      lines.push('The total_amount_in_words field contains a numeric equation, not independent amount-in-words evidence; re-read ONLY the printed Grand Total.');
     }
   }
   const unique = [...new Set(lines)];
   return unique.length === 0
     ? null
     : `A previous read of this document failed validation. ${unique.join(' ')} Correct a value only if the printed document supports it; otherwise leave it empty with low confidence.`;
+}
+
+export function retryFieldsFor(reasons: readonly string[]): string[] {
+  const fields = new Set<string>()
+  if (reasons.some((reason) => reason.startsWith('total-mismatch') || reason === 'total-zero')) {
+    return ['total_amount']
+  }
+  for (const reason of reasons) {
+    if (reason.startsWith('ai-money-unverified:')) fields.add(reason.slice('ai-money-unverified:'.length))
+    else if (reason.startsWith('ai-identity-unverified:')) fields.add(reason.slice('ai-identity-unverified:'.length))
+    else if (reason.startsWith('total-mismatch') || reason === 'total-zero'
+      || reason === 'amount-words-total-mismatch' || reason === 'amount-words-equation-not-evidence') fields.add('total_amount')
+    else if (reason === 'cgst-sgst-unequal') { fields.add('cgst_amount'); fields.add('sgst_amount') }
+    else if (reason === 'igst-with-cgst-sgst') { fields.add('igst_amount'); fields.add('cgst_amount'); fields.add('sgst_amount') }
+    else if (reason.startsWith('gstin-') || reason === 'supplier-equals-buyer'
+      || reason === 'supplier-equals-recipient') fields.add('supplier_gstin')
+    else if (reason.startsWith('invoice-date-')) fields.add('invoice_date')
+    else if (reason === 'vendor-ambiguous' || reason === 'vendor-name-placeholder') fields.add('vendor_name')
+    else if (reason.startsWith('tax-rate-mismatch:') || reason.startsWith('tax-rate-advisory:')
+      || reason.startsWith('tax-rate-amount-missing:')) {
+      const head = reason.split(':')[1]
+      if (head) fields.add(`${head}_amount`)
+    }
+  }
+  return [...fields].slice(0, 1)
 }

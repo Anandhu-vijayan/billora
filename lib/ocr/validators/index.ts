@@ -99,6 +99,6 @@ export function validateInvoiceCrossChecks(input: InvoiceValidationInput): Invoi
   return { reasons, measuredConfidencePenalty }
 }
 
-export { amountWordsMatchNumeric, parseIndianAmountWords } from './amount-words'
+export { amountWordsMatchNumeric, parseIndianAmountWords, parseNumericEquation } from './amount-words'
 export { checkPrintedTaxRates, expectedTaxMinorUnits } from './tax-rates'
 export { minorUnitsToNumber, minorUnitsToString, moneyToMinorUnits } from './money'

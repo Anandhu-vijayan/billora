@@ -16,6 +16,23 @@ const SCALES: Record<string, bigint> = {
   crore: BigInt(10_000_000),
 }
 
+export interface NumericEquationEvidence {
+  parts: string[]
+  result: string
+  isEquation: true
+  isIndependentEvidence: false
+}
+
+/** Parse a printed/calculated numeric equation without treating it as words evidence. */
+export function parseNumericEquation(text: string): NumericEquationEvidence | null {
+  const match = /^\s*([\d,]+(?:\.\d{1,4})?\s*(?:\+\s*[\d,]+(?:\.\d{1,4})?\s*)+)\s*=\s*([\d,]+(?:\.\d{1,4})?)\s*$/u.exec(text)
+  if (!match) return null
+  const parts = match[1].split('+').map((part) => part.trim())
+  const result = match[2].trim()
+  if (parts.some((part) => moneyToMinorUnits(part) === null) || moneyToMinorUnits(result) === null) return null
+  return { parts, result, isEquation: true, isIndependentEvidence: false }
+}
+
 function parseNumberWords(words: string[]): bigint | null {
   if (words.length === 0) return BigInt(0)
   let total = BigInt(0)
@@ -63,6 +80,7 @@ function parseNumberWords(words: string[]): bigint | null {
  * "One Thousand and Paise Fifty" order.
  */
 export function parseIndianAmountWords(input: string): bigint | null {
+  if (parseNumericEquation(input)) return null
   const NOISE = new Set(['indian', 'inr', 'rs', 'only', 'ruppee', 'ruppees'])
   const tokens = input.toLowerCase()
     .replace(/[^a-z]+/g, ' ')

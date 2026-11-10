@@ -75,18 +75,23 @@ an operator-controlled privacy gate.
   network service by this step. A deterministic parser maps recognized text to
   fields, and `lib/ocr/ledger.ts` evaluates the actual field values and
   validation checks before any row can be approved.
-  Money arithmetic is reconciled in integer paise. Printed tax rates and total
-  amounts in words are independent cross-checks; a disagreement sends the row
-  to review and never rewrites an extracted value.
+  Money arithmetic is reconciled in integer paise. Printed tax rates are
+  cross-checks. Amount-in-words repair is permitted only when locally sourced
+  natural-language words and locally sourced components agree within tolerance;
+  numeric equations in that field are explicitly non-independent evidence.
+  Repairs and their provenance are stored in the encrypted extracted payload.
 2. **Optional AI assistant (gated).** Only when an operator sets
   `EXTRACTION_ALLOW_AI=true`, confirms a paid tier (`EXTRACTION_AI_TIER=paid`
   after completing paid API activation), and supplies a usable Gemini API key
   with `EXTRACTION_PROVIDER=gemini` is Google Gemini consulted — for the fields
-  the local parser could not resolve. AI **assists**: valid local values
-   are kept and AI only fills gaps (`mergeCandidates`); its output is
-   independently re-validated and can never silently overrule good local data or
-   bypass the deterministic checks. Transient provider errors requeue; malformed
-   or refused responses are handled as permanent failures.
+  the local parser could not resolve. Gemini monetary fields use strict
+  decimal-preserving strings; a value such as `485000` is never divided or
+  silently rewritten. AI-only critical fields without local OCR corroboration
+  remain in human review. Valid local values are retained during
+  merge and every selected field carries source provenance. A second Gemini read
+  targets one failed field using a field-only schema. Transient provider failures
+  receive bounded retries and may use a configured fallback model; an outage is
+  never treated as proof that an invoice is invalid.
 3. **Human review.** Anything still incomplete, inconsistent or low-confidence is
    stored with `review_status='needs_review'` and a clear reason. Nothing is ever
    fabricated to force an approval.
@@ -116,11 +121,13 @@ auto-approved only when every check passes:
 - **Date**: parses day-first, is not in the future and not before GST (1 Jul
   2017). An implausible date is flagged and the invoice is not batched.
 
-When the AI read fails a re-readable check (checksum, arithmetic, swapped
-parties, date), the handler makes **one** targeted second AI call that names the
-failed checks, adopts it only if it is strictly better, and skips it when the
-first call was slow. Not yet built (see notes below): image-quality gating,
-per-workspace AI consent, and a calibration set of real invoices.
+When the AI read fails a re-readable check (checksum, arithmetic, party identity,
+date), the handler makes **one** field-targeted second AI call and adopts it only
+when the candidate ranks better by approval, hard failures, completeness, then
+measured confidence. Gemini transient retries, concurrency and fallback model are
+operator-configurable through `VISION_TIMEOUT_MS`, `VISION_MAX_TOTAL_MS`,
+`GEMINI_MAX_CONCURRENT` and `GEMINI_FALLBACK_MODEL`. Per-workspace AI consent and
+a calibration set of real invoices are not yet implemented.
 
 Extraction accuracy against real Indian invoices is **not yet certified**; the
 deterministic parsing and review logic are unit-tested, but OCR/render quality
@@ -130,7 +137,7 @@ must still be validated on representative documents before production use.
 
 - `npm run lint` runs ESLint.
 - `npm run typecheck` runs the TypeScript compiler without emitting files.
-- `npm test` runs the zero-dependency onboarding contract tests (`node --test`).
+- `npm test` runs the repository Node test suite, including OCR and financial regressions.
 - `npm run secret-scan` fails on secret-looking staged diffs.
 - `npm run check` runs secret-scan, lint, and typecheck.
 - `npm run build` creates an optimized production build.

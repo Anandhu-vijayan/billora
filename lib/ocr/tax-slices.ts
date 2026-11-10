@@ -385,13 +385,21 @@ export function validateTaxSlices(
   const igstSum = sumMinor((s) => s.igst_amount)
   const cessSum = sumMinor((s) => s.cess_amount ?? null)
 
-  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'taxable', taxableSum, moneyToMinorUnits(invoice.taxable_value ?? undefined), tol)
-  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'cgst', cgstSum, moneyToMinorUnits(invoice.cgst_amount ?? undefined), tol)
-  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'sgst', sgstSum, moneyToMinorUnits(invoice.sgst_amount ?? undefined), tol)
-  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'igst', igstSum, moneyToMinorUnits(invoice.igst_amount ?? undefined), tol)
+  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'taxable', taxableSum, moneyToMinorUnits(invoice.taxable_value ?? undefined), tol, true)
+  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'cgst', cgstSum, moneyToMinorUnits(invoice.cgst_amount ?? undefined), tol, true)
+  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'sgst', sgstSum, moneyToMinorUnits(invoice.sgst_amount ?? undefined), tol, true)
+  compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'igst', igstSum, moneyToMinorUnits(invoice.igst_amount ?? undefined), tol, true)
   compareHead(reasons, MIXED_GST_REASONS.invoiceTotalMismatch, 'cess', cessSum, moneyToMinorUnits(invoice.cess_amount ?? undefined), tol)
 
   const breakdownValidated = reasons.length === 0 && slices.every((_, i) => statuses[i] !== 'conflicting')
+  if (!breakdownValidated) {
+    statuses.forEach((status, index) => {
+      if (status !== 'conflicting') {
+        statuses[index] = 'unvalidated'
+        out[index].validation_status = 'unvalidated'
+      }
+    })
+  }
   return { reasons, statuses, breakdownValidated, slices: out }
 }
 
@@ -408,9 +416,12 @@ function expectedMatches(taxable: number, ratePercent: number, actualMinor: bigi
  */
 function compareHead(
   reasons: string[], code: string, head: string,
-  sliceSumMinor: bigint, invoiceMinor: bigint | null, tol: bigint,
+  sliceSumMinor: bigint, invoiceMinor: bigint | null, tol: bigint, requireKnown = false,
 ): void {
-  if (invoiceMinor === null) return
+  if (invoiceMinor === null) {
+    if (requireKnown) reasons.push(`${code}:${head}(unverifiable)`)
+    return
+  }
   if (sliceSumMinor === BigInt(0) && invoiceMinor === BigInt(0)) return
   if (absDiff(sliceSumMinor, invoiceMinor) > tol) {
     reasons.push(`${code}:${head}(${minorUnitsToString(sliceSumMinor)}!=${minorUnitsToString(invoiceMinor)})`)

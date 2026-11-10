@@ -981,7 +981,7 @@ test('G6d vision is provider-gated with a strict schema and transient/permanent 
   assert.ok(s.includes('class VisionTransientError') && s.includes('class VisionPermanentError'))
   assert.ok(s.includes('buildGeminiInvoiceRequest'))
   assert.ok(request.includes("responseMimeType: 'application/json'"))
-  assert.ok(s.includes('responseSchema: LEDGER_SCHEMA'))
+  assert.ok(s.includes(': LEDGER_SCHEMA') && s.includes('responseSchema,'), 'full extraction uses the canonical schema; targeted reads use a field schema')
   assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
   assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
   assert.ok(s.includes('cgst_rate_percent') && s.includes('total_amount_in_words'), 'Gemini schema returns optional printed corroboration evidence')
@@ -990,7 +990,8 @@ test('G6d vision is provider-gated with a strict schema and transient/permanent 
   assert.ok(s.includes("logger.warn('[Vision] Gemini request failed'"), 'provider failures log structured timing and classification')
   assert.ok(s.includes('failureReason: providerFailureReason(error)'), 'provider failure reason is logged without raw response content')
   assert.ok(s.includes('status === 429') && s.includes('status >= 500'), 'HTTP status alone can classify rate limits and provider outages')
-  assert.ok(!/for \(let attempt = 0; attempt < 2/.test(s), 'queue backoff owns retries; a request does not immediately spend a second timeout')
+  assert.ok(s.includes('attempt <= 3') && s.includes('exponential'), 'provider transients use at most three bounded retries')
+  assert.ok(s.includes('GEMINI_MAX_CONCURRENT') && s.includes('GEMINI_FALLBACK_MODEL'), 'provider concurrency and fallback model are configurable')
 })
 
 test('G6e JOB_TYPES alignment: both Phase-4 job kinds stay in the TS enum and phase3 CHECK', () => {
@@ -1824,7 +1825,7 @@ test('M4 image uses the vision path only when the operator enabled AI; disabled 
   assert.equal((e.match(/runVisionFirstPass\(/g) ?? []).length, 3, 'one definition + two gated call sites')
   const consume = e.indexOf('const firstPass = speculativeAi ?? runVisionFirstPass')
   assert.ok(consume > aiGate, 'the non-speculative first pass is reached only inside the AI block')
-  const retry = e.indexOf('const retryCandidate = await extractInvoiceFields(')
+  const retry = e.indexOf('const targetedRetry = await extractInvoiceFields(')
   assert.ok(retry > aiGate, 'the bounded retry lives inside the allowAI block')
   assert.ok(s.includes("env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'"), 'AI off by default')
   assert.ok(pdfEngineSrc().includes("if (!PDF_MIME.test(mimeType ?? '')) return null"), 'pdfjs-text is not claimed to OCR images')
@@ -2345,6 +2346,8 @@ test('P11 candidate ranking: a more complete, equally-safe merge wins over equal
   // Local: everything valid EXCEPT the invoice number, self-reported high.
   const local = {
     ...CLEAN_ROW, invoice_number: undefined,
+    field_sources: Object.fromEntries(['invoice_date', 'vendor_name', 'supplier_gstin', 'taxable_value',
+      'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'].map((field) => [field, 'local'])),
     confidence: { invoice_date: 0.95, vendor_name: 0.95, supplier_gstin: 0.95, taxable_value: 0.95,
       cgst_amount: 0.95, sgst_amount: 0.95, igst_amount: 0.95, total_amount: 0.95 },
   }
@@ -2694,7 +2697,7 @@ test('P16 money: currency formats/commas/NBSP parse; zero preserved; NaN/Infinit
   assert.equal(ev.row.igst_amount, 0, 'explicit zero IGST is kept, not treated as missing')
 })
 
-test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge that stays in review', () => {
+test('P17 a fuller row with hard monetary failures loses to a sparser lower-failure row', () => {
   // Local found only 4 fields; the missing heads make amountsFinite false, so it
   // reports non-finite-amount + confidence 0 (exactly the production log).
   const local = {
@@ -2711,8 +2714,8 @@ test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge 
   }
   const localEval = ledger.evaluateLedger(local, { minConfidence: 0.7, now: NOW_17 })
   const mergedEval = ledger.evaluateLedger(merged, { minConfidence: 0.7, now: NOW_17 })
-  // The old ranking (hard-failure count ABOVE completeness) kept local: 1 code
-  // (`non-finite-amount`) beat the merge's several, discarding 5 useful fields.
+  // Integrity takes priority over completeness: a hard arithmetic contradiction
+  // cannot win just because the AI candidate carries more fields.
   assert.equal(localEval.review, 'needs_review')
   assert.ok(localEval.reasons.includes('non-finite-amount'), 'missing heads read as non-finite, as in the log')
   assert.equal(mergedEval.review, 'needs_review', 'the fuller merge is NOT auto-accepted')
@@ -2721,12 +2724,10 @@ test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge 
     { candidate: local, evaluation: localEval, source: 'local' },
     { candidate: merged, evaluation: mergedEval, source: 'ai' },
   ])
-  assert.equal(chosen.source, 'ai', 'completeness is judged before failure count: the reviewer gets the fuller row')
-  assert.equal(chosen.evaluation.review, 'needs_review', 'the merge still requires review (nothing weakened)')
-  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('total-mismatch')), 'the real contradiction is still reported')
-  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('amount-words-total-mismatch')))
-  // And the resolved month-name date lets it batch into the right month.
-  assert.equal(chosen.evaluation.invoiceDateResolved, true)
+  assert.equal(chosen.source, 'local', 'fewer hard failures outrank completeness')
+  assert.equal(chosen.evaluation.review, 'needs_review')
+  assert.ok(mergedEval.reasons.some((r) => r.startsWith('total-mismatch')), 'the contradictory candidate remains explicitly rejected')
+  assert.equal(chosen.evaluation.invoiceDateResolved, false, 'the selected sparse row is not assigned an inferred batch month')
 })
 
 test('P18 completeness-first is bounded: at equal completeness a contradiction loses to a clean row', () => {
@@ -2796,12 +2797,12 @@ test('P21 financial validation is NOT weakened to raise approvals', () => {
   assert.ok(!soft.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'no HARD rate flag when the total ties')
 })
 
-test('P22 source contract: ranking puts completeness before failure count; money + month-name support present', () => {
+test('P22 source contract: ranking puts hard failures before completeness; money + month-name support present', () => {
   const ledSrc = readFileSync(new URL('../lib/ocr/ledger.ts', import.meta.url), 'utf8')
-  const iComplete = ledSrc.indexOf('if (aCount !== bCount) return aCount > bCount')
   const iHard = ledSrc.indexOf('if (aHard !== bHard) return aHard < bHard')
-  assert.ok(iComplete >= 0 && iHard >= 0 && iComplete < iHard,
-    'completeness is compared BEFORE hard-failure count (the 17 Oct fix)')
+  const iComplete = ledSrc.indexOf('if (aCount !== bCount) return aCount > bCount')
+  assert.ok(iComplete >= 0 && iHard >= 0 && iHard < iComplete,
+    'hard failures are compared BEFORE completeness')
   assert.ok(ledSrc.includes('MONTH_NAMES') && ledSrc.includes('monthFromName'), 'month-name date support present')
   const monSrc = readFileSync(new URL('../lib/ocr/validators/money.ts', import.meta.url), 'utf8')
   assert.ok(monSrc.includes('Number.isFinite') && monSrc.includes('LEADING_CURRENCY'),

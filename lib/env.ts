@@ -66,6 +66,8 @@ const serverSchema = z.object({
   // Gemini fallback for ambiguous spreadsheet headers (layout labels only, never row values).
   GEMINI_API_KEY: z.string().trim().min(1).optional(),
   GEMINI_MODEL: z.string().min(1).default('gemini-flash-lite-latest'),
+  GEMINI_FALLBACK_MODEL: z.string().trim().min(1).optional(),
+  GEMINI_MAX_CONCURRENT: z.coerce.number().int().min(1).max(20).default(3),
   // 32-byte hex master key for local AES-256-GCM payload encryption.
   ENCRYPTION_MASTER_KEY: z
     .string()
@@ -89,6 +91,8 @@ const serverSchema = z.object({
   EXTRACTION_AMOUNT_TOLERANCE_MINOR_UNITS: z.coerce.number().int().min(0).max(10000).default(101),
   // Vision model for invoice extraction; defaults to GEMINI_MODEL when unset.
   EXTRACTION_VISION_MODEL: z.string().min(1).optional(),
+  VISION_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(60_000).default(40_000),
+  VISION_MAX_TOTAL_MS: z.coerce.number().int().min(5_000).max(120_000).default(50_000),
   // PRIVACY GATE. AI is OFF by default: real customer invoices are never sent
   // to an external provider unless the operator explicitly enables it AND has
   // confirmed a paid-tier + reviewed data-processing terms (EXTRACTION_AI_TIER).

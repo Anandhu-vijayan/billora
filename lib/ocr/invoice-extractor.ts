@@ -11,6 +11,7 @@ import {
   evaluateLedger,
   mergeCandidates,
   retryHintFor,
+  retryFieldsFor,
   selectBestCandidate,
   detectCandidateConflicts,
   presentFieldCount,
@@ -807,6 +808,7 @@ export async function extractInvoice(
     hasCandidate: candidate !== null,
     fieldCount: candidateFieldCount(candidate),
     presentFieldNames: candidatePresentFields(candidate),
+    fieldConfidence: candidate?.confidence ?? {},
     review: evaluation?.review ?? 'no_candidate',
     confidence: evaluation?.confidence ?? null,
     reasonCodes: evaluation?.reasons.slice(0, 8) ?? [],
@@ -856,7 +858,13 @@ export async function extractInvoice(
       // still forbids guessing and the merge below can never downgrade a
       // validated local approval.
       if (aiEvaluation.review === 'needs_review') {
-        const hint = retryHintFor(aiEvaluation.reasons, { buyerGstin })
+        const retryFields = retryFieldsFor(aiEvaluation.reasons)
+        const retryReasonCode = aiEvaluation.reasons.find((reason) =>
+          retryFields.some((field) => reason.endsWith(field) || reason.startsWith('total-mismatch') && field === 'total_amount'),
+        ) ?? aiEvaluation.reasons[0] ?? null
+        const hint = retryReasonCode
+          ? retryHintFor([retryReasonCode], { buyerGstin })
+          : null
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
         // The second read runs only if elapsed AI time plus one more ceiling fits
@@ -867,32 +875,38 @@ export async function extractInvoice(
           return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 50_000
         })()
         const budgetLeftForRetry = aiTotalBudgetMs - (Date.now() - aiStartedAt)
-        if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
+        if (hint && retryFields.length > 0 && budgetLeftForRetry < visionCallTimeoutMs()) {
           logger.info('[Extract] AI second pass skipped: insufficient time budget', {
             model, elapsedMs: Date.now() - aiStartedAt,
             budgetLeftMs: budgetLeftForRetry, neededMs: visionCallTimeoutMs(),
           })
-        } else if (hint) {
+        } else if (hint && retryFields.length > 0) {
           secondPass = true
           logger.info('[Extract] AI second pass started', {
             model,
             durationMs: Date.now() - aiStartedAt,
             reasonCodes: aiEvaluation.reasons.slice(0, 8),
           })
-          const retryCandidate = await extractInvoiceFields(
+          const targetedRetry = await extractInvoiceFields(
             mimeType === PDF_MIME
-              ? { buffer, mimeType: PDF_MIME, apiKey, model, hint }
-              : { buffer: await prepareImageForVision(buffer), mimeType: 'image/jpeg', apiKey, model, hint },
+              ? { buffer, mimeType: PDF_MIME, apiKey, model, targetFields: retryFields, reasonCode: retryReasonCode, source: 'ai-pass2', hint }
+              : { buffer: await prepareImageForVision(buffer), mimeType: 'image/jpeg', apiKey, model, targetFields: retryFields, reasonCode: retryReasonCode, source: 'ai-pass2', hint },
           )
+          const retriedAiCandidate: LedgerCandidate = {
+            ...aiCandidate,
+            ...targetedRetry,
+            confidence: { ...aiCandidate.confidence, ...targetedRetry.confidence },
+            field_sources: { ...aiCandidate.field_sources, ...targetedRetry.field_sources },
+          }
           const retryAssisted = candidate
-            ? mergeCandidates(candidate, retryCandidate)
-            : retryCandidate
+            ? mergeCandidates(candidate, retriedAiCandidate)
+            : retriedAiCandidate
           const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
           logger.info('[Extract] AI second pass completed', {
             model,
             durationMs: Date.now() - aiStartedAt,
-            fieldCount: candidateFieldCount(retryCandidate),
-            fieldNames: candidatePresentFields(retryCandidate),
+            fieldCount: candidateFieldCount(targetedRetry),
+            fieldNames: candidatePresentFields(targetedRetry),
             review: retryEvaluation.review,
             confidence: retryEvaluation.confidence,
             reasonCodes: retryEvaluation.reasons.slice(0, 8),
@@ -906,7 +920,7 @@ export async function extractInvoice(
             { candidate: retryAssisted, evaluation: retryEvaluation, source: 'ai' },
           ])! 
           if (passChoice.candidate === retryAssisted) {
-            aiCandidate = retryCandidate
+            aiCandidate = retriedAiCandidate
             assisted = retryAssisted
             aiEvaluation = retryEvaluation
           }
@@ -960,7 +974,7 @@ export async function extractInvoice(
       logger.info('[Extract] candidate selected', {
         model,
         chosenSource: source,
-        selectionBasis: 'approved>completeness>hardFailures>confidence',
+            selectionBasis: 'approved>hardFailures>completeness>confidence',
         localFieldCount: candidateFieldCount(localCandidate),
         localFieldNames: candidatePresentFields(localCandidate),
         localRowCompleteness: localEvaluation ? presentFieldCount(localEvaluation.row) : 0,

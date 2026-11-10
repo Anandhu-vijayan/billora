@@ -361,6 +361,10 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
       JSON.stringify({
         ...evaluation.row,
         _reviewReasons: evaluation.reasons,
+        _repairs: evaluation.repairs ?? [],
+        _moneyReconciliation: evaluation.moneyReconciliation,
+        _fieldSources: result.candidate.field_sources ?? {},
+        _vendorNameSource: result.candidate.vendor_name_source ?? result.candidate.field_sources?.vendor_name ?? null,
         _recipientGstin: result.candidate.recipient_gstin ?? null,
         _classification: classification,
       }),
@@ -381,7 +385,7 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     logger.info('[Extract] result saved', {
       invoiceId, jobId: job.id, review: evaluation.review,
       source: confidenceSource, confidence: evaluation.confidence,
-      repairs: evaluation.repairs ?? [],
+      repairFields: (evaluation.repairs ?? []).map((repair) => repair.field),
       presentFieldNames: [
         'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
         'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',

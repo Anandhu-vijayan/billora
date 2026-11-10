@@ -289,7 +289,7 @@ test('an inconsistent mixed-rate breakdown forces review with the named gap, nev
   assert.ok(ev.reasons.some((r) => r.startsWith(`${R.invoiceTotalMismatch}:cgst`)), ev.reasons.join(','))
 })
 
-test('the historical single-rate path is untouched: no slices, no mixed-gst reasons, one derived slice', () => {
+test('single-rate header totals do not fabricate a rate-wise slice', () => {
   const ev = ledger.evaluateLedger({
     invoice_date: '05/09/2026', invoice_number: 'INV-42',
     vendor_name: 'Acme Traders Pvt Ltd', supplier_gstin: '27AAPFU0939F1ZV',
@@ -299,7 +299,7 @@ test('the historical single-rate path is untouched: no slices, no mixed-gst reas
   assert.equal(ev.review, 'approved', ev.reasons.join(','))
   assert.equal(ev.breakdownValidated, null, 'a single-rate bill has no breakdown to validate')
   assert.ok(!ev.reasons.some((r) => r.startsWith('mixed-gst-')), ev.reasons.join(','))
-  assert.equal(ev.row.tax_slices.length, 1, 'the derived slice feeds the Tax Breakdown sheet')
+  assert.equal(ev.row.tax_slices, undefined, 'header totals alone are not item-level slice evidence')
 })
 
 test('mergeCandidates preserves the rate-wise breakdown across local/AI sources', () => {

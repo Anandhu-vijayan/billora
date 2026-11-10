@@ -199,9 +199,13 @@ function stripVendorLabel(line: string): string | null {
   const after = line
     .replace(VENDOR_LABEL, '')
     .replace(/[:\s]+/g, ' ')
-    .replace(/(GSTIN|GST|UIN|Address|Date).*/i, '')
+    .replace(/\b(?:TAX\s+INVOICE|INVOICE\s+TAX)\b/ig, '')
+    .replace(/\b(?:GSTIN|GST|UIN|Address|Invoice\s+Date|Date)\b.*$/i, '')
     .trim()
-  return after.length >= 2 && after.length <= 80 ? after : null
+  if (after.length < 2 || after.length > 80) return null
+  if (/\b(?:bill\s*to|buyer|customer|ship\s*to|tax\s+invoice|invoice\s+date|authori[sz]ed|address)\b/i.test(after)) return null
+  if (/\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3,9})[-/ ]\d{2,4}\b/.test(after)) return null
+  return after.replace(/\s+/g, ' ')
 }
 
 /**
@@ -251,7 +255,8 @@ function findVendor(text: string): { value: string; confidence: number } | null 
         const value = stripVendorLabel(line)
         if (value) return { value, confidence: CONF_STRONG }
       }
-      if (!labelled) labelled = { value: line, confidence: CONF_STRONG }
+      const value = stripVendorLabel(line)
+      if (!labelled && value) labelled = { value, confidence: CONF_STRONG }
     }
     if (!labelled && VENDOR_LABEL.test(line)) {
       const value = stripVendorLabel(line)
@@ -478,6 +483,13 @@ export function parseInvoiceText(
   const summarySlices = parseRateWiseSummary(normalized)
   if (summarySlices) candidate.tax_slices = summarySlices
 
+  candidate.field_sources = Object.fromEntries(
+    Object.entries(candidate)
+      .filter(([field, value]) => field !== 'confidence' && field !== 'field_sources'
+        && value !== undefined && value !== null && value !== '')
+      .map(([field]) => [field, 'local']),
+  )
+  if (candidate.vendor_name) candidate.vendor_name_source = 'local'
   return candidate
 }
 

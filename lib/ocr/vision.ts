@@ -85,12 +85,52 @@ const REQUIRED_RESPONSE_FIELDS = [...TEXT_FIELDS, ...AMOUNT_FIELDS, 'confidence'
 
 /** Only these transport types are meaningful image/PDF inputs for vision. */
 const SUPPORTED_MIME = /^(image\/(jpeg|png|webp)|application\/pdf)$/i
+const TARGETABLE_FIELDS = new Set([
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+  ...AMOUNT_FIELDS,
+])
+
+function parseStrictMoneyString(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+  const raw = value.trim().replace(/^(?:INR|Rs\.?|₹)\s*/i, '')
+  const validFormat = /^[+-]?(?:\d+|\d{1,2}(?:,\d{2})*,\d{3}|\d{1,3}(?:,\d{3})+)(?:\.\d{1,4})?$/.test(raw)
+  if (!validFormat || moneyToMinorUnits(raw) === null) {
+    throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+  }
+  return raw
+}
+
+function parseJsonObject(text: string): Record<string, unknown> {
+  const trimmed = (text ?? '').trim()
+  const braceStart = trimmed.indexOf('{')
+  const braceEnd = trimmed.lastIndexOf('}')
+  if (braceStart < 0 || braceEnd <= braceStart) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  let value: unknown
+  try { value = JSON.parse(trimmed.slice(braceStart, braceEnd + 1)) } catch {
+    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  }
+  return value as Record<string, unknown>
+}
+
+export function parseNumericEquation(text: string): {
+  parts: string[]; result: string; isEquation: true; isIndependentEvidence: false
+} | null {
+  const match = /^\s*([\d,]+(?:\.\d{1,4})?\s*(?:\+\s*[\d,]+(?:\.\d{1,4})?\s*)+)\s*=\s*([\d,]+(?:\.\d{1,4})?)\s*$/u.exec(text)
+  if (!match) return null
+  const parts = match[1].split('+').map((part) => part.trim())
+  const result = match[2].trim()
+  if ([...parts, result].some((value) => moneyToMinorUnits(value) === null)) return null
+  return { parts, result, isEquation: true, isIndependentEvidence: false }
+}
 
 const VISION_PROMPT = [
   'You are reading a single Indian GST tax invoice. Extract ONLY values that are',
   'explicitly printed on the document. Never guess, infer or compute a number, a',
   'date, or a GSTIN. If a text field is not present or not legible, return an',
-  'empty string. For amount fields return null when unknown and numeric 0 only',
+  'empty string. For amount fields return null when unknown and the string "0.00" only',
   'when zero is explicitly printed or the tax head is demonstrably absent. An',
   'invoice charges EITHER IGST OR CGST+SGST, never both: when IGST is charged',
   'return 0 for cgst_amount and sgst_amount; when CGST and SGST are charged',
@@ -290,24 +330,95 @@ function providerStatus(error: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) ? value : null
 }
 
+let activeGeminiRequests = 0
+const geminiWaiters: Array<() => void> = []
+
+function maxConcurrentGeminiRequests(): number {
+  const parsed = Number.parseInt(process.env.GEMINI_MAX_CONCURRENT ?? '', 10)
+  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 20) : 3
+}
+
+async function acquireGeminiSlot(): Promise<() => void> {
+  if (activeGeminiRequests >= maxConcurrentGeminiRequests()) {
+    await new Promise<void>((resolve) => geminiWaiters.push(resolve))
+  } else {
+    activeGeminiRequests += 1
+  }
+  return () => {
+    const next = geminiWaiters.shift()
+    if (next) next()
+    else activeGeminiRequests = Math.max(0, activeGeminiRequests - 1)
+  }
+}
+
+function retryAfterMs(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+  const source = error as { headers?: unknown; response?: { headers?: unknown } }
+  const headers = source.headers ?? source.response?.headers
+  let value: unknown
+  if (headers && typeof headers === 'object' && 'get' in headers
+    && typeof (headers as { get?: unknown }).get === 'function') {
+    value = (headers as { get(name: string): unknown }).get('retry-after')
+  } else if (headers && typeof headers === 'object') {
+    value = (headers as Record<string, unknown>)['retry-after']
+      ?? (headers as Record<string, unknown>)['Retry-After']
+  }
+  if (typeof value !== 'string' && typeof value !== 'number') return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) return Math.max(0, Math.min(30_000, seconds * 1000))
+  const date = Date.parse(String(value))
+  return Number.isFinite(date) ? Math.max(0, Math.min(30_000, date - Date.now())) : null
+}
+
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  request: ReturnType<typeof buildGeminiInvoiceRequest>,
+  primaryModel: string,
+): Promise<{ response: Awaited<ReturnType<typeof ai.models.generateContent>>; model: string }> {
+  const fallbackModel = (process.env.GEMINI_FALLBACK_MODEL ?? '').trim()
+  const models = fallbackModel && fallbackModel !== primaryModel
+    ? [primaryModel, fallbackModel]
+    : [primaryModel]
+  const configuredBudget = Number.parseInt(process.env.VISION_MAX_TOTAL_MS ?? '', 10)
+  const deadline = Date.now() + (Number.isFinite(configuredBudget) && configuredBudget >= 5_000
+    ? configuredBudget : 50_000)
+  let lastError: unknown
+  for (const model of models) {
+    const modelRequest = { ...request, model }
+    for (let attempt = 0; attempt <= 3; attempt += 1) {
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) break
+      const release = await acquireGeminiSlot()
+      try {
+        const response = await withTimeout(ai.models.generateContent(modelRequest), Math.min(callTimeoutMs(), remainingMs))
+        return { response, model }
+      } catch (error) {
+        lastError = error
+        const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError
+          ? error : classifyProviderError(error)
+        if (!(classified instanceof VisionTransientError)) throw classified
+        if (attempt === 3) break
+        const exponential = 1_000 * (2 ** attempt)
+        const delay = retryAfterMs(error) ?? Math.round(exponential * (0.75 + Math.random() * 0.5))
+        if (delay >= deadline - Date.now()) break
+        logger.warn('[Vision] transient provider failure; retry scheduled', {
+          model, attempt: attempt + 1, delayMs: delay,
+          failureReason: providerFailureReason(error), httpStatus: providerStatus(error),
+        })
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      } finally {
+        release()
+      }
+    }
+  }
+  throw lastError instanceof Error ? classifyProviderError(lastError) : new VisionTransientError('provider_unavailable')
+}
+
 /** Parse the model's JSON text into a candidate; malformed output is permanent. */
-export function parseVisionJson(text: string): LedgerCandidate {
-  const trimmed = (text ?? '').trim()
-  if (!trimmed) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
+export function parseVisionJson(text: string, source: 'ai-pass1' | 'ai-pass2' = 'ai-pass1'): LedgerCandidate {
+  if (!(text ?? '').trim()) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
   // Tolerate a fenced block even with responseMimeType set; take the outer object.
-  const braceStart = trimmed.indexOf('{')
-  const braceEnd = trimmed.lastIndexOf('}')
-  if (braceStart < 0 || braceEnd <= braceStart) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  let json: unknown
-  try {
-    json = JSON.parse(trimmed.slice(braceStart, braceEnd + 1))
-  } catch {
-    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  }
-  if (!json || typeof json !== 'object' || Array.isArray(json)) {
-    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  }
-  const candidate = json as Record<string, unknown>
+  const candidate = parseJsonObject(text)
   // Required keys must be present. Optional evidence fields may be absent (read
   // as null) and unknown extra keys are ignored: failing a whole invoice (a
   // PERMANENT job failure) over metadata drift is far costlier than ignoring it.
@@ -332,12 +443,7 @@ export function parseVisionJson(text: string): LedgerCandidate {
   for (const field of AMOUNT_FIELDS) {
     const value = candidate[field]
     if (value === null) continue
-    if (typeof value !== 'string' && typeof value !== 'number') {
-      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    }
-    const minorUnits = moneyToMinorUnits(value)
-    if (minorUnits === null) throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    candidate[field] = minorUnitsToNumber(minorUnits)
+    candidate[field] = parseStrictMoneyString(value, field)
   }
   // Optional structural components: absent or malformed is tolerated as null,
   // never a permanent failure — they only assist reconciliation.
@@ -345,10 +451,8 @@ export function parseVisionJson(text: string): LedgerCandidate {
     const value = candidate[field]
     if (value === undefined) { candidate[field] = null; continue }
     if (value === null) continue
-    const minorUnits = typeof value === 'string' || typeof value === 'number'
-      ? moneyToMinorUnits(value)
-      : null
-    candidate[field] = minorUnits === null ? null : minorUnitsToNumber(minorUnits)
+    try { candidate[field] = value === null ? null : parseStrictMoneyString(value, field) }
+    catch { candidate[field] = null }
   }
   // §multi-rate: a rate-wise breakdown is OPTIONAL AI evidence. Preserve it when
   // the model returns a well-formed array of slice objects, but NEVER fail the
@@ -362,8 +466,10 @@ export function parseVisionJson(text: string): LedgerCandidate {
       .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object' && !Array.isArray(s))
       .map((s) => {
         const money = (v: unknown): number | null => {
-          if (typeof v !== 'string' && typeof v !== 'number') return null
-          const minorUnits = moneyToMinorUnits(v)
+          if (typeof v !== 'string') return null
+          let formatted: string
+          try { formatted = parseStrictMoneyString(v, 'tax_slices') } catch { return null }
+          const minorUnits = moneyToMinorUnits(formatted)
           return minorUnits === null || minorUnits < BigInt(0) ? null : minorUnitsToNumber(minorUnits)
         }
         const rate = typeof s.rate_percent === 'number' && Number.isFinite(s.rate_percent)
@@ -405,7 +511,46 @@ export function parseVisionJson(text: string): LedgerCandidate {
   }
   // Normalised: exactly the keys downstream consumes, all finite numbers in [0, 1].
   candidate.confidence = confidence
+  candidate.field_sources = Object.fromEntries(
+    [...TEXT_FIELDS, ...AMOUNT_FIELDS, ...(candidate.tax_slices ? ['tax_slices'] : [])]
+      .filter((field) => candidate[field] !== undefined && candidate[field] !== null && candidate[field] !== '')
+      .map((field) => [field, source]),
+  )
+  candidate.vendor_name_ambiguous = Boolean(candidate.vendor_name)
+  if (candidate.vendor_name) candidate.vendor_name_source = source
   return candidate as unknown as LedgerCandidate
+}
+
+export function parseTargetedVisionJson(
+  text: string,
+  fields: readonly string[],
+  source: 'ai-pass1' | 'ai-pass2' = 'ai-pass2',
+): LedgerCandidate {
+  if (!(text ?? '').trim()) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
+  const requested = [...new Set(fields)]
+  if (requested.length === 0 || requested.some((field) => !TARGETABLE_FIELDS.has(field))) {
+    throw new VisionPermanentError('VISION_TARGET_FIELD_INVALID')
+  }
+  const parsed = parseJsonObject(text)
+  const candidate: Record<string, unknown> = { confidence: {}, field_sources: {} }
+  const confidence = candidate.confidence as Record<string, number>
+  const fieldSources = candidate.field_sources as Record<string, string>
+  for (const field of requested) {
+    if (!(field in parsed)) throw new VisionPermanentError(`VISION_SCHEMA_KEYS_INVALID:${field}`)
+    const value = parsed[field]
+    if (AMOUNT_FIELDS.includes(field as typeof AMOUNT_FIELDS[number])) {
+      candidate[field] = value === null ? null : parseStrictMoneyString(value, field)
+    } else if (typeof value !== 'string') {
+      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    } else {
+      candidate[field] = value.trim()
+    }
+    confidence[field] = 0.8
+    fieldSources[field] = source
+  }
+  candidate.vendor_name_ambiguous = requested.includes('vendor_name') && Boolean(candidate.vendor_name)
+  if (candidate.vendor_name) candidate.vendor_name_source = source
+  return candidate as LedgerCandidate
 }
 
 /**
@@ -424,8 +569,11 @@ export async function extractInvoiceFields(args: {
    * to re-read — it is still forbidden to guess.
    */
   hint?: string | null
+  targetFields?: readonly string[]
+  reasonCode?: string | null
+  source?: 'ai-pass1' | 'ai-pass2'
 }): Promise<LedgerCandidate> {
-  const { buffer, mimeType, apiKey, model, hint } = args
+  const { buffer, mimeType, apiKey, model, hint, targetFields, reasonCode, source = 'ai-pass1' } = args
   if (!SUPPORTED_MIME.test(mimeType)) {
     throw new VisionPermanentError(`UNSUPPORTED_MEDIA_TYPE: ${mimeType}`)
   }
@@ -433,12 +581,27 @@ export async function extractInvoiceFields(args: {
   if (!buffer || buffer.length === 0) throw new VisionPermanentError('EMPTY_MEDIA')
 
   const ai = new GoogleGenAI({ apiKey })
+  const targets = targetFields?.length ? [...new Set(targetFields)] : null
+  if (targets?.some((field) => !TARGETABLE_FIELDS.has(field))) {
+    throw new VisionPermanentError('VISION_TARGET_FIELD_INVALID')
+  }
+  const responseSchema = targets
+    ? {
+        type: Type.OBJECT,
+        properties: Object.fromEntries(targets.map((field) => [field, LEDGER_SCHEMA.properties[field as keyof typeof LEDGER_SCHEMA.properties]])),
+        required: targets,
+        propertyOrdering: targets,
+      }
+    : LEDGER_SCHEMA
+  const prompt = targets
+    ? `Re-read ONLY these fields from the supplied invoice image: ${targets.join(', ')}. Original validation reason: ${reasonCode ?? 'field reread requested'}. ${hint ?? ''} Return JSON containing only the requested fields. For monetary fields return a JSON string copied exactly as printed, including decimal points and trailing zeroes; never calculate or infer a replacement. For vendor_name use only the top issuer letterhead or Supplier / Sold By / Invoice From, never Bill To / Buyer / Customer, and omit TAX INVOICE, dates and addresses. If a requested value cannot be read, return an empty string for text or null for money.`
+    : hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT
   const request = buildGeminiInvoiceRequest({
     model,
     mimeType,
     imageBase64: buffer.toString('base64'),
-    prompt: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT,
-    responseSchema: LEDGER_SCHEMA,
+    prompt,
+    responseSchema,
   })
 
   const imagePart = request.contents[0].parts.find((part) => 'inlineData' in part)
@@ -456,15 +619,13 @@ export async function extractInvoiceFields(args: {
     promptBytes: Buffer.byteLength(promptPart.text, 'utf8'),
     contentPartCount: request.contents[0].parts.length,
     responseMimeType: request.config.responseMimeType,
-    schemaFieldNames: Object.keys(LEDGER_SCHEMA.properties),
+    schemaFieldNames: targets ?? Object.keys(LEDGER_SCHEMA.properties),
   })
   try {
-    const response = await withTimeout(
-      ai.models.generateContent(request),
-      callTimeoutMs(),
-    )
+    const { response, model: responseModel } = await generateWithRetry(ai, request, model)
     const text = (response as { text?: string }).text ?? ''
-    const candidate = parseVisionJson(text)
+    const candidate = targets ? parseTargetedVisionJson(text, targets, source) : parseVisionJson(text, source)
+    if (responseModel !== model) logger.info('[Vision] fallback model used', { model: responseModel })
     return candidate
   } catch (error) {
     const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError

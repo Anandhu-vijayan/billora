@@ -30,7 +30,7 @@ const src = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8
     const minorUnitsToNumber = (value: bigint) => Number(value) / 100
   `)
 writeFileSync(new URL(`../${STUB_PATH}`, import.meta.url), src)
-const { parseVisionJson, VisionPermanentError } = await importTs(STUB_PATH)
+const { parseVisionJson, parseTargetedVisionJson, parseNumericEquation, VisionPermanentError } = await importTs(STUB_PATH)
 after(() => rmSync(new URL(`../${STUB_PATH}`, import.meta.url), { force: true }))
 
 // What Gemini returns for the schema in vision.ts (confidence has the 9 keys the schema asks for).
@@ -49,8 +49,8 @@ const failsWith = (o, code) => assert.throws(() => parse(o), (e) => e instanceof
 
 test('V1 the exact response shape the schema requests is ACCEPTED (was VISION_CONFIDENCE_KEYS_INVALID)', () => {
   const c = parse(good())
-  assert.equal(c.total_amount, 118000)
-  assert.equal(c.taxable_value, 100000)
+  assert.equal(c.total_amount, '1,18,000.00')
+  assert.equal(c.taxable_value, '1,00,000.00')
   assert.deepEqual(Object.keys(c.confidence).sort(), [
     'cgst_amount', 'igst_amount', 'invoice_date', 'invoice_number', 'sgst_amount',
     'supplier_gstin', 'taxable_value', 'total_amount', 'vendor_name',
@@ -80,6 +80,8 @@ test('V4 genuine problems are still rejected', () => {
   failsWith(nullTextConf, 'VISION_CONFIDENCE_INVALID:invoice_number')
   const badType = good(); badType.taxable_value = { amount: 100000 }
   failsWith(badType, 'VISION_FIELD_TYPE_INVALID:taxable_value')
+  const numericAmount = good(); numericAmount.taxable_value = 485000
+  failsWith(numericAmount, 'VISION_FIELD_TYPE_INVALID:taxable_value')
   const malformedMoney = good(); malformedMoney.total_amount = '4.850.00'
   failsWith(malformedMoney, 'VISION_FIELD_TYPE_INVALID:total_amount')
   const badEvidence = good(); badEvidence.igst_rate_percent = 18
@@ -100,11 +102,30 @@ test('V5 amount strings preserve decimal points and vendor extraction excludes b
   o.sgst_amount = '291.00'
   o.total_amount = '5,432.00'
   const c = parse(o)
-  assert.equal(c.taxable_value, 4850)
-  assert.equal(c.cgst_amount, 291)
-  assert.equal(c.total_amount, 5432)
+  assert.equal(c.taxable_value, '4,850.00')
+  assert.equal(c.cgst_amount, '291.00')
+  assert.equal(c.total_amount, '5,432.00')
   assert.match(src, /must be "4850\.00", never "485000"/)
   assert.match(src, /Never identify the supplier from the Bill To/)
+  const scaleError = good(); scaleError.total_amount = '485000'
+  assert.equal(parse(scaleError).total_amount, '485000', 'raw integer is retained, never silently divided')
+  assert.equal(parseNumericEquation('9000.00 + 225.00 + 225.00 = 9450.00')?.isIndependentEvidence, false)
+  assert.equal(parseNumericEquation('Nine Thousand Four Hundred Fifty Only'), null)
+})
+
+test('V6 targeted parser accepts only the requested field and records second-pass provenance', () => {
+  const c = parseTargetedVisionJson('{"total_amount":"5,432.00"}', ['total_amount'], 'ai-pass2')
+  assert.equal(c.total_amount, '5,432.00')
+  assert.equal(c.field_sources.total_amount, 'ai-pass2')
+  assert.ok(!('vendor_name' in c) && !('taxable_value' in c))
+  assert.throws(() => parseTargetedVisionJson('{"vendor_name":"Buyer Co"}', ['taxable_value']))
+})
+
+test('V6b the extraction retry call is field-targeted rather than another broad schema pass', () => {
+  assert.ok(extractor.includes('retryFieldsFor('))
+  assert.ok(extractor.includes('targetFields: retryFields'))
+  assert.ok(extractor.includes('reasonCode: retryReasonCode'))
+  assert.equal((extractor.match(/targetFields: retryFields/g) ?? []).length, 2, 'image and PDF retry paths both target fields')
 })
 
 // ---- extractor / worker wiring --------------------------------------------------
