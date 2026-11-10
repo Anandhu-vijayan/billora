@@ -293,7 +293,7 @@ function providerStatus(error: unknown): number | null {
 /** Parse the model's JSON text into a candidate; malformed output is permanent. */
 function isStrictMoneyToken(value: string): boolean {
   const raw = value.trim().replace(/^(?:INR|RS[.]?|₹)[ ]*/i, '').replace(/[ ]/g, '')
-  const grouped = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})'
+  const grouped = '(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3}|[0-9]+)'
   const match = raw.match(new RegExp('^[+-]?' + grouped + '(?:[.][0-9]{1,2})?'))
   return !!match && match[0] === raw
 }
