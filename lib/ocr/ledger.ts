@@ -575,7 +575,7 @@ export function evaluateLedger(
   if (candidate.vendor_ambiguous) reasons.push('vendor-ambiguous')
   if (!vendorName) reasons.push('vendor-name-missing')
   else if (!vendorNameValid) reasons.push('vendor-name-placeholder')
-  for (const field of Object.keys(candidate.field_conflicts ?? {})) reasons.push(`money-field-conflict:\${field}`)
+  for (const field of Object.keys(candidate.field_conflicts ?? {})) reasons.push(`money-field-conflict:${field}`)
 
   const gstin = (candidate.supplier_gstin ?? '').trim().toUpperCase();
   let gstinOk = false;
