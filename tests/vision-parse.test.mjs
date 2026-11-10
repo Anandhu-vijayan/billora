@@ -141,14 +141,14 @@ test('V6 Gemini receives a small colour JPEG, never the 3 MB OCR PNG', async () 
   const m2 = await sharp(await prepareImageForVision(small)).metadata()
   assert.deepEqual([m2.width, m2.height], [800, 1100])
   // The first AI pass gets a bounded colour JPEG. The second pass uses a
-  // label-located, lossless Grand Total crop rather than repeating the page.
+  // label-located Grand Total crop, or the original document if no crop is found.
   assert.equal((extractor.match(/prepareImageForVision\(buffer\)/g) ?? []).length, 1, 'only first AI pass uses the full-page JPEG')
   assert.ok(extractor.includes('cropGrandTotalRegion'), 'OCR line boxes locate the printed Grand Total crop')
   assert.ok(extractor.includes("targetField: 'total_amount'"), 'second pass requests only total_amount')
   assert.ok(!/buffer: normalized,\s*mimeType: 'image\/png'/.test(extractor), 'no OCR-PNG sent to Gemini')
   assert.ok(extractor.includes('const png = await normalizeImageToPng(buffer)'), 'Tesseract gets the lossless OCR copy')
   const normalizer = extractor.slice(extractor.indexOf('async function normalizeImageToPng'), extractor.indexOf('type OcrWorker'))
-  assert.ok(!normalizer.includes('.resize('), 'local OCR preprocessing never resamples the source')
+  assert.ok(normalizer.includes('getOcrRasterSize') && normalizer.includes('.resize('), 'local OCR gets a bounded resized copy while the original input stays intact')
 })
 
 test('V7 an unusable AI answer settles on the local result; config faults still fail the job', () => {
