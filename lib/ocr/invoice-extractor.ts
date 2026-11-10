@@ -350,9 +350,10 @@ async function cropGrandTotalRegion(png: Buffer, data: unknown): Promise<Buffer 
   const cropHeight = Math.min(meta.height, Math.max(160, Math.ceil(lineHeight * 9)))
   const top = Math.max(0, Math.min(meta.height - cropHeight, Math.floor((box.y0 as number) - lineHeight * 2)))
   try {
+    const scale = Math.min(2, 4000 / meta.width)
     return await sharp(png)
       .extract({ left: 0, top, width: meta.width, height: cropHeight })
-      .resize({ width: meta.width * 2, height: cropHeight * 2, fit: 'fill' })
+      .resize({ width: Math.round(meta.width * scale), height: Math.round(cropHeight * scale), fit: 'fill' })
       .png()
       .toBuffer()
   } catch { return null }
