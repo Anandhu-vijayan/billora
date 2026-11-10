@@ -120,6 +120,12 @@ export interface LedgerCandidate {
    */
   tax_slices?: InvoiceTaxSlice[] | null;
   confidence?: Record<string, number> | null;
+  /** Internal extraction evidence; removed from canonical ledger rows. */
+  buyer_region_names?: string[];
+  vendor_ambiguous?: boolean;
+  total_amount_in_words_source?: 'local-ocr' | 'ai' | 'human';
+  /** Both source readings are retained for review when a money field conflicts. */
+  field_conflicts?: Record<string, { local: number | string; ai: number | string }>;
 }
 
 export type LedgerReview = 'approved' | 'needs_review';
@@ -386,7 +392,21 @@ export function mergeCandidates(
     }
   }
   copyText('invoice_number', isTextValid)
-  copyText('vendor_name', isValidVendorName)
+  const normalizeVendor = (value: string): string => value.toUpperCase()
+    .replace(/\bPVT\.?\s*LTD\.?\b/g, 'PRIVATE LIMITED')
+    .replace(/\bPVTLTD\.?(?=\s|$)/g, 'PRIVATE LIMITED')
+    .replace(/[^A-Z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
+  const buyerNames = (primary.buyer_region_names ?? []).map(normalizeVendor)
+  const primaryVendor = typeof primary.vendor_name === 'string' ? primary.vendor_name.trim() : ''
+  const fallbackVendor = typeof fallback?.vendor_name === 'string' ? fallback.vendor_name.trim() : ''
+  const primaryIsBuyer = !!primaryVendor && buyerNames.includes(normalizeVendor(primaryVendor))
+  const fallbackIsBuyer = !!fallbackVendor && buyerNames.includes(normalizeVendor(fallbackVendor))
+  if (primary.vendor_ambiguous || primaryIsBuyer || fallbackIsBuyer) {
+    merged.vendor_name = null
+    merged.vendor_ambiguous = true
+  } else {
+    copyText('vendor_name', isValidVendorName)
+  }
 
   if (isDateValid(primary.invoice_date)) {
     merged.invoice_date = (primary.invoice_date ?? '').trim()
@@ -396,12 +416,23 @@ export function mergeCandidates(
     merged.supplier_gstin = (primary.supplier_gstin ?? '').trim().toUpperCase()
     if (primary.confidence?.supplier_gstin !== undefined) confidence.supplier_gstin = primary.confidence.supplier_gstin
   }
+  const fieldConflicts: NonNullable<LedgerCandidate['field_conflicts']> = { ...(primary.field_conflicts ?? fallback?.field_conflicts ?? {}) }
   for (const field of ['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const) {
-    if (isAmountValid(primary[field])) {
-      ;(merged as Record<string, unknown>)[field] = primary[field]
+    const localValue = primary[field]
+    const aiValue = fallback?.[field]
+    const localMinor = moneyToMinorUnits(localValue)
+    const aiMinor = moneyToMinorUnits(aiValue)
+    if (localMinor !== null && aiMinor !== null && localMinor !== aiMinor) {
+      fieldConflicts[field] = { local: localValue as number | string, ai: aiValue as number | string }
+      ;(merged as Record<string, unknown>)[field] = localValue
+      continue
+    }
+    if (isAmountValid(localValue)) {
+      ;(merged as Record<string, unknown>)[field] = localValue
       if (primary.confidence?.[field] !== undefined) confidence[field] = primary.confidence[field]
     }
   }
+  if (Object.keys(fieldConflicts).length > 0) merged.field_conflicts = fieldConflicts
   // Optional structural components: keep whichever source printed a parseable
   // value (primary/local preferred), preserving provenance. Unlike the canonical
   // heads these are legitimately absent, and `round_off` may be negative, so the
@@ -428,6 +459,11 @@ export function mergeCandidates(
   // §P3-16 document type is a LOCAL structural signal (a printed Credit/Debit Note
   // title). The AI schema never returns it, so a note read locally must survive a
   // merge with an AI candidate that reports nothing. Prefer the primary (local) read.
+  if (primary.total_amount_in_words && primary.total_amount_in_words_source) {
+    merged.total_amount_in_words_source = primary.total_amount_in_words_source
+  } else if (fallback?.total_amount_in_words) {
+    merged.total_amount_in_words_source = 'ai'
+  }
   const docType = primary.document_type ?? fallback?.document_type
   if (docType) merged.document_type = docType
   // Rate-wise slices are preserved WITHOUT flattening: the primary (local/human)
@@ -456,7 +492,7 @@ function repairTotalFromWords(
   repairs: string[],
 ): LedgerCandidate {
   const words = (candidate.total_amount_in_words ?? '').trim()
-  if (!words) return candidate
+  if (!words || !['local-ocr', 'human'].includes(candidate.total_amount_in_words_source ?? '')) return candidate
   const wordsMinor = parseIndianAmountWords(words)
   if (wordsMinor === null) return candidate
   const printedMinor = moneyToMinorUnits(candidate.total_amount)
@@ -536,8 +572,10 @@ export function evaluateLedger(
 
   const vendorName = (candidate.vendor_name ?? '').trim();
   const vendorNameValid = isValidVendorName(vendorName)
+  if (candidate.vendor_ambiguous) reasons.push('vendor-ambiguous')
   if (!vendorName) reasons.push('vendor-name-missing')
   else if (!vendorNameValid) reasons.push('vendor-name-placeholder')
+  for (const field of Object.keys(candidate.field_conflicts ?? {})) reasons.push(`money-field-conflict:\${field}`)
 
   const gstin = (candidate.supplier_gstin ?? '').trim().toUpperCase();
   let gstinOk = false;
@@ -567,6 +605,20 @@ export function evaluateLedger(
   const amountsNonNegative = amounts.every((n) => Number.isFinite(n) && n >= 0);
   let arithmeticConsistent = true;
   let structureConsistent = true;
+  // Plausibility gate only: never rescale or rewrite a printed amount. Standard
+  // GST component ceilings are 14% per CGST/SGST head and 28% IGST. Values above
+  // a small tolerance are suspicious for decimal/zero-joining OCR errors; they
+  // stay untouched and force human review. Cess is represented separately.
+  const [taxableForMagnitude, cgstForMagnitude, sgstForMagnitude, igstForMagnitude] = amountMinorUnits
+  if (taxableForMagnitude !== null && taxableForMagnitude > BigInt(0)) {
+    const exceeds = (amount: bigint | null, basisPoints: bigint): boolean =>
+      amount !== null && amount * BigInt(10000) > taxableForMagnitude * basisPoints
+    if (exceeds(cgstForMagnitude, BigInt(1425)) || exceeds(sgstForMagnitude, BigInt(1425))
+      || exceeds(igstForMagnitude, BigInt(2850))) {
+      structureConsistent = false
+      reasons.push('local-money-magnitude-suspect')
+    }
+  }
   if (!amountsFinite) reasons.push('non-finite-amount');
   if (amounts.some((n) => Number.isFinite(n) && n < 0)) reasons.push('negative-amount');
   if (amountsFinite) {
@@ -793,7 +845,8 @@ export function evaluateLedger(
  * when BOTH sources produced an independently VALID, materially different value —
  * a repair of a value one source left missing/garbage is NOT a conflict.
  */
-const CRITICAL_CONFLICT_FIELDS = ['invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'total_amount'] as const
+const CRITICAL_CONFLICT_FIELDS = ['invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'] as const
+const MONEY_CONFLICT_FIELDS = new Set(['taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount'])
 
 const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v))
 
@@ -803,7 +856,8 @@ function fieldIndependentlyValid(field: string, raw: unknown): boolean {
     case 'vendor_name': return isValidVendorName(asText(raw))
     case 'supplier_gstin': return gstinFullyValid(asText(raw).trim().toUpperCase())
     case 'invoice_number': { const s = asText(raw).trim(); return s !== '' && !isPlaceholderText(s) }
-    case 'total_amount': return moneyToMinorUnits(raw as number | string | null | undefined) !== null
+    case 'taxable_value': case 'cgst_amount': case 'sgst_amount': case 'igst_amount': case 'total_amount':
+      return moneyToMinorUnits(raw as number | string | null | undefined) !== null
     default: return asText(raw).trim() !== ''
   }
 }
@@ -814,7 +868,7 @@ function normalizeForCompare(field: string, raw: unknown): string {
     case 'invoice_date': return parseInvoiceDate(asText(raw)) ?? ''
     case 'supplier_gstin': return asText(raw).trim().toUpperCase()
     case 'invoice_number': return asText(raw).trim().toLowerCase().replace(/\s+/g, '')
-    case 'total_amount': {
+    case 'taxable_value': case 'cgst_amount': case 'sgst_amount': case 'igst_amount': case 'total_amount': {
       const minor = moneyToMinorUnits(raw as number | string | null | undefined)
       return minor === null ? '' : minor.toString()
     }
@@ -844,11 +898,11 @@ export function detectCandidateConflicts(
   credibility?: { a: boolean; b: boolean },
 ): string[] {
   if (!a || !b) return []
-  if (credibility && (!credibility.a || !credibility.b)) return []
   const out: string[] = []
   for (const field of CRITICAL_CONFLICT_FIELDS) {
     const va = (a as Record<string, unknown>)[field]
     const vb = (b as Record<string, unknown>)[field]
+    if (credibility && (!credibility.a || !credibility.b) && !MONEY_CONFLICT_FIELDS.has(field)) continue
     if (
       fieldIndependentlyValid(field, va)
       && fieldIndependentlyValid(field, vb)
@@ -873,7 +927,7 @@ const HARD_VALIDATION_FAILURES = new Set([
   'igst-with-cgst-sgst', 'cgst-sgst-unequal', 'igst-on-intrastate', 'cgst-sgst-on-interstate',
   'supplier-equals-recipient', 'tax-rate-mismatch', 'tax-rate-amount-missing', 'tax-rate-invalid',
   'tax-rate-cgst-sgst-unequal', 'tax-rate-igst-with-cgst-sgst', 'amount-words-total-mismatch',
-  'candidate-conflict',
+  'candidate-conflict', 'vendor-ambiguous', 'money-field-conflict', 'local-money-magnitude-suspect',
   // NOTE: `tax-rate-advisory` is DELIBERATELY ABSENT. It is the SAME rate/amount
   // disagreement raised only when the invoice total already ties out, so it is a
   // soft reliability hint (a human may one-tap approve), never an integrity break.
@@ -943,12 +997,12 @@ export function selectBestCandidate(
     const aApproved = a.evaluation.review === 'approved' ? 1 : 0
     const bApproved = b.evaluation.review === 'approved' ? 1 : 0
     if (aApproved !== bApproved) return aApproved > bApproved
-    const aCount = presentFieldCount(a.evaluation.row)
-    const bCount = presentFieldCount(b.evaluation.row)
-    if (aCount !== bCount) return aCount > bCount
     const aHard = hardValidationFailureCount(a.evaluation.reasons)
     const bHard = hardValidationFailureCount(b.evaluation.reasons)
     if (aHard !== bHard) return aHard < bHard
+    const aCount = presentFieldCount(a.evaluation.row)
+    const bCount = presentFieldCount(b.evaluation.row)
+    if (aCount !== bCount) return aCount > bCount
     if (a.evaluation.measuredConfidence !== b.evaluation.measuredConfidence) {
       return a.evaluation.measuredConfidence > b.evaluation.measuredConfidence
     }
