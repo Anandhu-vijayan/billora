@@ -251,8 +251,8 @@ function expandYear(rawYear: string): number {
 function normalizeOcrDateToken(raw: string | null | undefined): { value: string; corrected: boolean } {
   const original = (raw ?? '').trim()
   const value = original
-    .replace(/\\bNot\\b/gi, 'Nov')
-    .replace(/\\b0ct(ober)?\\b/gi, (_match, suffix: string | undefined) => suffix ? 'October' : 'Oct')
+    .replace(/\bNot\b/gi, 'Nov')
+    .replace(/\b0ct(ober)?\b/gi, (_match, suffix: string | undefined) => suffix ? 'October' : 'Oct')
   return { value, corrected: value !== original }
 }
 
