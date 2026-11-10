@@ -10,7 +10,6 @@ import { logger } from '@/lib/logger'
 import {
   evaluateLedger,
   mergeCandidates,
-  retryHintFor,
   selectBestCandidate,
   detectCandidateConflicts,
   presentFieldCount,
@@ -884,7 +883,9 @@ export async function extractInvoice(
       // region is absent or unreadable, no repeat full-page question is sent.
       if (aiEvaluation.review === 'needs_review') {
         const totalMismatch = aiEvaluation.reasons.some((reason) => reason.startsWith('total-mismatch'))
-        const hint = totalMismatch ? retryHintFor(aiEvaluation.reasons, { buyerGstin }) : null
+        const hint = totalMismatch
+          ? 'The first pass did not establish the printed total. Read only the number printed next to Grand Total / Total / Net Payable; do not calculate or infer it.'
+          : null
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
         // The second read runs only if elapsed AI time plus one more ceiling fits
