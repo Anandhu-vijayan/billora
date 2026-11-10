@@ -290,6 +290,333 @@ function providerStatus(error: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) ? value : null
 }
 
+/** Strictly validate a printed currency token before normalising it to paise. */
+function isStrictMoneyToken(value: string): boolean {
+  const raw = value.trim()
+    .replace(/^(?:INR|RS\.?|₹)\s*/i, '')
+    .replace(/[\u00a0\u2002-\u200a\u202f\u205f\u3000]/g, ' ')
+    .replace(/\s/g, '')
+  const grouped = '(?:\\d+|\\d{1,3}(?:,\\d{3})+|\\d{1,2}(?:,\\d{2})*,\\d{3})'
+  return new RegExp(`^[+-]?${grouped}(?:\\.\\d{1,2})?// lib/ocr/vision.ts — Gemini Vision invoice extraction (server only).
+//
+// Selection lives behind EXTRACTION_PROVIDER: `gemini` is the only implemented
+// engine (`tesseract` is reserved and throws a permanent config error, so the
+// queue settles such a job instead of silently doing nothing). The model is
+// pinned to EXTRACTION_VISION_MODEL (default GEMINI_MODEL) and is asked for a
+// STRICT JSON object shaped like `LedgerCandidate` (ledger fields + a
+// per-field confidence), so downstream review routing in lib/ocr/ledger.ts has
+// the signal it needs.
+//
+// Error taxonomy is what the job queue depends on (rule 3 / rule 5):
+//   * VisionTransientError  -> 429/5xx/network/timeout — a retry may help, so
+//     the handler rethrows a normal error and fail_processing_job backoffs.
+//   * VisionPermanentError  -> unsupported type, empty/unparseable JSON, or a
+//     refused/blocked prompt — a retry can never help, so the handler raises a
+//     PermanentJobError and the job settles.
+// Nothing here touches the database or storage; it is a pure provider call and
+// its result is only ever a candidate the caller validates before trusting.
+import { GoogleGenAI, Type } from '@google/genai'
+import { logger } from '@/lib/logger'
+import type { LedgerCandidate } from '@/lib/ocr/ledger'
+import { buildGeminiInvoiceRequest } from '@/lib/ocr/gemini-request'
+import { minorUnitsToNumber, moneyToMinorUnits } from './validators/money'
+
+// Per-call Gemini ceiling. A throttled/free-tier key can take 25s+ for a single
+// read, so this is operator-configurable (VISION_TIMEOUT_MS) instead of pinned
+// to 15s — a pinned 15s aborted every real call as GEMINI_TIMEOUT before the
+// answer arrived. Default 40s clears the observed worst case while staying under
+// the worker's 60s function limit; the extractor bounds the SECOND pass
+// separately (VISION_MAX_TOTAL_MS) so two slow reads cannot exceed maxDuration.
+function callTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env.VISION_TIMEOUT_MS ?? '', 10)
+  return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 40_000
+}
+
+/** The active per-call Gemini ceiling, exported so callers can budget retries. */
+export function visionCallTimeoutMs(): number {
+  return callTimeoutMs()
+}
+
+export class VisionTransientError extends Error {
+  override name = 'VisionTransientError'
+}
+
+export class VisionPermanentError extends Error {
+  override name = 'VisionPermanentError'
+}
+
+// recipient_gstin is optional: a retail bill may print no buyer GSTIN, and forcing
+// the field invites the model to invent one. A supplier GSTIN equal to the
+// recipient's is NEVER silently repaired here — it means the model took the
+// buyer's GSTIN as the seller's, and ledger.ts must route it to review.
+const TEXT_FIELDS = [
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+] as const
+const OPTIONAL_EVIDENCE_FIELDS = [
+  'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words',
+] as const
+const AMOUNT_FIELDS = [
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+] as const
+// Optional structural components a plain `taxable + tax = total` cannot carry
+// (discount, freight, cess, deduction, round-off). NEVER required and NEVER
+// given a confidence key: a model that omits them, or returns a malformed value
+// for them, must still be accepted — they only assist the shared reconciliation
+// engine and can never, on their own, approve or fail an invoice.
+const OPTIONAL_AMOUNT_FIELDS = [
+  'cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off',
+] as const
+// The confidence object the model is ASKED for (see confidenceSchema below) has
+// exactly these nine keys. The four optional evidence fields carry no confidence
+// of their own. The validator below must accept what the schema asks for: the
+// previous validator demanded 13 keys while the schema requested 9, so EVERY
+// valid Gemini answer was rejected as VISION_CONFIDENCE_KEYS_INVALID (permanent).
+const CORE_CONFIDENCE_FIELDS = [
+  'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+] as const
+/** Confidence for an unknown amount may legitimately be null (schema: nullable). */
+const NULLABLE_CONFIDENCE_FIELDS = new Set<string>([
+  'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+])
+/** Keys that MUST be present in a response; the optional evidence fields may be absent. */
+const REQUIRED_RESPONSE_FIELDS = [...TEXT_FIELDS, ...AMOUNT_FIELDS, 'confidence'] as const
+
+/** Only these transport types are meaningful image/PDF inputs for vision. */
+const SUPPORTED_MIME = /^(image\/(jpeg|png|webp)|application\/pdf)$/i
+
+const VISION_PROMPT = [
+  'You are reading a single Indian GST tax invoice. Extract ONLY values that are',
+  'explicitly printed on the document. Never guess, infer or compute a number, a',
+  'date, or a GSTIN. If a text field is not present or not legible, return an',
+  'empty string. For amount fields return null when unknown and numeric 0 only',
+  'when zero is explicitly printed or the tax head is demonstrably absent. An',
+  'invoice charges EITHER IGST OR CGST+SGST, never both: when IGST is charged',
+  'return 0 for cgst_amount and sgst_amount; when CGST and SGST are charged',
+  'return 0 for igst_amount.',
+  'Give every extracted field a confidence (0.0-1.0; never default to high).',
+  'PARTIES: The SUPPLIER is the seller who issued this invoice.',
+  'Identify the supplier from the issuer company name in the top header,',
+  'colored header bar or company letterhead when present, and corroborate it',
+  'with the seller name and supplier GSTIN. The RECIPIENT is the buyer.',
+  'Copy only the company name itself: do not append invoice titles, dates,',
+  'addresses or adjacent lines. Never identify the supplier from the Bill To,',
+  'Buyer or Ship To box, even when it contains a company name. IMPORTANT',
+  'FOOTER RULE: Text such as "For Supplier",',
+  '"For Seller", "For Vendor", "For and on behalf of [Company]",',
+  '"Authorised Signatory", or signature declarations is a footer/signature',
+  'declaration, NOT the supplier name. Do not extract the word "For" or a',
+  'generic role such as "Supplier" as vendor_name. Do not use the signature/',
+  'footer text to replace a supplier name already printed in the header. If the',
+  'header identifies the supplier, return that exact company name. If the supplier',
+  'cannot be identified reliably, return an empty string rather than guessing.',
+  'supplier_gstin and vendor_name belong to the SUPPLIER only; put the buyer\'s',
+  'GSTIN in recipient_gstin. Never swap them. The supplier GSTIN is printed',
+  'under the company logo / letterhead at the top and again in the invoice',
+  'details box beside Invoice No and Date; the GSTIN inside the "Bill To" /',
+  '"Ship To" box is the BUYER\'s. A GSTIN may be printed with a space after',
+  'the 2-digit state code; return it without spaces. If the buyer has no GSTIN',
+  'printed return an empty string for recipient_gstin; NEVER repeat the',
+  'supplier\'s GSTIN there.',
+  'AMOUNTS: taxable_value is the total taxable value before tax; cgst_amount,',
+  'sgst_amount and igst_amount are the invoice-level tax amounts per head (not',
+  'rates, not percentages); total_amount is the final payable invoice total',
+  'including tax and round-off (labelled Total Invoice Value / Grand Total /',
+  'Net Payable). A row labelled just "Total Amount" or "Sales Amount" is often the',
+  'PRE-TAX subtotal, not the invoice total. Return EVERY money amount as a JSON',
+  'STRING copied from the printed amount, preserving the decimal point, all',
+  'decimal digits including trailing zeroes, and digits exactly. For example,',
+  'printed 4850.00 must be "4850.00", never "485000"; printed 832.50 must be',
+  '"832.50", never "832550". Do not convert amounts to paise, round them,',
+  'drop a decimal point, or join digits across a decimal point. Indian comma',
+  'grouping and a printed currency symbol are accepted. If the tax-rate percentages are explicitly printed,',
+  'return them as strings without the percent sign; otherwise return an empty',
+  'string. Copy the printed total amount-in-words exactly, or return an empty',
+  'string when it is absent. Never infer a rate or amount-in-words.',
+  'TOTAL CHECK: the printed total in words and the numeric grand total are the',
+  'same figure; read both and make sure total_amount matches the words line.',
+  'OPTIONAL COMPONENTS: when the invoice EXPLICITLY prints any of these amounts,',
+  'return them as decimal strings copied exactly; otherwise return null for each. discount_amount',
+  'is a line or invoice-level discount; shipping_amount is freight / packaging /',
+  'handling / other charges; cess_amount is a GST cess; deduction_amount is an',
+  'explicit deduction (e.g. advance or TDS on payment); round_off is the final',
+  'rounding (may be negative). Never compute or guess one that is not printed.',
+  'DATES: invoice_date is the INVOICE date, never the due, order, delivery or PO',
+  'date. Return it as printed (prefer DD/MM/YYYY or YYYY-MM-DD).',
+  'GSTIN is exactly 15 characters: 2 digits, 5 letters, 4 digits, 1 letter, 1',
+  'alphanumeric, "Z", 1 alphanumeric. Read it character by character.',
+  'If the page shows several invoices, read only the first/most prominent one.',
+  // §multi-rate: the register's per-rate columns and the Tally per-slab ledger
+  // lines can only be filled from an EVIDENCED rate-wise breakdown. The flat
+  // cgst/sgst/igst rate fields above are the invoice-level heads, so a bill that
+  // mixes slabs (say 18% on one line and 28% on another) cannot express itself
+  // through them — without tax_slices such a bill degrades to one unexplained
+  // slab. Ask for it explicitly, with the same never-guess rule as everything
+  // else on this page.
+  'RATE-WISE BREAKDOWN: if the document PRINTS a rate-wise / slab-wise tax summary',
+  '(a table or block grouping the taxable value and the tax amounts by GST rate,',
+  'e.g. "18% 7,500.00 675.00 675.00"), return tax_slices with ONE entry per',
+  'printed rate line: rate_percent and the amounts as decimal strings copied',
+  'exactly from the document, treatment',
+  '"local" when that row prints CGST and SGST and "interstate" when it prints',
+  'IGST. Copy those rows exactly — never split a single-rate invoice, never',
+  'derive a slab from an item line, never compute an amount the document does',
+  'not print. Return an EMPTY array when there is no printed rate-wise summary.',
+].join(' ')
+
+const confidenceSchema = {
+  type: Type.OBJECT,
+  properties: {
+    invoice_date: { type: Type.NUMBER },
+    invoice_number: { type: Type.NUMBER },
+    vendor_name: { type: Type.NUMBER },
+    supplier_gstin: { type: Type.NUMBER },
+    taxable_value: { type: Type.NUMBER, nullable: true },
+    cgst_amount: { type: Type.NUMBER, nullable: true },
+    sgst_amount: { type: Type.NUMBER, nullable: true },
+    igst_amount: { type: Type.NUMBER, nullable: true },
+    total_amount: { type: Type.NUMBER, nullable: true },
+  },
+  required: [
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+    'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+  ],
+  propertyOrdering: [
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+    'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+  ],
+}
+
+// One line of a printed rate-wise tax summary. Every field is nullable and the
+// array itself is OPTIONAL (never in `required`): a single-rate invoice, an older
+// model or a bill with no slab table must still produce a valid response. The
+// numbers are copied evidence — parseVisionJson tolerates a malformed entry and
+// ledger.ts validates the whole array against the invoice heads before using it,
+// so a wrong answer here can only ever force review, never fabricate a slab.
+const taxSliceSchema = {
+  type: Type.OBJECT,
+  properties: {
+    rate_percent: { type: Type.NUMBER, nullable: true },
+    taxable_value: { type: Type.STRING, nullable: true },
+    cgst_amount: { type: Type.STRING, nullable: true },
+    sgst_amount: { type: Type.STRING, nullable: true },
+    igst_amount: { type: Type.STRING, nullable: true },
+    cess_amount: { type: Type.STRING, nullable: true },
+    treatment: { type: Type.STRING, nullable: true },
+  },
+  propertyOrdering: [
+    'rate_percent', 'taxable_value', 'cgst_amount', 'sgst_amount',
+    'igst_amount', 'cess_amount', 'treatment',
+  ],
+}
+
+const LEDGER_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    invoice_date: { type: Type.STRING },
+    invoice_number: { type: Type.STRING },
+    vendor_name: { type: Type.STRING },
+    supplier_gstin: { type: Type.STRING },
+    recipient_gstin: { type: Type.STRING, nullable: true },
+    taxable_value: { type: Type.STRING, nullable: true },
+    cgst_amount: { type: Type.STRING, nullable: true },
+    sgst_amount: { type: Type.STRING, nullable: true },
+    igst_amount: { type: Type.STRING, nullable: true },
+    total_amount: { type: Type.STRING, nullable: true },
+    cess_amount: { type: Type.STRING, nullable: true },
+    shipping_amount: { type: Type.STRING, nullable: true },
+    discount_amount: { type: Type.STRING, nullable: true },
+    deduction_amount: { type: Type.STRING, nullable: true },
+    round_off: { type: Type.STRING, nullable: true },
+    cgst_rate_percent: { type: Type.STRING, nullable: true },
+    sgst_rate_percent: { type: Type.STRING, nullable: true },
+    igst_rate_percent: { type: Type.STRING, nullable: true },
+    total_amount_in_words: { type: Type.STRING, nullable: true },
+    confidence: confidenceSchema,
+    tax_slices: { type: Type.ARRAY, nullable: true, items: taxSliceSchema },
+  },
+  required: [
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin',
+    'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+    'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
+  ],
+  propertyOrdering: [
+    'invoice_date', 'invoice_number', 'vendor_name', 'supplier_gstin', 'recipient_gstin',
+    'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+    'cess_amount', 'shipping_amount', 'discount_amount', 'deduction_amount', 'round_off',
+    'cgst_rate_percent', 'sgst_rate_percent', 'igst_rate_percent', 'total_amount_in_words', 'confidence',
+    'tax_slices',
+  ],
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new VisionTransientError('GEMINI_TIMEOUT')), ms)
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
+}
+
+/** Classify a raw thrown provider error into transient vs permanent. */
+function classifyProviderError(error: unknown): Error {
+  const status = providerStatus(error)
+  const reason = providerFailureReason(error)
+  if (status === 429 || (status !== null && status >= 500)
+    || reason === 'timeout' || reason === 'network') {
+    return new VisionTransientError(reason)
+  }
+  return new VisionPermanentError(reason)
+}
+
+function providerFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const status = providerStatus(error)
+  if (status === 429) return 'rate_limited'
+  if (status !== null && status >= 500) return 'provider_unavailable'
+  if (/timeout|deadline/i.test(message)) return 'timeout'
+  if (/\b429\b|rate.?limit/i.test(message)) return 'rate_limited'
+  if (/\b5\d\d\b|unavailable|overloaded|temporar/i.test(message)) return 'provider_unavailable'
+  if (/network|socket|fetch/i.test(message)) return 'network'
+  return 'provider_error'
+}
+
+function providerStatus(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+  const value = (error as { status?: unknown; statusCode?: unknown }).status
+    ?? (error as { statusCode?: unknown }).statusCode
+  return typeof value === 'number' && Number.isInteger(value) ? value : null
+}
+
+).test(raw)
+}
+
+/** Parse the narrow second-pass response: exactly one printed field, no calculations. */
+function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCandidate {
+  const trimmed = (text ?? '').trim()
+  const start = trimmed.indexOf('{')
+  const end = trimmed.lastIndexOf('}')
+  if (start < 0 || end <= start) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  let value: unknown
+  try { value = (JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>)[field] }
+  catch { throw new VisionPermanentError('UNPARSEABLE_VISION_JSON') }
+  if (value === null) return { [field]: null, confidence: { [field]: 0 } }
+  if (typeof value !== 'string' || !isStrictMoneyToken(value)) {
+    throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+  }
+  const minor = moneyToMinorUnits(value)
+  if (minor === null) throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+  return { [field]: minorUnitsToNumber(minor), confidence: { [field]: 0.5 } }
+}
+
+const TARGETED_TOTAL_SCHEMA = {
+  type: Type.OBJECT,
+  properties: { total_amount: { type: Type.STRING, nullable: true } },
+  required: ['total_amount'],
+  propertyOrdering: ['total_amount'],
+}
+
 /** Parse the model's JSON text into a candidate; malformed output is permanent. */
 export function parseVisionJson(text: string): LedgerCandidate {
   const trimmed = (text ?? '').trim()
@@ -335,6 +662,9 @@ export function parseVisionJson(text: string): LedgerCandidate {
     if (typeof value !== 'string' && typeof value !== 'number') {
       throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     }
+    if (typeof value === 'string' && !isStrictMoneyToken(value)) {
+      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
+    }
     const minorUnits = moneyToMinorUnits(value)
     if (minorUnits === null) throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
     candidate[field] = minorUnitsToNumber(minorUnits)
@@ -346,7 +676,7 @@ export function parseVisionJson(text: string): LedgerCandidate {
     if (value === undefined) { candidate[field] = null; continue }
     if (value === null) continue
     const minorUnits = typeof value === 'string' || typeof value === 'number'
-      ? moneyToMinorUnits(value)
+      ? (typeof value === 'string' && !isStrictMoneyToken(value) ? null : moneyToMinorUnits(value))
       : null
     candidate[field] = minorUnits === null ? null : minorUnitsToNumber(minorUnits)
   }
@@ -363,6 +693,7 @@ export function parseVisionJson(text: string): LedgerCandidate {
       .map((s) => {
         const money = (v: unknown): number | null => {
           if (typeof v !== 'string' && typeof v !== 'number') return null
+          if (typeof v === 'string' && !isStrictMoneyToken(v)) return null
           const minorUnits = moneyToMinorUnits(v)
           return minorUnits === null || minorUnits < BigInt(0) ? null : minorUnitsToNumber(minorUnits)
         }
@@ -424,8 +755,9 @@ export async function extractInvoiceFields(args: {
    * to re-read — it is still forbidden to guess.
    */
   hint?: string | null
+  targetField?: 'total_amount'
 }): Promise<LedgerCandidate> {
-  const { buffer, mimeType, apiKey, model, hint } = args
+  const { buffer, mimeType, apiKey, model, hint, targetField } = args
   if (!SUPPORTED_MIME.test(mimeType)) {
     throw new VisionPermanentError(`UNSUPPORTED_MEDIA_TYPE: ${mimeType}`)
   }
@@ -433,12 +765,19 @@ export async function extractInvoiceFields(args: {
   if (!buffer || buffer.length === 0) throw new VisionPermanentError('EMPTY_MEDIA')
 
   const ai = new GoogleGenAI({ apiKey })
+  const targetedPrompt = [
+    'Read ONLY the printed Grand Total / Net Payable amount visible in this cropped invoice region.',
+    'Copy the digits exactly as printed, including decimal point and trailing zeroes.',
+    'Return total_amount as a STRING such as "31250.00" or null if unreadable.',
+    'Do NOT calculate, infer, convert to paise, or use any amount from another field.',
+    hint ?? '',
+  ].filter(Boolean).join(' ')
   const request = buildGeminiInvoiceRequest({
     model,
     mimeType,
     imageBase64: buffer.toString('base64'),
-    prompt: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT,
-    responseSchema: LEDGER_SCHEMA,
+    prompt: targetField ? targetedPrompt : (hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT),
+    responseSchema: targetField ? TARGETED_TOTAL_SCHEMA : LEDGER_SCHEMA,
   })
 
   const imagePart = request.contents[0].parts.find((part) => 'inlineData' in part)
@@ -464,7 +803,7 @@ export async function extractInvoiceFields(args: {
       callTimeoutMs(),
     )
     const text = (response as { text?: string }).text ?? ''
-    const candidate = parseVisionJson(text)
+    const candidate = targetField ? parseTargetedVisionJson(text, targetField) : parseVisionJson(text)
     return candidate
   } catch (error) {
     const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError
