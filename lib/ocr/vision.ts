@@ -298,7 +298,9 @@ function isStrictMoneyToken(value: string): boolean {
   return !!match && match[0] === raw
 }
 
-function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCandidate {
+type TargetedMoneyField = 'total_amount' | 'cgst_amount' | 'sgst_amount' | 'igst_amount'
+
+function parseTargetedVisionJson(text: string, field: TargetedMoneyField): LedgerCandidate {
   const trimmed = (text ?? '').trim()
   const start = trimmed.indexOf('{')
   const end = trimmed.lastIndexOf('}')
@@ -313,11 +315,13 @@ function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCan
   return { [field]: minorUnitsToNumber(minor), confidence: { [field]: 0.5 } }
 }
 
-const TARGETED_TOTAL_SCHEMA = {
-  type: Type.OBJECT,
-  properties: { total_amount: { type: Type.STRING, nullable: true } },
-  required: ['total_amount'],
-  propertyOrdering: ['total_amount'],
+function targetedMoneySchema(field: TargetedMoneyField) {
+  return {
+    type: Type.OBJECT,
+    properties: { [field]: { type: Type.STRING, nullable: true } },
+    required: [field],
+    propertyOrdering: [field],
+  }
 }
 export function parseVisionJson(text: string): LedgerCandidate {
   const trimmed = (text ?? '').trim()
@@ -456,7 +460,7 @@ export async function extractInvoiceFields(args: {
    * to re-read — it is still forbidden to guess.
    */
   hint?: string | null
-  targetField?: 'total_amount'
+  targetField?: TargetedMoneyField
 }): Promise<LedgerCandidate> {
   const { buffer, mimeType, apiKey, model, hint, targetField } = args
   if (!SUPPORTED_MIME.test(mimeType)) {
@@ -466,13 +470,13 @@ export async function extractInvoiceFields(args: {
   if (!buffer || buffer.length === 0) throw new VisionPermanentError('EMPTY_MEDIA')
 
   const ai = new GoogleGenAI({ apiKey })
-  const targetedPrompt = [
-    'Read ONLY the printed Grand Total / Net Payable amount visible in this cropped invoice region.',
-    'Copy the digits exactly as printed, including decimal point and trailing zeroes.',
-    'Return total_amount as a STRING such as "31250.00" or null if unreadable.',
-    'Do NOT calculate, infer, convert to paise, or use any amount from another field.',
+  const targetedPrompt = targetField ? [
+    `Read ONLY the printed ${({ total_amount: 'Grand Total / Net Payable', cgst_amount: 'CGST amount', sgst_amount: 'SGST amount', igst_amount: 'IGST amount' } as const)[targetField]} on this invoice.`,
+    'Copy the digits exactly as printed, including the decimal point and trailing zeroes.',
+    `Return ${targetField} as a STRING such as "832.50" or null if unreadable.`,
+    'Do NOT calculate, infer, convert to paise, remove decimal points, or use an amount from another field.',
     hint ?? '',
-  ].filter(Boolean).join(' ')
+  ].filter(Boolean).join(' ') : ''
   const request = buildGeminiInvoiceRequest({
     model,
     mimeType,
@@ -496,7 +500,7 @@ export async function extractInvoiceFields(args: {
     promptBytes: Buffer.byteLength(promptPart.text, 'utf8'),
     contentPartCount: request.contents[0].parts.length,
     responseMimeType: request.config.responseMimeType,
-    schemaFieldNames: Object.keys(targetField ? TARGETED_TOTAL_SCHEMA.properties : LEDGER_SCHEMA.properties),
+    schemaFieldNames: Object.keys(targetField ? targetedMoneySchema(targetField).properties : LEDGER_SCHEMA.properties),
   })
   try {
     const response = await withTimeout(
