@@ -2320,12 +2320,13 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   // responseMimeType + responseSchema only, never temperature/top_p/top_k.
   assert.ok(request.includes("responseMimeType: 'application/json'"))
   assert.ok(!/temperature|top_p|top_k/.test(request.replace(/\/\/.*$/gm, '')), 'no legacy sampling parameters (comments excluded)')
-  // Bounded second pass: only a located Grand Total region is reread, with one field requested.
+  // Bounded second pass: prefer the located Grand Total crop, otherwise reread the original document with one field requested.
   const eng = extractorSrc()
   assert.ok(eng.includes('cropGrandTotalRegion'), 'OCR line boxes locate the total region')
   assert.ok(eng.includes("targetField: 'total_amount'"), 'the second pass is field-targeted')
   assert.ok(eng.includes('AI second pass started') && eng.includes('AI second pass completed'), 'second pass is logged')
-  assert.ok(eng.includes('buffer: grandTotalCrop as Buffer'), 'second pass uses the cropped region, not the full page')
+  assert.ok(eng.includes('const targetedBuffer = grandTotalCrop ?? buffer'), 'second pass falls back to the original document when OCR cannot locate the crop')
+  assert.ok(eng.includes("input: grandTotalCrop ? 'grand-total-crop' : 'original-document-fallback'"), 'the targeted input source is observable')
 })
 
 test('P9 ledger: tax heads stay unknown unless explicit; explicit zeros approve an IGST-only invoice', () => {
