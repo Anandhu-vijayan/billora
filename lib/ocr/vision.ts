@@ -290,7 +290,7 @@ function providerStatus(error: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) ? value : null
 }
 
-/** Strictly validate a printed currency token before normalising it to paise. */
+/** Parse the model's JSON text into a candidate; malformed output is permanent. */
 function isStrictMoneyToken(value: string): boolean {
   const raw = value.trim().replace(/^(?:INR|RS[.]?|₹)[ ]*/i, '').replace(/[ ]/g, '')
   const grouped = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})'
@@ -298,7 +298,6 @@ function isStrictMoneyToken(value: string): boolean {
   return !!match && match[0] === raw
 }
 
-/** Parse the narrow second-pass response: exactly one printed field, no calculations. */
 function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCandidate {
   const trimmed = (text ?? '').trim()
   const start = trimmed.indexOf('{')
@@ -320,7 +319,6 @@ const TARGETED_TOTAL_SCHEMA = {
   required: ['total_amount'],
   propertyOrdering: ['total_amount'],
 }
-
 export function parseVisionJson(text: string): LedgerCandidate {
   const trimmed = (text ?? '').trim()
   if (!trimmed) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
@@ -499,223 +497,6 @@ export async function extractInvoiceFields(args: {
     contentPartCount: request.contents[0].parts.length,
     responseMimeType: request.config.responseMimeType,
     schemaFieldNames: Object.keys(targetField ? TARGETED_TOTAL_SCHEMA.properties : LEDGER_SCHEMA.properties),
-  })
-  try {
-    const response = await withTimeout(
-      ai.models.generateContent(request),
-      callTimeoutMs(),
-    )
-    const text = (response as { text?: string }).text ?? ''
-    const candidate = targetField ? parseTargetedVisionJson(text, targetField) : parseVisionJson(text)
-    return candidate
-  } catch (error) {
-    const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError
-      ? error
-      : classifyProviderError(error)
-    logger.warn('[Vision] Gemini request failed', {
-      model,
-      durationMs: Date.now() - startedAt,
-      failureClass: classified instanceof VisionTransientError ? 'transient' : 'permanent',
-      failureReason: providerFailureReason(error),
-      httpStatus: providerStatus(error),
-    })
-    throw classified
-  }
-}
-).test(raw)
-}
-
-/** Parse the narrow second-pass response: exactly one printed field, no calculations. */
-function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCandidate {
-  const trimmed = (text ?? '').trim()
-  const start = trimmed.indexOf('{')
-  const end = trimmed.lastIndexOf('}')
-  if (start < 0 || end <= start) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  let value: unknown
-  try { value = (JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>)[field] }
-  catch { throw new VisionPermanentError('UNPARSEABLE_VISION_JSON') }
-  if (value === null) return { [field]: null, confidence: { [field]: 0 } }
-  if (typeof value !== 'string' || !isStrictMoneyToken(value)) {
-    throw new VisionPermanentError('VISION_FIELD_TYPE_INVALID:' + field)
-  }
-  const minor = moneyToMinorUnits(value)
-  if (minor === null) throw new VisionPermanentError('VISION_FIELD_TYPE_INVALID:' + field)
-  return { [field]: minorUnitsToNumber(minor), confidence: { [field]: 0.5 } }
-}
-
-const TARGETED_TOTAL_SCHEMA = {
-  type: Type.OBJECT,
-  properties: { total_amount: { type: Type.STRING, nullable: true } },
-  required: ['total_amount'],
-  propertyOrdering: ['total_amount'],
-}
-/** Parse the model's JSON text into a candidate; malformed output is permanent. */
-export function parseVisionJson(text: string): LedgerCandidate {
-  const trimmed = (text ?? '').trim()
-  if (!trimmed) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
-  // Tolerate a fenced block even with responseMimeType set; take the outer object.
-  const braceStart = trimmed.indexOf('{')
-  const braceEnd = trimmed.lastIndexOf('}')
-  if (braceStart < 0 || braceEnd <= braceStart) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  let json: unknown
-  try {
-    json = JSON.parse(trimmed.slice(braceStart, braceEnd + 1))
-  } catch {
-    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  }
-  if (!json || typeof json !== 'object' || Array.isArray(json)) {
-    throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
-  }
-  const candidate = json as Record<string, unknown>
-  // Required keys must be present. Optional evidence fields may be absent (read
-  // as null) and unknown extra keys are ignored: failing a whole invoice (a
-  // PERMANENT job failure) over metadata drift is far costlier than ignoring it.
-  for (const key of REQUIRED_RESPONSE_FIELDS) {
-    if (!(key in candidate)) throw new VisionPermanentError('VISION_SCHEMA_KEYS_INVALID')
-  }
-  for (const field of TEXT_FIELDS) {
-    if (typeof candidate[field] !== 'string') {
-      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    }
-  }
-  // Buyer GSTIN: optional; normalised only (no spaces, upper-case). Kept even
-  // when identical to the supplier's so `supplier-equals-recipient` still fires.
-  candidate.recipient_gstin = typeof candidate.recipient_gstin === 'string'
-    ? candidate.recipient_gstin.replace(/\s+/g, '').toUpperCase() : ''
-  for (const field of OPTIONAL_EVIDENCE_FIELDS) {
-    if (candidate[field] === undefined) candidate[field] = null
-    if (candidate[field] !== null && typeof candidate[field] !== 'string') {
-      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    }
-  }
-  for (const field of AMOUNT_FIELDS) {
-    const value = candidate[field]
-    if (value === null) continue
-    if (typeof value !== 'string' && typeof value !== 'number') {
-      throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    }
-    const minorUnits = moneyToMinorUnits(value)
-    if (minorUnits === null) throw new VisionPermanentError(`VISION_FIELD_TYPE_INVALID:${field}`)
-    candidate[field] = minorUnitsToNumber(minorUnits)
-  }
-  // Optional structural components: absent or malformed is tolerated as null,
-  // never a permanent failure — they only assist reconciliation.
-  for (const field of OPTIONAL_AMOUNT_FIELDS) {
-    const value = candidate[field]
-    if (value === undefined) { candidate[field] = null; continue }
-    if (value === null) continue
-    const minorUnits = typeof value === 'string' || typeof value === 'number'
-      ? moneyToMinorUnits(value)
-      : null
-    candidate[field] = minorUnits === null ? null : minorUnitsToNumber(minorUnits)
-  }
-  // §multi-rate: a rate-wise breakdown is OPTIONAL AI evidence. Preserve it when
-  // the model returns a well-formed array of slice objects, but NEVER fail the
-  // whole invoice over a malformed one (that would be a permanent job failure over
-  // metadata drift). Absent/invalid simply means "no breakdown from AI", which the
-  // deterministic parser + invoice-heads derivation still cover. It is never given
-  // a confidence key and never overrides stronger validated local evidence — the
-  // merge in ledger.ts keeps the local slices and only fills rates local omitted.
-  if (Array.isArray(candidate.tax_slices)) {
-    const slices = (candidate.tax_slices as unknown[])
-      .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object' && !Array.isArray(s))
-      .map((s) => {
-        const money = (v: unknown): number | null => {
-          if (typeof v !== 'string' && typeof v !== 'number') return null
-          const minorUnits = moneyToMinorUnits(v)
-          return minorUnits === null || minorUnits < BigInt(0) ? null : minorUnitsToNumber(minorUnits)
-        }
-        const rate = typeof s.rate_percent === 'number' && Number.isFinite(s.rate_percent)
-          && s.rate_percent >= 0 && s.rate_percent <= 100 ? s.rate_percent : null
-        const treat = s.treatment === 'interstate' ? 'interstate'
-          : s.treatment === 'local' ? 'local' : 'unknown'
-        return {
-          rate_percent: rate,
-          taxable_value: money(s.taxable_value),
-          cgst_amount: money(s.cgst_amount),
-          sgst_amount: money(s.sgst_amount),
-          igst_amount: money(s.igst_amount),
-          cess_amount: money(s.cess_amount),
-          treatment: treat,
-          provenance: 'item-level',
-          confidence: null,
-          validation_status: 'unvalidated',
-        }
-      })
-    candidate.tax_slices = slices.length > 0 ? slices : null
-  } else {
-    delete candidate.tax_slices
-  }
-  if (!candidate.confidence || typeof candidate.confidence !== 'object' || Array.isArray(candidate.confidence)) {
-    throw new VisionPermanentError('VISION_CONFIDENCE_INVALID')
-  }
-  const rawConfidence = candidate.confidence as Record<string, unknown>
-  const confidence: Record<string, number> = {}
-  for (const field of CORE_CONFIDENCE_FIELDS) {
-    if (!(field in rawConfidence)) throw new VisionPermanentError('VISION_CONFIDENCE_KEYS_INVALID')
-    const value = rawConfidence[field]
-    // A null confidence for an unknown amount means "no belief": score it 0 so
-    // the ledger can only ever downgrade, never approve, on it.
-    if (value === null && NULLABLE_CONFIDENCE_FIELDS.has(field)) { confidence[field] = 0; continue }
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
-      throw new VisionPermanentError(`VISION_CONFIDENCE_INVALID:${field}`)
-    }
-    confidence[field] = value
-  }
-  // Normalised: exactly the keys downstream consumes, all finite numbers in [0, 1].
-  candidate.confidence = confidence
-  return candidate as unknown as LedgerCandidate
-}
-
-/**
- * Send one invoice document to Gemini and return the raw extracted candidate.
- * Transient failures are retried by the durable job queue, not here, so a worker
- * request never spends its whole execution budget on duplicate provider calls.
- */
-export async function extractInvoiceFields(args: {
-  buffer: Buffer
-  mimeType: string
-  apiKey: string
-  model: string
-  /**
-   * Second-pass only: the failed validation checks from the first read (see
-   * retryHintFor in ledger.ts). The model is told what did not add up and asked
-   * to re-read — it is still forbidden to guess.
-   */
-  hint?: string | null
-}): Promise<LedgerCandidate> {
-  const { buffer, mimeType, apiKey, model, hint } = args
-  if (!SUPPORTED_MIME.test(mimeType)) {
-    throw new VisionPermanentError(`UNSUPPORTED_MEDIA_TYPE: ${mimeType}`)
-  }
-  if (!apiKey) throw new VisionPermanentError('VISION_UNCONFIGURED: GEMINI_API_KEY missing')
-  if (!buffer || buffer.length === 0) throw new VisionPermanentError('EMPTY_MEDIA')
-
-  const ai = new GoogleGenAI({ apiKey })
-  const request = buildGeminiInvoiceRequest({
-    model,
-    mimeType,
-    imageBase64: buffer.toString('base64'),
-    prompt: hint ? `${VISION_PROMPT} ${hint}` : VISION_PROMPT,
-    responseSchema: LEDGER_SCHEMA,
-  })
-
-  const imagePart = request.contents[0].parts.find((part) => 'inlineData' in part)
-  const promptPart = request.contents[0].parts.find((part) => 'text' in part)
-  if (!imagePart || !('inlineData' in imagePart) || !promptPart || !('text' in promptPart)) {
-    throw new VisionPermanentError('INVALID_GEMINI_REQUEST_SHAPE')
-  }
-
-  const startedAt = Date.now()
-  logger.info('[Vision] Gemini request prepared', {
-    model,
-    mimeType,
-    imageBytes: buffer.length,
-    encodedImageBytes: imagePart.inlineData.data.length,
-    promptBytes: Buffer.byteLength(promptPart.text, 'utf8'),
-    contentPartCount: request.contents[0].parts.length,
-    responseMimeType: request.config.responseMimeType,
-    schemaFieldNames: Object.keys(LEDGER_SCHEMA.properties),
   })
   try {
     const response = await withTimeout(
