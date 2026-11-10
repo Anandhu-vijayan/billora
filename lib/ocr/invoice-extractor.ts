@@ -908,22 +908,23 @@ export async function extractInvoice(
           return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 50_000
         })()
         const budgetLeftForRetry = aiTotalBudgetMs - (Date.now() - aiStartedAt)
-        if (hint && !grandTotalCrop) {
-          logger.info('[Extract] AI second pass skipped: Grand Total region not confidently located', { model })
-        } else if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
+        if (hint && budgetLeftForRetry < visionCallTimeoutMs()) {
           logger.info('[Extract] AI second pass skipped: insufficient time budget', {
             model, elapsedMs: Date.now() - aiStartedAt,
             budgetLeftMs: budgetLeftForRetry, neededMs: visionCallTimeoutMs(),
           })
         } else if (hint) {
           secondPass = true
+          const targetedBuffer = grandTotalCrop ?? buffer
+          const targetedMimeType = grandTotalCrop ? 'image/png' : mimeType
           logger.info('[Extract] AI second pass started', {
             model,
             durationMs: Date.now() - aiStartedAt,
+            input: grandTotalCrop ? 'grand-total-crop' : 'original-document-fallback',
             reasonCodes: aiEvaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
           })
           const retryCandidate = await extractInvoiceFields({
-            buffer: grandTotalCrop as Buffer, mimeType: 'image/png', apiKey, model, hint,
+            buffer: targetedBuffer, mimeType: targetedMimeType, apiKey, model, hint,
             targetField: 'total_amount',
           })
           const retryAssisted = candidate
