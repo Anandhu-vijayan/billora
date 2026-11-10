@@ -164,6 +164,7 @@ export function describeReason(code: string): string {
   const base = code.split(':')[0]
   if (base === 'low-confidence') return 'the reading was low-confidence'
   if (base === 'total-mismatch') return 'the amounts do not add up to the total'
+  if (base === 'amount-words-equation-not-evidence') return 'an arithmetic equation was returned instead of printed amount-in-words; it is not used as evidence'
   if (base === 'vendor-ambiguous') return 'the supplier name may have been read from the Bill To / buyer section; confirm the seller name'
   if (base === 'local-money-magnitude-suspect') return 'a tax amount is unusually large compared with taxable value; verify the printed digits and decimal point'
   if (base === 'money-field-conflict') {
@@ -192,7 +193,7 @@ const REASON_FIELD: Record<string, number | 'amounts'> = {
   'igst-with-cgst-sgst': 'amounts', 'cgst-sgst-unequal': 'amounts', 'igst-on-intrastate': 'amounts',
   'cgst-sgst-on-interstate': 'amounts', 'tax-rate-mismatch': 'amounts', 'tax-rate-advisory': 'amounts', 'tax-rate-amount-missing': 'amounts',
   'tax-rate-invalid': 'amounts', 'tax-rate-cgst-sgst-unequal': 'amounts', 'tax-rate-igst-with-cgst-sgst': 'amounts',
-  'amount-words-total-mismatch': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts', 'money-field-conflict': 'amounts',
+  'amount-words-total-mismatch': 'amounts', 'amount-words-equation-not-evidence': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts', 'money-field-conflict': 'amounts',
 }
 
 /**
