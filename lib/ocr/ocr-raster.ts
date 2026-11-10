@@ -19,7 +19,7 @@ export function getOcrRasterSize(
     maxLongEdge / Math.max(width, height),
     Math.sqrt(maxPixels / (width * height)),
   )
-  if (scale <= 1) return { width: Math.round(width), height: Math.round(height) }
+  if (scale === 1) return { width: Math.round(width), height: Math.round(height) }
   return {
     width: Math.max(1, Math.round(width * scale)),
     height: Math.max(1, Math.round(height * scale)),
