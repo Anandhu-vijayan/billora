@@ -22,6 +22,7 @@ jobs:
           # secret-scan inspects the staged diff; full history not needed.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: npm run check
+      - run: npm test
       - run: npm run build
         env:
           # Dummy public values so `next build` can statically analyze routes
