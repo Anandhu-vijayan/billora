@@ -68,11 +68,14 @@ export function findAllGstins(text: string): GstinHit[] {
   // Printed GSTINs often carry a space after the 2-digit state code
   // ("GSTIN: 32 ADRPJ8730C1ZN"); without tolerating it the letterhead GSTIN is
   // invisible and the buyer's GSTIN becomes the only ("clean") survivor.
-  const re = /\b([0-9]{2})[ \t]?([A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b/g
+  // OCR engines may split the printed token into visual groups
+  // ("32 AAEFG 1234 C1Z9"). Permit only short horizontal gaps; never join
+  // across lines or apply O/0, I/1 substitutions without checksum evidence.
+  const re = /\b([0-9]{2})[ \t]{0,3}([A-Z]{5})[ \t]{0,3}([0-9]{4})[ \t]{0,3}([A-Z][1-9A-Z]Z[0-9A-Z])\b/g
   const seen = new Set<string>()
   const hits: GstinHit[] = []
   for (let m = re.exec(upper); m; m = re.exec(upper)) {
-    const value = `${m[1]}${m[2]}`
+    const value = `${m[1]}${m[2]}${m[3]}${m[4]}`
     if (seen.has(value)) continue
     seen.add(value)
     hits.push({ value, index: m.index, valid: gstinFullyValid(value) })
