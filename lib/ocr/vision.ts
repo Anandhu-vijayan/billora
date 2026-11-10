@@ -482,7 +482,7 @@ export async function extractInvoiceFields(args: {
     mimeType,
     imageBase64: buffer.toString('base64'),
     prompt: targetField ? targetedPrompt : (hint ? VISION_PROMPT + ' ' + hint : VISION_PROMPT),
-    responseSchema: targetField ? TARGETED_TOTAL_SCHEMA : LEDGER_SCHEMA,
+    responseSchema: targetField ? targetedMoneySchema(targetField) : LEDGER_SCHEMA,
   })
 
   const imagePart = request.contents[0].parts.find((part) => 'inlineData' in part)
