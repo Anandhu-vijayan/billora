@@ -406,6 +406,12 @@ export function mergeCandidates(
     merged.vendor_ambiguous = true
   } else {
     copyText('vendor_name', isValidVendorName)
+    if (typeof merged.vendor_name === 'string') {
+      merged.vendor_name = merged.vendor_name
+        .replace(/\bPVTLTD\.?(?=\s|$)/gi, 'PVT LTD')
+        .replace(/\bPVT\.?\s*LTD\.?\b/gi, 'PVT LTD')
+        .replace(/\s+/g, ' ').trim()
+    }
   }
 
   if (isDateValid(primary.invoice_date)) {
