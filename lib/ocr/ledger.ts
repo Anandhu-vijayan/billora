@@ -243,9 +243,22 @@ function expandYear(rawYear: string): number {
   return y <= 69 ? 2000 + y : 1900 + y
 }
 
+/**
+ * Correct only two high-confidence OCR month-token confusions. The corrected
+ * value is still routed to human review below: a text normalizer must never
+ * silently turn an uncertain printed date into an approved accounting date.
+ */
+function normalizeOcrDateToken(raw: string | null | undefined): { value: string; corrected: boolean } {
+  const original = (raw ?? '').trim()
+  const value = original
+    .replace(/\\bNot\\b/gi, 'Nov')
+    .replace(/\\b0ct(ober)?\\b/gi, (_match, suffix: string | undefined) => suffix ? 'October' : 'Oct')
+  return { value, corrected: value !== original }
+}
+
 /** Parse the common Indian + ISO invoice date spellings to `YYYY-MM-DD`. */
 function parseInvoiceDate(raw: string | null | undefined): string | null {
-  const s = (raw ?? '').trim();
+  const s = normalizeOcrDateToken(raw).value;
   if (!s) return null;
   // ISO first (already canonical).
   const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
@@ -565,7 +578,9 @@ export function evaluateLedger(
   );
   if (candidate.amount_words_equation_not_evidence) reasons.push('amount-words-equation-not-evidence');
 
+  const normalizedDate = normalizeOcrDateToken(candidate.invoice_date);
   const parsedDate = parseInvoiceDate(candidate.invoice_date);
+  if (normalizedDate.corrected) reasons.push('invoice-date-ocr-normalized');
   if (!parsedDate) reasons.push('invoice-date-unresolved');
   // A date that parses but cannot be a real invoice date (in the future, or
   // before GST existed) is almost always a misread digit. It is flagged and is
