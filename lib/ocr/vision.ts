@@ -292,12 +292,35 @@ function providerStatus(error: unknown): number | null {
 
 /** Strictly validate a printed currency token before normalising it to paise. */
 function isStrictMoneyToken(value: string): boolean {
-  const raw = value.trim()
-    .replace(/^(?:INR|RS\\.?|₹)\\s*/i, '')
-    .replace(/[\\u00a0\\u2002-\\u200a\\u202f\\u205f\\u3000]/g, ' ')
-    .replace(/\\s/g, '')
-  const grouped = '(?:\\\\d+|\\\\d{1,3}(?:,\\\\d{3})+|\\\\d{1,2}(?:,\\\\d{2})*,\\\\d{3})'
-  return new RegExp('^[+-]?' + grouped + '(?:\\\\.\\\\d{1,2})?
+  const raw = value.trim().replace(/^(?:INR|RS\\.?|₹)\\s*/i, '').replace(/\\s/g, '')
+  const grouped = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})'
+  const match = raw.match(new RegExp('^[+-]?' + grouped + '(?:[.][0-9]{1,2})?'))
+  return !!match && match[0] === raw
+}
+
+/** Parse the narrow second-pass response: exactly one printed field, no calculations. */
+function parseTargetedVisionJson(text: string, field: 'total_amount'): LedgerCandidate {
+  const trimmed = (text ?? '').trim()
+  const start = trimmed.indexOf('{')
+  const end = trimmed.lastIndexOf('}')
+  if (start < 0 || end <= start) throw new VisionPermanentError('UNPARSEABLE_VISION_JSON')
+  let value: unknown
+  try { value = (JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>)[field] }
+  catch { throw new VisionPermanentError('UNPARSEABLE_VISION_JSON') }
+  if (value === null) return { [field]: null, confidence: { [field]: 0 } }
+  if (typeof value !== 'string' || !isStrictMoneyToken(value)) throw new VisionPermanentError('VISION_FIELD_TYPE_INVALID:' + field)
+  const minor = moneyToMinorUnits(value)
+  if (minor === null) throw new VisionPermanentError('VISION_FIELD_TYPE_INVALID:' + field)
+  return { [field]: minorUnitsToNumber(minor), confidence: { [field]: 0.5 } }
+}
+
+const TARGETED_TOTAL_SCHEMA = {
+  type: Type.OBJECT,
+  properties: { total_amount: { type: Type.STRING, nullable: true } },
+  required: ['total_amount'],
+  propertyOrdering: ['total_amount'],
+}
+
 export function parseVisionJson(text: string): LedgerCandidate {
   const trimmed = (text ?? '').trim()
   if (!trimmed) throw new VisionPermanentError('EMPTY_VISION_RESPONSE')
