@@ -981,7 +981,7 @@ test('G6d vision is provider-gated with a strict schema and transient/permanent 
   assert.ok(s.includes('class VisionTransientError') && s.includes('class VisionPermanentError'))
   assert.ok(s.includes('buildGeminiInvoiceRequest'))
   assert.ok(request.includes("responseMimeType: 'application/json'"))
-  assert.ok(s.includes('responseSchema: LEDGER_SCHEMA'))
+  assert.ok(s.includes('responseSchema: targetField ? TARGETED_TOTAL_SCHEMA : LEDGER_SCHEMA'))
   assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
   assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
   assert.ok(s.includes('cgst_rate_percent') && s.includes('total_amount_in_words'), 'Gemini schema returns optional printed corroboration evidence')
@@ -1640,7 +1640,7 @@ test('K2 mergeCandidates: AI assists the local parse but never overrules valid l
   assert.equal(merged.invoice_number, 'INV-1', 'valid local text field kept over the AI value')
   assert.equal(merged.supplier_gstin, '27AAPFU0939F1ZV', 'an INVALID local GSTIN is filled from AI')
   assert.equal(merged.total_amount, 1000, 'valid local amount kept over AI')
-  assert.equal(merged.vendor_name, 'Acme Traders Pvt Ltd', 'AI fills a field local missed')
+  assert.equal(merged.vendor_name, 'Acme Traders PVT LTD', 'AI fills a field local missed and legal suffix is normalized')
   assert.equal(merged.invoice_date, '05/09/2026', 'AI fills the missing date')
 })
 
@@ -1681,7 +1681,8 @@ test('K5 OCR engine: local-first sharp+tesseract, bounded scanned-PDF raster, ga
   assert.ok(e.includes('combinePageCandidates(') && e.includes('groupPageCandidates('), 'multi-page candidates are grouped by invoice number, never blindly concatenated (§P3-14)')
   assert.ok(e.includes('extractScannedPdf(') && e.includes('recognizeText(png, worker)'), 'scanned PDFs are rasterized then OCR-read')
   assert.ok(e.includes('langPath: process.cwd()') && e.includes('gzip: false'), 'Tesseract loads the bundled traineddata locally')
-  assert.ok(e.includes('.greyscale()') && e.includes('.normalize()'), 'OCR input receives contrast normalization')
+  const localOcrImage = e.slice(e.indexOf('async function normalizeImageToPng'), e.indexOf('type OcrWorker'))
+  assert.ok(!localOcrImage.includes('.resize(') && !localOcrImage.includes('.greyscale()') && !localOcrImage.includes('.normalize()') && !localOcrImage.includes('.sharpen()'), 'local OCR preserves original pixels without lossy transforms')
   assert.ok(e.includes('await withOcrWorker(async (worker)'), 'one worker is reused across scanned PDF pages')
   assert.ok(e.includes('width > MAX_RENDER_DIMENSION || height > MAX_RENDER_DIMENSION'), 'PDF page dimensions stay under the hard ceiling')
   assert.ok(e.includes('candidateHasUsefulFields(parsed)'), 'text length alone cannot count as a local extraction candidate')
@@ -2319,12 +2320,12 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   // responseMimeType + responseSchema only, never temperature/top_p/top_k.
   assert.ok(request.includes("responseMimeType: 'application/json'"))
   assert.ok(!/temperature|top_p|top_k/.test(request.replace(/\/\/.*$/gm, '')), 'no legacy sampling parameters (comments excluded)')
-  // Bounded second pass: one targeted re-read via retryHintFor, adopted only
-  // on strict improvement, merged so valid local fields are never downgraded.
+  // Bounded second pass: only a located Grand Total region is reread, with one field requested.
   const eng = extractorSrc()
-  assert.ok(eng.includes('retryHintFor('), 'second pass derives its hint from the failed checks')
+  assert.ok(eng.includes('cropGrandTotalRegion'), 'OCR line boxes locate the total region')
+  assert.ok(eng.includes("targetField: 'total_amount'"), 'the second pass is field-targeted')
   assert.ok(eng.includes('AI second pass started') && eng.includes('AI second pass completed'), 'second pass is logged')
-  assert.ok(/extractInvoiceFields\(\s*mimeType === PDF_MIME/.test(eng), 'second pass reuses the same media path + model')
+  assert.ok(eng.includes('buffer: grandTotalCrop as Buffer'), 'second pass uses the cropped region, not the full page')
 })
 
 test('P9 ledger: tax heads stay unknown unless explicit; explicit zeros approve an IGST-only invoice', () => {
@@ -2711,8 +2712,8 @@ test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge 
   }
   const localEval = ledger.evaluateLedger(local, { minConfidence: 0.7, now: NOW_17 })
   const mergedEval = ledger.evaluateLedger(merged, { minConfidence: 0.7, now: NOW_17 })
-  // The old ranking (hard-failure count ABOVE completeness) kept local: 1 code
-  // (`non-finite-amount`) beat the merge's several, discarding 5 useful fields.
+  // Integrity failures now outrank completeness: the fuller candidate has more
+  // hard contradictions, so it cannot win merely by carrying more fields.
   assert.equal(localEval.review, 'needs_review')
   assert.ok(localEval.reasons.includes('non-finite-amount'), 'missing heads read as non-finite, as in the log')
   assert.equal(mergedEval.review, 'needs_review', 'the fuller merge is NOT auto-accepted')
@@ -2721,7 +2722,7 @@ test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge 
     { candidate: local, evaluation: localEval, source: 'local' },
     { candidate: merged, evaluation: mergedEval, source: 'ai' },
   ])
-  assert.equal(chosen.source, 'ai', 'completeness is judged before failure count: the reviewer gets the fuller row')
+  assert.equal(chosen.source, 'local', 'fewer hard failures outrank completeness')
   assert.equal(chosen.evaluation.review, 'needs_review', 'the merge still requires review (nothing weakened)')
   assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('total-mismatch')), 'the real contradiction is still reported')
   assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('amount-words-total-mismatch')))
@@ -2796,12 +2797,12 @@ test('P21 financial validation is NOT weakened to raise approvals', () => {
   assert.ok(!soft.reasons.some((r) => r.startsWith('tax-rate-mismatch')), 'no HARD rate flag when the total ties')
 })
 
-test('P22 source contract: ranking puts completeness before failure count; money + month-name support present', () => {
+test('P22 source contract: ranking puts hard failures before completeness; money + month-name support present', () => {
   const ledSrc = readFileSync(new URL('../lib/ocr/ledger.ts', import.meta.url), 'utf8')
   const iComplete = ledSrc.indexOf('if (aCount !== bCount) return aCount > bCount')
   const iHard = ledSrc.indexOf('if (aHard !== bHard) return aHard < bHard')
-  assert.ok(iComplete >= 0 && iHard >= 0 && iComplete < iHard,
-    'completeness is compared BEFORE hard-failure count (the 17 Oct fix)')
+  assert.ok(iComplete >= 0 && iHard >= 0 && iHard < iComplete,
+    'hard-failure count is compared BEFORE completeness')
   assert.ok(ledSrc.includes('MONTH_NAMES') && ledSrc.includes('monthFromName'), 'month-name date support present')
   const monSrc = readFileSync(new URL('../lib/ocr/validators/money.ts', import.meta.url), 'utf8')
   assert.ok(monSrc.includes('Number.isFinite') && monSrc.includes('LEADING_CURRENCY'),
