@@ -39,5 +39,6 @@ test('equation-like amount-in-words never repairs a printed total', () => {
   }, { minConfidence: 0.8, now })
   assert.equal(result.row.total_amount, 900000)
   assert.deepEqual(result.repairs, [])
+  assert.ok(result.reasons.includes('amount-words-equation-not-evidence'))
   assert.equal(result.review, 'needs_review')
 })
