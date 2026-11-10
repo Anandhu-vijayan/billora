@@ -908,12 +908,14 @@ export async function extractInvoice(
       // relative to taxable value. This is a transcription retry, never a /100 fix.
       if (aiEvaluation.review === 'needs_review') {
         const totalMismatch = aiEvaluation.reasons.some((reason) => reason.startsWith('total-mismatch'))
-        const targetTaxField = totalMismatch ? null : magnitudeSuspectTaxField(assisted)
-        const targetField = totalMismatch ? 'total_amount' as const : targetTaxField
-        const hint = totalMismatch
-          ? 'The first pass did not establish the printed total. Read only the number printed next to Grand Total / Total / Net Payable; do not calculate or infer it.'
-          : targetTaxField
-            ? `The first read of ${targetTaxField} was an extreme outlier relative to taxable value. Re-read only that printed tax-head amount; preserve the decimal point exactly and do not calculate it.`
+        const targetTaxField = magnitudeSuspectTaxField(assisted)
+        // A tax-head magnitude outlier is the likely cause of the total mismatch;
+        // re-read that field before asking Gemini to re-read an already plausible total.
+        const targetField = targetTaxField ?? (totalMismatch ? 'total_amount' as const : null)
+        const hint = targetTaxField
+          ? `The first read of ${targetTaxField} was an extreme outlier relative to taxable value. Re-read only that printed tax-head amount; preserve the decimal point exactly and do not calculate it.`
+          : totalMismatch
+            ? 'The first pass did not establish the printed total. Read only the number printed next to Grand Total / Total / Net Payable; do not calculate or infer it.'
             : null
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
@@ -952,7 +954,19 @@ export async function extractInvoice(
           // identified as a magnitude outlier. All other fields and evidence are
           // retained; the normal ledger checks must still reconcile the full row.
           if (targetTaxField && retryCandidate[targetTaxField] != null && candidate) {
-            retryAssisted = { ...assisted, [targetTaxField]: retryCandidate[targetTaxField] }
+            const remainingConflicts = { ...(assisted.field_conflicts ?? {}) }
+            // The targeted second read is specifically requested because the
+            // existing local value is a magnitude outlier. Retire only this field's
+            // stale local-vs-first-pass conflict; keep every unrelated conflict.
+            delete remainingConflicts[targetTaxField]
+            const confidence = { ...(assisted.confidence ?? {}) }
+            delete confidence[targetTaxField] // targeted parser confidence is not calibrated
+            retryAssisted = {
+              ...assisted,
+              [targetTaxField]: retryCandidate[targetTaxField],
+              confidence,
+              field_conflicts: Object.keys(remainingConflicts).length ? remainingConflicts : undefined,
+            }
           }
           const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
           logger.info('[Extract] AI second pass completed', {
