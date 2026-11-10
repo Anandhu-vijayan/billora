@@ -72,7 +72,7 @@ test('local money parser preserves a printed decimal and never invents one when 
     'CGST: 291.00',
     'SGST: 291.00',
     'Grand Total: 5,432.00',
-  ].join('\\n'))
+  ].join('\n'))
   assert.equal(parsed.taxable_value, 4850)
   assert.equal(parsed.total_amount, 5432)
 
