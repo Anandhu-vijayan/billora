@@ -329,25 +329,6 @@ async function withOcrWorker<T>(run: (worker: OcrWorker) => Promise<T>): Promise
   }
 }
 
-async function recognizeText(png: Buffer, worker: OcrWorker): Promise<string> {
-
-  try {
-    const result = await worker.recognize(png)
-    const text = result.data.text || ''
-    // Metadata only (never the OCR text itself): proves whether the worker ran
-    // and roughly how much it read, without leaking invoice content to logs.
-    logger.info('[OCR] recognize complete', { chars: text.length, sourceBytes: png.length })
-    return text
-  } catch (error) {
-    // Surface WHY the worker failed (a bundling/model-resolution fault in the
-    // server runtime looked identical to "blank invoice" before).
-    logger.warn('[OCR] tesseract worker failed', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    throw new InvoiceExtractionError('LOCAL_OCR_FAILED', true)
-  }
-}
-
 interface OcrRecognition {
   text: string
   grandTotalCrop: Buffer | null
@@ -358,8 +339,8 @@ async function cropGrandTotalRegion(png: Buffer, data: unknown): Promise<Buffer 
   if (!Array.isArray(lines)) return null
   const target = lines.find((line) => {
     const text = line.text ?? ''
-    return /\\b(?:grand\\s*total|net\\s*payable|total\\s*invoice\\s*value|invoice\\s*total|amount\\s*payable)\\b/i.test(text)
-      || (/^\\s*total\\b/i.test(text) && !/\\btotal\\s+(?:tax|taxable|qty|quantity|discount)\\b/i.test(text))
+    return /\b(?:grand\s*total|net\s*payable|total\s*invoice\s*value|invoice\s*total|amount\s*payable)\b/i.test(text)
+      || (/^\s*total\b/i.test(text) && !/\btotal\s+(?:tax|taxable|qty|quantity|discount)\b/i.test(text))
   })
   const box = target?.bbox
   if (!box || ![box.x0, box.y0, box.x1, box.y1].every((n) => typeof n === 'number' && Number.isFinite(n))) return null
