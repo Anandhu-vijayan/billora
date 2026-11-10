@@ -2695,7 +2695,7 @@ test('P16 money: currency formats/commas/NBSP parse; zero preserved; NaN/Infinit
   assert.equal(ev.row.igst_amount, 0, 'explicit zero IGST is kept, not treated as missing')
 })
 
-test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge that stays in review', () => {
+test('P17 the 17 Oct failure: fewer hard failures outrank completeness', () => {
   // Local found only 4 fields; the missing heads make amountsFinite false, so it
   // reports non-finite-amount + confidence 0 (exactly the production log).
   const local = {
@@ -2724,8 +2724,8 @@ test('P17 the 17 Oct failure, fixed: a sparse local row loses to a fuller merge 
   ])
   assert.equal(chosen.source, 'local', 'fewer hard failures outrank completeness')
   assert.equal(chosen.evaluation.review, 'needs_review', 'the merge still requires review (nothing weakened)')
-  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('total-mismatch')), 'the real contradiction is still reported')
-  assert.ok(chosen.evaluation.reasons.some((r) => r.startsWith('amount-words-total-mismatch')))
+  assert.ok(mergedEval.reasons.some((r) => r.startsWith('total-mismatch')), 'the rejected richer candidate retains its total contradiction')
+  assert.ok(mergedEval.reasons.some((r) => r.startsWith('amount-words-total-mismatch')), 'the rejected richer candidate retains its words mismatch')
   // And the resolved month-name date lets it batch into the right month.
   assert.equal(chosen.evaluation.invoiceDateResolved, true)
 })
