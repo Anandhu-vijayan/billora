@@ -760,6 +760,20 @@ function isResultSufficient(evaluation: LedgerEvaluation | null): boolean {
   return evaluation !== null && evaluation.review === 'approved'
 }
 
+function magnitudeSuspectTaxField(candidate: LedgerCandidate | null): 'cgst_amount' | 'sgst_amount' | 'igst_amount' | null {
+  if (!candidate) return null
+  const taxable = Number(candidate.taxable_value)
+  if (!Number.isFinite(taxable) || taxable <= 0) return null
+  const limits = [
+    ['cgst_amount', 0.255], ['sgst_amount', 0.1425], ['igst_amount', 0.51],
+  ] as const
+  for (const [field, limit] of limits) {
+    const amount = Number(candidate[field])
+    if (Number.isFinite(amount) && amount > taxable * limit) return field
+  }
+  return null
+}
+
 export async function extractInvoice(
   options: InvoiceExtractionOptions,
 ): Promise<InvoiceExtractionResult> {
@@ -889,15 +903,18 @@ export async function extractInvoice(
 
       let aiEvaluation = evaluateLedger(assisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
       let secondPass = false
-      // Bounded second pass: only a printed total mismatch can trigger it.
-      // Tesseract must first locate the Grand Total / Net Payable row; Gemini
-      // receives that crop and is asked to transcribe one field only. If the
-      // region is absent or unreadable, no repeat full-page question is sent.
+      // Bounded second pass: target a printed total mismatch first; otherwise
+      // re-read a tax head only when its local magnitude is physically implausible
+      // relative to taxable value. This is a transcription retry, never a /100 fix.
       if (aiEvaluation.review === 'needs_review') {
         const totalMismatch = aiEvaluation.reasons.some((reason) => reason.startsWith('total-mismatch'))
+        const targetTaxField = totalMismatch ? null : magnitudeSuspectTaxField(assisted)
+        const targetField = totalMismatch ? 'total_amount' as const : targetTaxField
         const hint = totalMismatch
           ? 'The first pass did not establish the printed total. Read only the number printed next to Grand Total / Total / Net Payable; do not calculate or infer it.'
-          : null
+          : targetTaxField
+            ? `The first read of ${targetTaxField} was an extreme outlier relative to taxable value. Re-read only that printed tax-head amount; preserve the decimal point exactly and do not calculate it.`
+            : null
         // Bound ALL AI work for this job: a slow (throttled) key must not spend
         // two full per-call ceilings and get the worker killed at maxDuration.
         // The second read runs only if elapsed AI time plus one more ceiling fits
@@ -915,21 +932,28 @@ export async function extractInvoice(
           })
         } else if (hint) {
           secondPass = true
-          const targetedBuffer = grandTotalCrop ?? buffer
-          const targetedMimeType = grandTotalCrop ? 'image/png' : mimeType
+          const useGrandTotalCrop = targetField === 'total_amount' && grandTotalCrop !== null
+          const targetedBuffer = useGrandTotalCrop ? grandTotalCrop as Buffer : buffer
+          const targetedMimeType = useGrandTotalCrop ? 'image/png' : mimeType
           logger.info('[Extract] AI second pass started', {
             model,
             durationMs: Date.now() - aiStartedAt,
-            input: grandTotalCrop ? 'grand-total-crop' : 'original-document-fallback',
+            input: useGrandTotalCrop ? 'grand-total-crop' : 'original-document-fallback',
             reasonCodes: aiEvaluation.reasons.map((reason) => reason.split(':')[0]).slice(0, 8),
           })
           const retryCandidate = await extractInvoiceFields({
             buffer: targetedBuffer, mimeType: targetedMimeType, apiKey, model, hint,
-            targetField: 'total_amount',
+            targetField,
           })
-          const retryAssisted = candidate
+          let retryAssisted = candidate
             ? mergeCandidates(candidate, retryCandidate)
             : retryCandidate
+          // A targeted tax-head re-read may replace ONLY the field already
+          // identified as a magnitude outlier. All other fields and evidence are
+          // retained; the normal ledger checks must still reconcile the full row.
+          if (targetTaxField && retryCandidate[targetTaxField] != null && candidate) {
+            retryAssisted = { ...assisted, [targetTaxField]: retryCandidate[targetTaxField] }
+          }
           const retryEvaluation = evaluateLedger(retryAssisted, { minConfidence, amountToleranceMinorUnits, buyerGstin })
           logger.info('[Extract] AI second pass completed', {
             model,
