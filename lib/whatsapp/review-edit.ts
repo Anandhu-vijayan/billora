@@ -164,6 +164,15 @@ export function describeReason(code: string): string {
   const base = code.split(':')[0]
   if (base === 'low-confidence') return 'the reading was low-confidence'
   if (base === 'total-mismatch') return 'the amounts do not add up to the total'
+  if (base === 'vendor-ambiguous') return 'the supplier name may have been read from the Bill To / buyer section; confirm the seller name'
+  if (base === 'local-money-magnitude-suspect') return 'a tax amount is unusually large compared with taxable value; verify the printed digits and decimal point'
+  if (base === 'money-field-conflict') {
+    const field = code.split(':')[1] ?? 'amount'
+    const local = /local=([^:]+)/.exec(code)?.[1] ?? 'unknown'
+    const ai = /ai=([^:]+)/.exec(code)?.[1] ?? 'unknown'
+    const label = EDITABLE_FIELDS.find((item) => item.key === field)?.label ?? field
+    return label + ' differs between OCR sources (local: ' + local + '; AI: ' + ai + '); verify the printed value'
+  }
   return REASON_TEXT[base] ?? 'it needs a manual check'
 }
 
@@ -177,13 +186,13 @@ const REASON_FIELD: Record<string, number | 'amounts'> = {
   'invoice-number-missing': 1, 'invoice-number-placeholder': 1, 'review-confirmation-required': 1,
   'gstin-missing': 2, 'gstin-invalid': 2, 'gstin-state-invalid': 2, 'gstin-checksum-failed': 2,
   'supplier-equals-buyer': 2, 'supplier-equals-recipient': 2,
-  'vendor-name-missing': 3, 'vendor-name-placeholder': 3,
+  'vendor-name-missing': 3, 'vendor-name-placeholder': 3, 'vendor-ambiguous': 3,
   'invoice-date-unresolved': 4, 'invoice-date-future': 4, 'invoice-date-before-gst': 4,
-  'non-finite-amount': 'amounts', 'negative-amount': 'amounts', 'total-zero': 'amounts',
+  'non-finite-amount': 'amounts', 'negative-amount': 'amounts', 'total-zero': 'amounts', 'local-money-magnitude-suspect': 'amounts',
   'igst-with-cgst-sgst': 'amounts', 'cgst-sgst-unequal': 'amounts', 'igst-on-intrastate': 'amounts',
   'cgst-sgst-on-interstate': 'amounts', 'tax-rate-mismatch': 'amounts', 'tax-rate-advisory': 'amounts', 'tax-rate-amount-missing': 'amounts',
   'tax-rate-invalid': 'amounts', 'tax-rate-cgst-sgst-unequal': 'amounts', 'tax-rate-igst-with-cgst-sgst': 'amounts',
-  'amount-words-total-mismatch': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts',
+  'amount-words-total-mismatch': 'amounts', 'total-mismatch': 'amounts', 'candidate-conflict': 'amounts', 'money-field-conflict': 'amounts',
 }
 
 /**
