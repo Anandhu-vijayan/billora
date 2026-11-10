@@ -292,7 +292,7 @@ function providerStatus(error: unknown): number | null {
 
 /** Strictly validate a printed currency token before normalising it to paise. */
 function isStrictMoneyToken(value: string): boolean {
-  const raw = value.trim().replace(/^(?:INR|RS\\.?|₹)\\s*/i, '').replace(/\\s/g, '')
+  const raw = value.trim().replace(/^(?:INR|RS[.]?|₹)[ ]*/i, '').replace(/[ ]/g, '')
   const grouped = '(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})'
   const match = raw.match(new RegExp('^[+-]?' + grouped + '(?:[.][0-9]{1,2})?'))
   return !!match && match[0] === raw
@@ -498,7 +498,7 @@ export async function extractInvoiceFields(args: {
     promptBytes: Buffer.byteLength(promptPart.text, 'utf8'),
     contentPartCount: request.contents[0].parts.length,
     responseMimeType: request.config.responseMimeType,
-    schemaFieldNames: Object.keys(LEDGER_SCHEMA.properties),
+    schemaFieldNames: Object.keys(targetField ? TARGETED_TOTAL_SCHEMA.properties : LEDGER_SCHEMA.properties),
   })
   try {
     const response = await withTimeout(
@@ -506,7 +506,7 @@ export async function extractInvoiceFields(args: {
       callTimeoutMs(),
     )
     const text = (response as { text?: string }).text ?? ''
-    const candidate = parseVisionJson(text)
+    const candidate = targetField ? parseTargetedVisionJson(text, targetField) : parseVisionJson(text)
     return candidate
   } catch (error) {
     const classified = error instanceof VisionTransientError || error instanceof VisionPermanentError
