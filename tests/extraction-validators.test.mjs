@@ -33,13 +33,13 @@ test('ledger arithmetic is exact for decimal fractions', () => {
   const result = ledger.evaluateLedger({
     ...BASE,
     taxable_value: 0.1,
-    cgst_amount: 0.1,
-    sgst_amount: 0.1,
+    cgst_amount: 0.01,
+    sgst_amount: 0.01,
     igst_amount: 0,
-    total_amount: 0.3,
+    total_amount: 0.12,
   }, { minConfidence: 0.8, now: NOW })
   assert.equal(result.review, 'approved')
-  assert.equal(result.row.total_amount, 0.3)
+  assert.equal(result.row.total_amount, 0.12)
 })
 
 test('amount-in-words parser supports Indian lakh/crore and paise values', () => {
@@ -217,6 +217,7 @@ test('misread numeric total is repaired from the amount-in-words when the words 
     total_amount: 558502.93,
     round_off: 0.29,
     total_amount_in_words: 'Five Lakh Seventy Five Thousand Three Hundred and Fifty One Indian Rupee only.',
+    total_amount_in_words_source: 'local-ocr',
   }
   const out = ledger.evaluateLedger(cand, { minConfidence: 0.8, now: NOW })
   assert.equal(out.row.total_amount, 575351)
@@ -345,4 +346,62 @@ test('different valid supplier names are detected as a conflict', () => {
   )
 
   assert.ok(conflicts.includes('vendor_name'))
+})
+
+test('supplier name inside Bill To is excluded and becomes ambiguous when no seller is found', () => {
+  const parsed = textParser.parseInvoiceText([
+    'TAX INVOICE',
+    'Bill To: Anandhu Enterprises',
+    'Thrissur Kerala',
+    'GSTIN: 32ACXPV2326B1ZL',
+    'Invoice No: INV-2026-10-103',
+    'Invoice Date: 20-Oct-2026',
+    'Taxable Value: 25000.00',
+    'Grand Total: 31250.00',
+  ].join('\n'))
+  assert.equal(parsed.vendor_name, undefined)
+  assert.equal(parsed.vendor_ambiguous, true)
+  assert.ok((parsed.buyer_region_names ?? []).some((name) => /Anandhu Enterprises/i.test(name)))
+  const merged = ledger.mergeCandidates({ ...parsed }, { vendor_name: 'Anandhu Enterprises' })
+  assert.equal(merged.vendor_name, null)
+  assert.equal(merged.vendor_ambiguous, true)
+})
+
+test('money disagreements are retained as field conflicts instead of silently choosing local', () => {
+  const local = { ...BASE, taxable_value: 1800, total_amount: 1800000 }
+  const ai = { ...BASE, taxable_value: 18000, total_amount: 21240 }
+  const merged = ledger.mergeCandidates(local, ai)
+  assert.deepEqual(merged.field_conflicts?.taxable_value, { local: 1800, ai: 18000 })
+  assert.deepEqual(merged.field_conflicts?.total_amount, { local: 1800000, ai: 21240 })
+  assert.ok(ledger.detectCandidateConflicts(local, ai).includes('taxable_value'))
+  assert.ok(ledger.detectCandidateConflicts(local, ai).includes('total_amount'))
+})
+
+test('candidate ranking checks hard failures before completeness', () => {
+  const fullButContradictory = {
+    candidate: { ...BASE }, source: 'local',
+    evaluation: { review: 'needs_review', reasons: ['total-mismatch', 'cgst-sgst-unequal'], measuredConfidence: 0.9,
+      row: { ...BASE, invoice_date: '2026-09-05' } },
+  }
+  const sparseWithFewerFailures = {
+    candidate: { invoice_number: 'INV-42' }, source: 'ai',
+    evaluation: { review: 'needs_review', reasons: ['gstin-missing'], measuredConfidence: 0.2,
+      row: { invoice_date: '', invoice_number: 'INV-42', vendor_name: '', supplier_gstin: '', taxable_value: null, cgst_amount: null, sgst_amount: null, igst_amount: null, total_amount: null } },
+  }
+  assert.equal(ledger.selectBestCandidate([fullButContradictory, sparseWithFewerFailures]), sparseWithFewerFailures)
+})
+
+test('OCR money magnitude anomaly flags but never rescales a suspicious tax amount', () => {
+  const out = ledger.evaluateLedger({ ...BASE, taxable_value: 1800, cgst_amount: 1620, sgst_amount: 1620, total_amount: 5040 }, { minConfidence: 0.8, now: NOW })
+  assert.equal(out.review, 'needs_review')
+  assert.ok(out.reasons.includes('local-money-magnitude-suspect'))
+  assert.equal(out.row.cgst_amount, 1620)
+  assert.equal(out.row.sgst_amount, 1620)
+})
+
+test('AI-only amount-in-words is not accepted as independent repair evidence', () => {
+  const out = ledger.evaluateLedger({ ...BASE, total_amount: 9999, total_amount_in_words: 'One Thousand One Hundred Eighty Only', total_amount_in_words_source: 'ai' }, { minConfidence: 0.8, now: NOW })
+  assert.equal(out.row.total_amount, 9999)
+  assert.deepEqual(out.repairs, [])
+  assert.ok(out.reasons.some((reason) => reason.startsWith('total-mismatch')))
 })
