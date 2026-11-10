@@ -605,16 +605,16 @@ export function evaluateLedger(
   const amountsNonNegative = amounts.every((n) => Number.isFinite(n) && n >= 0);
   let arithmeticConsistent = true;
   let structureConsistent = true;
-  // Plausibility gate only: never rescale or rewrite a printed amount. Standard
-  // GST component ceilings are 14% per CGST/SGST head and 28% IGST. Values above
-  // a small tolerance are suspicious for decimal/zero-joining OCR errors; they
-  // stay untouched and force human review. Cess is represented separately.
+  // High-anomaly gate only: never rescale or rewrite a printed amount. Use
+  // deliberately generous bounds (25% per local tax head / 50% IGST) so special
+  // or revised GST rates do not become false positives. Values beyond these
+  // bounds are suspicious for OCR digit/decimal corruption and require review.
   const [taxableForMagnitude, cgstForMagnitude, sgstForMagnitude, igstForMagnitude] = amountMinorUnits
   if (taxableForMagnitude !== null && taxableForMagnitude > BigInt(0)) {
     const exceeds = (amount: bigint | null, basisPoints: bigint): boolean =>
       amount !== null && amount * BigInt(10000) > taxableForMagnitude * basisPoints
-    if (exceeds(cgstForMagnitude, BigInt(1425)) || exceeds(sgstForMagnitude, BigInt(1425))
-      || exceeds(igstForMagnitude, BigInt(2850))) {
+    if (exceeds(cgstForMagnitude, BigInt(2550)) || exceeds(sgstForMagnitude, BigInt(1425))
+      || exceeds(igstForMagnitude, BigInt(5100))) {
       structureConsistent = false
       reasons.push('local-money-magnitude-suspect')
     }
