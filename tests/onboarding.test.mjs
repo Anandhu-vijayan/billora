@@ -981,7 +981,8 @@ test('G6d vision is provider-gated with a strict schema and transient/permanent 
   assert.ok(s.includes('class VisionTransientError') && s.includes('class VisionPermanentError'))
   assert.ok(s.includes('buildGeminiInvoiceRequest'))
   assert.ok(request.includes("responseMimeType: 'application/json'"))
-  assert.ok(s.includes('responseSchema: targetField ? TARGETED_TOTAL_SCHEMA : LEDGER_SCHEMA'))
+  assert.ok(s.includes('responseSchema: targetField ? targetedMoneySchema(targetField) : LEDGER_SCHEMA'))
+  assert.ok(s.includes('function targetedMoneySchema(field: TargetedMoneyField)'), 'targeted schema is field-specific for total and tax heads')
   assert.ok(s.includes('confidence'), 'schema requests per-field confidence')
   assert.ok(s.includes('UNSUPPORTED_MEDIA_TYPE'), 'only image/pdf are sendable')
   assert.ok(s.includes('cgst_rate_percent') && s.includes('total_amount_in_words'), 'Gemini schema returns optional printed corroboration evidence')
@@ -2325,10 +2326,11 @@ test('P8 extract handler wiring: engine drives review/status and failures are cl
   // Bounded second pass: prefer the located Grand Total crop, otherwise reread the original document with one field requested.
   const eng = extractorSrc()
   assert.ok(eng.includes('cropGrandTotalRegion'), 'OCR line boxes locate the total region')
-  assert.ok(eng.includes("targetField: 'total_amount'"), 'the second pass is field-targeted')
+  assert.ok(eng.includes("targetField: targetField ?? 'total_amount'"), 'the second pass is field-targeted')
+  assert.ok(eng.includes('magnitudeSuspectTaxField') && eng.includes('targetTaxField'), 'an extreme tax-head magnitude triggers a field-specific reread')
   assert.ok(eng.includes('AI second pass started') && eng.includes('AI second pass completed'), 'second pass is logged')
-  assert.ok(eng.includes('const targetedBuffer = grandTotalCrop ?? buffer'), 'second pass falls back to the original document when OCR cannot locate the crop')
-  assert.ok(eng.includes("input: grandTotalCrop ? 'grand-total-crop' : 'original-document-fallback'"), 'the targeted input source is observable')
+  assert.ok(eng.includes('const targetedBuffer = useGrandTotalCrop ? grandTotalCrop as Buffer : buffer'), 'total reread uses its crop when present and otherwise the original document')
+  assert.ok(eng.includes("input: useGrandTotalCrop ? 'grand-total-crop' : 'original-document-fallback'"), 'the targeted input source is observable')
 })
 
 test('P9 ledger: tax heads stay unknown unless explicit; explicit zeros approve an IGST-only invoice', () => {
