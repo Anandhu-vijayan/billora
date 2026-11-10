@@ -356,7 +356,11 @@ interface OcrRecognition {
 async function cropGrandTotalRegion(png: Buffer, data: unknown): Promise<Buffer | null> {
   const lines = (data as { lines?: Array<{ text?: string; bbox?: { x0?: number; y0?: number; x1?: number; y1?: number } }> })?.lines
   if (!Array.isArray(lines)) return null
-  const target = lines.find((line) => /\\b(?:grand\\s*total|net\\s*payable|total\\s*invoice\\s*value|invoice\\s*total|amount\\s*payable)\\b/i.test(line.text ?? ''))
+  const target = lines.find((line) => {
+    const text = line.text ?? ''
+    return /\\b(?:grand\\s*total|net\\s*payable|total\\s*invoice\\s*value|invoice\\s*total|amount\\s*payable)\\b/i.test(text)
+      || (/^\\s*total\\b/i.test(text) && !/\\btotal\\s+(?:tax|taxable|qty|quantity|discount)\\b/i.test(text))
+  })
   const box = target?.bbox
   if (!box || ![box.x0, box.y0, box.x1, box.y1].every((n) => typeof n === 'number' && Number.isFinite(n))) return null
   const meta = await sharp(png).metadata()
