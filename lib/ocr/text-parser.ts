@@ -188,6 +188,37 @@ const BUYER_LABEL = /\b(bill(?:ed)?\s*to|buyer|purchaser|customer|recipient|cons
 const BUYER_HEADING = /^[^A-Za-z]*\b(bill(?:ed)?\s*to|buyer|purchaser|customer|recipient|consignee|ship(?:ped)?\s*to|delivered\s*to|to)\b/i
 /** ...and ENDS at a supplier heading or the tax/item table section. */
 const TAX_TABLE_SECTION = /\b(hsn|sac|sl\.?\s*(?:no|no\.)|description|quantity|qty|taxable\s*(?:value|amount|qty)?|assessable|cgst|sgst|igst|cess|discount|round\s*off|grand\s*total|total\b|net\s+(?:payable|amount)|amount\s+(?:in\s+)?(?:words|due)|freight|carriage)\b/i
+const BUYER_REGION_END = /\b(invoice\s*(?:no|number|date)|items?\s+details|particulars|hsn|sac|description|taxable|cgst|sgst|igst|grand\s+total|net\s+payable|supplier|sold\s+by|invoice\s+from)\b/i
+
+function normalizeVendorDisplay(value: string): string {
+  return value.replace(/\bPVT\.?\s*LTD\.?\b/gi, 'PVT LTD')
+    .replace(/\bPVTLTD\.?(?=\s|$)/gi, 'PVT LTD')
+    .replace(/\s+/g, ' ').trim()
+}
+
+/** Capture company-like names explicitly inside buyer blocks for cross-source exclusion. */
+function findBuyerRegionNames(text: string): string[] {
+  const names: string[] = []
+  let inBuyer = false
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    if (BUYER_HEADING.test(line)) {
+      inBuyer = true
+      const inline = line.replace(BUYER_HEADING, '').replace(/^\s*[:=-]\s*/, '').trim()
+      if (inline && /[A-Za-z]/.test(inline) && !/\b(?:gstin|address|date)\b/i.test(inline)) names.push(normalizeVendorDisplay(inline))
+      continue
+    }
+    if (inBuyer && BUYER_REGION_END.test(line)) { inBuyer = false; continue }
+    if (!inBuyer || /\b(?:gstin|state|phone|mobile|email|address|pin(?:code)?)\b/i.test(line)) continue
+    const cleaned = line.replace(/\s{2,}/g, ' ').trim()
+    if (cleaned.length >= 3 && cleaned.length <= 80 && /[A-Za-z]/.test(cleaned)
+      && !/\d/.test(cleaned) && !TAX_TABLE_SECTION.test(cleaned)) {
+      names.push(normalizeVendorDisplay(cleaned))
+    }
+  }
+  return [...new Set(names)]
+}
 
 /**
  * The NAME a supplier label carries, with the label (and any trailing GSTIN/
@@ -407,8 +438,17 @@ export function parseInvoiceText(
 
   const vendor = findVendor(normalized)
   if (vendor) {
-    candidate.vendor_name = vendor.value
+    candidate.vendor_name = normalizeVendorDisplay(vendor.value)
     candidate.confidence.vendor_name = vendor.confidence
+  }
+  const buyerRegionNames = findBuyerRegionNames(normalized)
+  if (buyerRegionNames.length > 0) candidate.buyer_region_names = buyerRegionNames
+  const normalizedBuyerNames = new Set(buyerRegionNames.map((name) => name.toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim()))
+  if (candidate.vendor_name && normalizedBuyerNames.has(candidate.vendor_name.toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim())) {
+    candidate.vendor_name = null
+    candidate.vendor_ambiguous = true
+  } else if (!candidate.vendor_name && buyerRegionNames.length > 0) {
+    candidate.vendor_ambiguous = true
   }
 
   const taxable = findLabeledAmount(normalized, /taxable(?:\s+(?:value|amount|amt))?|assessable(?:\s+value)?|net\s+amount/i)
@@ -452,7 +492,10 @@ export function parseInvoiceText(
   if (sgstRate !== null) candidate.sgst_rate_percent = sgstRate
   if (igstRate !== null) candidate.igst_rate_percent = igstRate
   const amountInWords = findAmountInWords(normalized)
-  if (amountInWords) candidate.total_amount_in_words = amountInWords
+  if (amountInWords) {
+    candidate.total_amount_in_words = amountInWords
+    candidate.total_amount_in_words_source = 'local-ocr'
+  }
   const total =
     findLabeledAmount(normalized, /grand\s+total|invoice\s+total|total\s+(?:amount|payable)|amount\s+due|net\s+payable/i)
     // A bare "Total" is a WEAK hit (it can be a quantity or a subtotal), so it
