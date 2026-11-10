@@ -33,7 +33,7 @@ test('money validator uses integer paise and rejects malformed values', () => {
 
 test('OCR raster sizing enlarges small WhatsApp images without exceeding hard bounds', () => {
   assert.deepEqual(ocrRaster.getOcrRasterSize(1240, 1754), { width: 2480, height: 3508 })
-  assert.deepEqual(ocrRaster.getOcrRasterSize(4000, 3000), { width: 4000, height: 3000 })
+  assert.deepEqual(ocrRaster.getOcrRasterSize(4000, 3000), { width: 3508, height: 2631 })
   const bounded = ocrRaster.getOcrRasterSize(3000, 3000, 8_000_000, 3508, 2)
   assert.ok(bounded.width * bounded.height <= 8_000_000)
   assert.ok(Math.max(bounded.width, bounded.height) <= 3508)
