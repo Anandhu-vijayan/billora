@@ -124,6 +124,7 @@ export interface LedgerCandidate {
   buyer_region_names?: string[];
   vendor_ambiguous?: boolean;
   total_amount_in_words_source?: 'local-ocr' | 'ai' | 'human';
+  amount_words_equation_not_evidence?: boolean;
   /** Both source readings are retained for review when a money field conflicts. */
   field_conflicts?: Record<string, { local: number | string; ai: number | string }>;
 }
@@ -498,7 +499,12 @@ function repairTotalFromWords(
   repairs: string[],
 ): LedgerCandidate {
   const words = (candidate.total_amount_in_words ?? '').trim()
-  if (!words || !['local-ocr', 'human'].includes(candidate.total_amount_in_words_source ?? '')) return candidate
+  if (!words) return candidate
+  if (/[=+*/]/.test(words)) {
+    candidate.amount_words_equation_not_evidence = true
+    return candidate
+  }
+  if (!['local-ocr', 'human'].includes(candidate.total_amount_in_words_source ?? '')) return candidate
   const wordsMinor = parseIndianAmountWords(words)
   if (wordsMinor === null) return candidate
   const printedMinor = moneyToMinorUnits(candidate.total_amount)
@@ -557,6 +563,7 @@ export function evaluateLedger(
     BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101))),
     repairs,
   );
+  if (candidate.amount_words_equation_not_evidence) reasons.push('amount-words-equation-not-evidence');
 
   const parsedDate = parseInvoiceDate(candidate.invoice_date);
   if (!parsedDate) reasons.push('invoice-date-unresolved');
