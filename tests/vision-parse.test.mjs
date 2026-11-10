@@ -82,6 +82,8 @@ test('V4 genuine problems are still rejected', () => {
   failsWith(badType, 'VISION_FIELD_TYPE_INVALID:taxable_value')
   const malformedMoney = good(); malformedMoney.total_amount = '4.850.00'
   failsWith(malformedMoney, 'VISION_FIELD_TYPE_INVALID:total_amount')
+  const malformedGrouping = good(); malformedGrouping.total_amount = '4,85.00'
+  failsWith(malformedGrouping, 'VISION_FIELD_TYPE_INVALID:total_amount')
   const badEvidence = good(); badEvidence.igst_rate_percent = 18
   failsWith(badEvidence, 'VISION_FIELD_TYPE_INVALID:igst_rate_percent')
   assert.throws(() => parseVisionJson('not json'), (e) => e.message === 'UNPARSEABLE_VISION_JSON')
@@ -103,6 +105,8 @@ test('V5 amount strings preserve decimal points and vendor extraction excludes b
   assert.equal(c.taxable_value, 4850)
   assert.equal(c.cgst_amount, 291)
   assert.equal(c.total_amount, 5432)
+  const indianGrouping = good(); indianGrouping.taxable_value = '1,00,000.00'
+  assert.equal(parse(indianGrouping).taxable_value, 100000)
   assert.match(src, /must be "4850\.00", never "485000"/)
   assert.match(src, /Never identify the supplier from the Bill To/)
 })
@@ -136,10 +140,15 @@ test('V6 Gemini receives a small colour JPEG, never the 3 MB OCR PNG', async () 
   const small = await sharp({ create: { width: 800, height: 1100, channels: 3, background: '#ffffff' } }).jpeg().toBuffer()
   const m2 = await sharp(await prepareImageForVision(small)).metadata()
   assert.deepEqual([m2.width, m2.height], [800, 1100])
-  // the OCR path is untouched and the AI paths use the vision image
-  assert.equal((extractor.match(/prepareImageForVision\(buffer\)/g) ?? []).length, 2, 'first and second AI pass')
+  // The first AI pass gets a bounded colour JPEG. The second pass uses a
+  // label-located, lossless Grand Total crop rather than repeating the page.
+  assert.equal((extractor.match(/prepareImageForVision\(buffer\)/g) ?? []).length, 1, 'only first AI pass uses the full-page JPEG')
+  assert.ok(extractor.includes('cropGrandTotalRegion'), 'OCR line boxes locate the printed Grand Total crop')
+  assert.ok(extractor.includes("targetField: 'total_amount'"), 'second pass requests only total_amount')
   assert.ok(!/buffer: normalized,\s*mimeType: 'image\/png'/.test(extractor), 'no OCR-PNG sent to Gemini')
-  assert.ok(extractor.includes('const png = await normalizeImageToPng(buffer)'), 'Tesseract still gets the OCR copy')
+  assert.ok(extractor.includes('const png = await normalizeImageToPng(buffer)'), 'Tesseract gets the lossless OCR copy')
+  const normalizer = extractor.slice(extractor.indexOf('async function normalizeImageToPng'), extractor.indexOf('type OcrWorker'))
+  assert.ok(!normalizer.includes('.resize('), 'local OCR preprocessing never resamples the source')
 })
 
 test('V7 an unusable AI answer settles on the local result; config faults still fail the job', () => {
