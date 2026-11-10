@@ -365,6 +365,8 @@ test('supplier name inside Bill To is excluded and becomes ambiguous when no sel
   const merged = ledger.mergeCandidates({ ...parsed }, { vendor_name: 'Anandhu Enterprises' })
   assert.equal(merged.vendor_name, null)
   assert.equal(merged.vendor_ambiguous, true)
+  const normalized = ledger.mergeCandidates({}, { vendor_name: 'SOUTH COAST TRADERS PVTLTD.' })
+  assert.equal(normalized.vendor_name, 'SOUTH COAST TRADERS PVT LTD')
 })
 
 test('money disagreements are retained as field conflicts instead of silently choosing local', () => {
