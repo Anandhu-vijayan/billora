@@ -19,6 +19,7 @@ import {
   type LedgerEvaluation,
 } from '@/lib/ocr/ledger'
 import { parseInvoiceText, hasMeaningfulText } from '@/lib/ocr/text-parser'
+import { getOcrRasterSize } from '@/lib/ocr/ocr-raster'
 import { extractPdfTextLayerPages } from '@/lib/ocr/pdf'
 import {
   extractInvoiceFields,
@@ -33,7 +34,7 @@ import {
 const MAX_FILE_BYTES = 15 * 1024 * 1024
 const MAX_IMAGE_PIXELS = 40_000_000
 const MAX_PDF_PAGES = 10
-const MAX_RENDER_DIMENSION = 2400
+const MAX_RENDER_DIMENSION = 3508
 const OCR_LANGUAGE = 'eng'
 const OCR_LANGUAGE_DATA = join(process.cwd(), `${OCR_LANGUAGE}.traineddata`)
 
@@ -285,18 +286,27 @@ async function normalizeImageToPng(buffer: Buffer): Promise<Buffer> {
       throw new InvoiceExtractionError('IMAGE_PIXEL_LIMIT_EXCEEDED')
     }
 
-    // Keep the source pixel grid intact for Tesseract. Resizing, contrast
-    // stretching and sharpening can erase decimal points or merge zeroes.
-    // Rotate/flatten only and encode losslessly; never resample this OCR copy.
-    return await sharp(buffer, {
+    // Keep original bytes untouched for evidence/Gemini. For local OCR only,
+    // enlarge small WhatsApp rasters by at most 2x (bounded to an A4-300dpi
+    // long edge and the global pixel cap). This improves glyph segmentation;
+    // it does NOT restore lost detail or justify correcting a financial value.
+    const swapsDimensions = [5, 6, 7, 8].includes(metadata.orientation ?? 1)
+    const orientedWidth = swapsDimensions ? metadata.height : metadata.width
+    const orientedHeight = swapsDimensions ? metadata.width : metadata.height
+    const target = getOcrRasterSize(
+      orientedWidth, orientedHeight, MAX_IMAGE_PIXELS, MAX_RENDER_DIMENSION, 2,
+    )
+    let pipeline = sharp(buffer, {
       limitInputPixels: MAX_IMAGE_PIXELS,
       animated: false,
       failOn: 'error',
-    })
-      .rotate()
-      .flatten({ background: '#ffffff' })
-      .png()
-      .toBuffer()
+    }).rotate().flatten({ background: '#ffffff' })
+    if (target.width !== orientedWidth || target.height !== orientedHeight) {
+      pipeline = pipeline.resize({
+        width: target.width, height: target.height, fit: 'fill', kernel: 'lanczos3',
+      })
+    }
+    return await pipeline.png().toBuffer()
   } catch (error) {
     if (error instanceof InvoiceExtractionError) throw error
 
@@ -557,8 +567,10 @@ async function extractScannedPdf(
       for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
         const page = await pdf.getPage(pageNumber)
         const baseViewport = page.getViewport({ scale: 1 })
+        // Render vector PDFs at up to ~300dpi (A4 long edge 3508px),
+        // bounded by MAX_RENDER_DIMENSION and the downstream pixel limit.
         const scale = Math.min(
-          2,
+          4.5,
           MAX_RENDER_DIMENSION / Math.max(baseViewport.width, baseViewport.height),
         )
         const viewport = page.getViewport({ scale })
