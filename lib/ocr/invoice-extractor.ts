@@ -945,7 +945,7 @@ export async function extractInvoice(
           })
           const retryCandidate = await extractInvoiceFields({
             buffer: targetedBuffer, mimeType: targetedMimeType, apiKey, model, hint,
-            targetField,
+            targetField: targetField ?? 'total_amount',
           })
           let retryAssisted = candidate
             ? mergeCandidates(candidate, retryCandidate)
