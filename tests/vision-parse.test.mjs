@@ -69,6 +69,22 @@ test('V3 optional evidence fields may be absent; unknown extra keys are ignored'
   assert.equal(c.total_amount_in_words, null)
 })
 
+test('V3b explicit item-level mixed-rate slices preserve decimal values', () => {
+  const o = good()
+  o.tax_slices = [
+    { rate_percent: 5, taxable_value: '4,500.00', cgst_amount: '112.50', sgst_amount: '112.50', igst_amount: null, treatment: 'local' },
+    { rate_percent: 18, taxable_value: '8,000.00', cgst_amount: '720.00', sgst_amount: '720.00', igst_amount: null, treatment: 'local' },
+  ]
+  const c = parse(o)
+  assert.deepEqual(c.tax_slices.map((x) => [
+    x.rate_percent, x.taxable_value, x.cgst_amount, x.sgst_amount, x.treatment,
+  ]), [
+    [5, 4500, 112.5, 112.5, 'local'],
+    [18, 8000, 720, 720, 'local'],
+  ])
+  assert.ok(c.tax_slices.every((x) => x.provenance === 'item-level'))
+})
+
 test('V4 genuine problems are still rejected', () => {
   const noTotal = good(); delete noTotal.total_amount
   failsWith(noTotal, 'VISION_SCHEMA_KEYS_INVALID')
