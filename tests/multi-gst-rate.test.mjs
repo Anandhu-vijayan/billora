@@ -122,6 +122,40 @@ const FLAT_5_18 = {
   total_amount: 14165, cgst_rate_percent: 0, sgst_rate_percent: 0,
 }
 
+test('PDF text parser recognises an unlabelled Products seller header outside Bill To', () => {
+  const parsed = textParser.parseInvoiceText([
+    'TAX INVOICE',
+    'Sunrise Agro Products',
+    'GSTIN: 32AAHIJ1234D1ZU',
+    'Bill To: Anandhu Enterprises',
+    'GSTIN: 32AABCT1234G1ZX',
+    'Invoice No: INV-2026-11-001',
+    'Invoice Date: 11-Nov-2026',
+    'Taxable Value: 12500.00',
+    'CGST: 832.50',
+    'SGST: 832.50',
+    'Grand Total: 14165.00',
+  ].join('\\n'))
+  assert.equal(parsed.vendor_name, 'Sunrise Agro Products')
+  assert.equal(parsed.vendor_ambiguous, undefined)
+})
+
+test('AI supplier name fills local buyer-block ambiguity only when it is not the buyer', () => {
+  const local = textParser.parseInvoiceText([
+    'TAX INVOICE',
+    'Bill To: Anandhu Enterprises',
+    'GSTIN: 32AABCT1234G1ZX',
+    'Invoice No: INV-2026-11-001',
+  ].join('\\n'))
+  assert.equal(local.vendor_ambiguous, true)
+  const merged = ledger.mergeCandidates(local, { vendor_name: 'Sunrise Agro Products' })
+  assert.equal(merged.vendor_name, 'Sunrise Agro Products')
+  assert.equal(merged.vendor_ambiguous, false)
+  const buyerLeak = ledger.mergeCandidates(local, { vendor_name: 'Anandhu Enterprises' })
+  assert.equal(buyerLeak.vendor_name, null)
+  assert.equal(buyerLeak.vendor_ambiguous, true)
+})
+
 test('a multi-rate bill flattened onto one head resolves to NO rate — never the 0% slab', () => {
   assert.equal(tallyMap.overallGstRatePercent(FLAT_18_28, 'local'), null, '0/0 cannot explain 6,250 of tax')
   assert.equal(tallyMap.overallGstRatePercent(FLAT_5_18, 'local'), null, '0/0 cannot explain 1,665 of tax')
