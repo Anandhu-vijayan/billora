@@ -1065,23 +1065,27 @@ async function processMessage(
   // the invoices.file_object_path unique constraint, a redelivery can never
   // store or queue the same file twice, whatever the retry timing.
   //
-  // §Part-5 Layer 1 (exact-file duplicate prevention): a byte-for-byte resend
-  // arrives under a NEW provider media id, so it gets a NEW object path and slips
-  // past the object-path idempotency above — it would become a second register
-  // row and spend a second (gated) Gemini extraction. We check the stored
-  // SHA-256 over the plaintext bytes against LIVE invoices for this (workspace,
-  // client) BEFORE uploading/queueing: an exact match is acknowledged and skipped
-  // (nothing is lost — the bytes already exist as a row). The lookup is fail-open,
-  // so an error never blocks a legitimate invoice. An early `return;` mirrors the
-  // daily-limit guard below: the intake still settles accepted exactly once.
-  const duplicateFileInvoiceId = await findLiveInvoiceByFileHash(db, {
+  // Exact-file deduplication is status-aware. Keep the duplicate guard, but do
+  // not tell customers that nothing was lost when the original row is failed,
+  // awaiting review, or not yet included in a register.
+  const duplicateFileInvoice = await findLiveInvoiceByFileHash(db, {
     workspaceId, clientId, fileSha256Hex: sha256Hex,
   });
-  if (duplicateFileInvoiceId) {
+  if (duplicateFileInvoice) {
     logger.info('[WhatsApp] exact-file duplicate skipped at intake', {
-      shortId, invoiceId: duplicateFileInvoiceId.slice(0, 8),
+      shortId, invoiceId: duplicateFileInvoice.id.slice(0, 8),
+      status: duplicateFileInvoice.status, hasBatch: !!duplicateFileInvoice.batchId,
     });
-    await sendText(message.from, 'I already received that exact file, so I did not add it again — nothing was lost. Send a different invoice anytime, or type Done / Menu.');
+    const duplicateReply = duplicateFileInvoice.status === 'needs_review'
+      ? 'I already received this exact file, so I did not create a duplicate. It still needs your review — send Review to correct or approve it.'
+      : duplicateFileInvoice.status === 'failed'
+        ? 'I already received this exact file, but its previous processing attempt failed. I have not created a duplicate. Please contact support with this message so the existing record can be recovered safely.'
+        : duplicateFileInvoice.status === 'received' || duplicateFileInvoice.status === 'queued' || duplicateFileInvoice.status === 'processing'
+          ? 'I already received this exact file and it is still in the processing queue. I did not create a duplicate. Send Done later to check the register.'
+          : duplicateFileInvoice.status === 'completed'
+            ? 'I already received and processed this exact file, so I did not add it again. If it is missing from your Excel register, send Done to refresh the register; otherwise you can send a different invoice.'
+            : 'I already received this exact file, so I did not add it again. Send Done to check your register.';
+    await sendText(message.from, duplicateReply);
     return;
   }
   const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
