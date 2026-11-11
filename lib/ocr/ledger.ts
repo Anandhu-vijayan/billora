@@ -415,7 +415,18 @@ export function mergeCandidates(
   const fallbackVendor = typeof fallback?.vendor_name === 'string' ? fallback.vendor_name.trim() : ''
   const primaryIsBuyer = !!primaryVendor && buyerNames.includes(normalizeVendor(primaryVendor))
   const fallbackIsBuyer = !!fallbackVendor && buyerNames.includes(normalizeVendor(fallbackVendor))
-  if (primary.vendor_ambiguous || primaryIsBuyer || fallbackIsBuyer) {
+  // A local parser may mark the supplier ambiguous simply because it
+  // correctly found a buyer block but could not classify the seller header.
+  // That is NOT evidence that a separately read AI supplier is the buyer.
+  // Reject only an actual name collision with the buyer region; otherwise allow
+  // a non-placeholder AI supplier to fill the missing local field.
+  if (primaryIsBuyer || fallbackIsBuyer) {
+    merged.vendor_name = null
+    merged.vendor_ambiguous = true
+  } else if (primary.vendor_ambiguous && isValidVendorName(fallbackVendor)) {
+    merged.vendor_name = fallbackVendor
+    merged.vendor_ambiguous = false
+  } else if (primary.vendor_ambiguous) {
     merged.vendor_name = null
     merged.vendor_ambiguous = true
   } else {
