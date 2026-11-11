@@ -29,7 +29,7 @@ const serverSchema = z.object({
   WHATSAPP_APP_SECRET: z.string().min(1).optional(),
   WHATSAPP_ACCESS_TOKEN: z.string().min(1).optional(),
   WHATSAPP_PHONE_NUMBER_ID: z.string().min(1).optional(),
-  WHATSAPP_GRAPH_VERSION: z.string().min(1).default('v21.0'),
+  WHATSAPP_GRAPH_VERSION: z.string().min(1).default('v25.0'),
   // ABUSE / PROVIDER-QUOTA GUARD. Max NEW invoices one workspace may file per
   // UTC day at the WhatsApp intake. Bounds runaway Gemini/storage/OCR cost from
   // a spamming sender. Set 0 to disable the cap entirely.
