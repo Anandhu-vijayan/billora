@@ -93,8 +93,8 @@ test('V4 genuine problems are still rejected', () => {
 test('V5 the prompt tells the model the tax regime rule so absent heads come back as explicit 0', () => {
   assert.match(src, /EITHER IGST OR CGST\+SGST/)
   assert.match(src, /return 0 for cgst_amount and sgst_amount/)
-  assert.match(src, /item table explicitly prints the GST rate, taxable value and tax amounts/)
-  assert.match(src, /GROUP rows by the exact printed rate AND treatment/)
+  assert.ok(src.includes("'the GST rate, taxable value and tax amounts for individual item rows.'"))
+  assert.ok(src.includes('GROUP rows') && src.includes('SUM ONLY the printed taxable'))
   assert.match(src, /never calculate a tax amount, infer a rate/)
 })
 
