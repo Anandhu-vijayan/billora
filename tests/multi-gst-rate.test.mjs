@@ -158,7 +158,7 @@ test('AI supplier name fills local buyer-block ambiguity only when it is not the
 
 test('INV-2026-11-001 item-level 5% + 18% slices reconcile without flattening', () => {
   const ev = ledger.evaluateLedger({
-    invoice_date: '11/11/2026',
+    invoice_date: '05/10/2026',
     invoice_number: 'INV-2026-11-001',
     vendor_name: 'Sunrise Agro Products',
     supplier_gstin: '32AAHIJ1234D1ZU',
