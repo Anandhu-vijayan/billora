@@ -837,6 +837,20 @@ export function evaluateLedger(
   const derivedSlices = deriveSlicesFromInvoiceHeads(row)
   const candidateSlices = explicitSlices ?? derivedSlices
   let breakdownValidated: boolean | null = null
+
+  // An explicitly reported 0% invoice-level rate cannot explain a positive tax
+  // amount. If no rate-wise evidence exists to resolve the actual slab(s), keep
+  // the row in review instead of approving it with an unclassified tax breakdown.
+  // A validated item-level/summary tax_slices list takes precedence because it
+  // supplies the missing rate evidence and is checked against every invoice head.
+  const zeroRateWithPositiveTax =
+    (row.cgst_rate_percent === 0 && (moneyToMinorUnits(row.cgst_amount) ?? BigInt(0)) > BigInt(0))
+    || (row.sgst_rate_percent === 0 && (moneyToMinorUnits(row.sgst_amount) ?? BigInt(0)) > BigInt(0))
+    || (row.igst_rate_percent === 0 && (moneyToMinorUnits(row.igst_amount) ?? BigInt(0)) > BigInt(0))
+  if (!candidateSlices && zeroRateWithPositiveTax) {
+    reasons.push(MIXED_GST_REASONS.rateUnresolved)
+  }
+
   if (candidateSlices && candidateSlices.length > 0) {
     const tolMinor = BigInt(Math.max(0, Math.trunc(opts.amountToleranceMinorUnits ?? 101)))
     const mixed = explicitSlices !== null && distinctTaxRates(explicitSlices).length >= 2
