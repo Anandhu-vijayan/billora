@@ -135,7 +135,7 @@ test('PDF text parser recognises an unlabelled Products seller header outside Bi
     'CGST: 832.50',
     'SGST: 832.50',
     'Grand Total: 14165.00',
-  ].join('\\n'))
+  ].join('\n'))
   assert.equal(parsed.vendor_name, 'Sunrise Agro Products')
   assert.equal(parsed.vendor_ambiguous, undefined)
 })
@@ -146,7 +146,7 @@ test('AI supplier name fills local buyer-block ambiguity only when it is not the
     'Bill To: Anandhu Enterprises',
     'GSTIN: 32AABCT1234G1ZX',
     'Invoice No: INV-2026-11-001',
-  ].join('\\n'))
+  ].join('\n'))
   assert.equal(local.vendor_ambiguous, true)
   const merged = ledger.mergeCandidates(local, { vendor_name: 'Sunrise Agro Products' })
   assert.equal(merged.vendor_name, 'Sunrise Agro Products')
