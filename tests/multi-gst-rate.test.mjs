@@ -633,7 +633,7 @@ test('the vision schema ASKS for the printed rate-wise breakdown, and keeps it o
   assert.match(src, /tax_slices: \{ type: Type\.ARRAY/, 'the flat heads cannot carry a slab split, so the schema must request one')
   assert.match(src, /RATE-WISE BREAKDOWN/)
   assert.match(src, /never split the invoice into multiple invoice rows/, 'one invoice remains one register row')
-  assert.match(src, /GROUP rows by the exact printed rate AND treatment/, 'explicit item-level evidence is grouped by slab')
+  assert.ok(src.includes("'by the exact printed rate AND treatment, and SUM ONLY the printed taxable'"), 'explicit item-level evidence is grouped by slab')
   assert.match(src, /Return an EMPTY array when neither a printed summary nor complete item-level/, 'missing evidence remains unknown')
   // OPTIONAL, never required: a single-rate bill or a model that omits the key must
   // still be a valid response, not a permanent job failure over missing metadata.
