@@ -238,8 +238,9 @@ test('evaluateLedger leaves an unevidenced multi-rate bill with NO breakdown on 
   assert.ok(!ev.row.tax_slices, 'the row carries no invented rate-wise breakdown')
   assert.equal(slices.normalizeSlices(ev.row.tax_slices) ?? slices.deriveSlicesFromInvoiceHeads(ev.row), null,
     'what build-register resolves for display is NOTHING — blank per-rate cells')
-  assert.ok(!ev.reasons.some((r) => Object.values(R).some((k) => r.startsWith(k))),
-    `no mixed-gst reasons without explicit slices: ${ev.reasons.join(',')}`)
+  assert.equal(ev.review, 'needs_review', 'explicit 0% heads cannot approve positive tax without a rate-wise breakdown')
+  assert.ok(ev.reasons.includes(R.rateUnresolved), ev.reasons.join(','))
+  assert.ok(!ev.reasons.includes(R.breakdownMissing), 'do not claim a mixed breakdown was read when none was supplied')
   // Amounts are never rewritten to make a slab fit.
   assert.equal(ev.row.taxable_value, 25000)
   assert.equal(ev.row.cgst_amount, 3125)
