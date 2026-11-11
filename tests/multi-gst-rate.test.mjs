@@ -156,6 +156,36 @@ test('AI supplier name fills local buyer-block ambiguity only when it is not the
   assert.equal(buyerLeak.vendor_ambiguous, true)
 })
 
+test('INV-2026-11-001 item-level 5% + 18% slices reconcile without flattening', () => {
+  const ev = ledger.evaluateLedger({
+    invoice_date: '11/11/2026',
+    invoice_number: 'INV-2026-11-001',
+    vendor_name: 'Sunrise Agro Products',
+    supplier_gstin: '32AAHIJ1234D1ZU',
+    taxable_value: 12500,
+    cgst_amount: 832.5,
+    sgst_amount: 832.5,
+    igst_amount: 0,
+    total_amount: 14165,
+    cgst_rate_percent: 0,
+    sgst_rate_percent: 0,
+    tax_slices: [
+      slice({ rate_percent: 5, taxable_value: 4500, cgst_amount: 112.5, sgst_amount: 112.5, treatment: 'local', provenance: 'item-level' }),
+      slice({ rate_percent: 18, taxable_value: 8000, cgst_amount: 720, sgst_amount: 720, treatment: 'local', provenance: 'item-level' }),
+    ],
+  }, { minConfidence: 0.8, now: NOW })
+  assert.equal(ev.review, 'approved', ev.reasons.join(','))
+  assert.equal(ev.breakdownValidated, true, ev.reasons.join(','))
+  assert.deepEqual(ev.row.tax_slices.map((x) => [x.rate_percent, x.taxable_value, x.cgst_amount, x.sgst_amount]), [
+    [5, 4500, 112.5, 112.5],
+    [18, 8000, 720, 720],
+  ])
+  assert.equal(ev.row.taxable_value, 12500)
+  assert.equal(ev.row.cgst_amount, 832.5)
+  assert.equal(ev.row.sgst_amount, 832.5)
+  assert.equal(ev.row.total_amount, 14165)
+})
+
 test('a multi-rate bill flattened onto one head resolves to NO rate — never the 0% slab', () => {
   assert.equal(tallyMap.overallGstRatePercent(FLAT_18_28, 'local'), null, '0/0 cannot explain 6,250 of tax')
   assert.equal(tallyMap.overallGstRatePercent(FLAT_5_18, 'local'), null, '0/0 cannot explain 1,665 of tax')
@@ -602,8 +632,9 @@ test('the vision schema ASKS for the printed rate-wise breakdown, and keeps it o
   const src = readFileSync(new URL('../lib/ocr/vision.ts', import.meta.url), 'utf8')
   assert.match(src, /tax_slices: \{ type: Type\.ARRAY/, 'the flat heads cannot carry a slab split, so the schema must request one')
   assert.match(src, /RATE-WISE BREAKDOWN/)
-  assert.match(src, /never split a single-rate invoice/, 'the model may only COPY a printed summary')
-  assert.match(src, /Return an EMPTY array when there is no printed rate-wise summary/)
+  assert.match(src, /never split the invoice into multiple invoice rows/, 'one invoice remains one register row')
+  assert.match(src, /GROUP rows by the exact printed rate AND treatment/, 'explicit item-level evidence is grouped by slab')
+  assert.match(src, /Return an EMPTY array when neither a printed summary nor complete item-level/, 'missing evidence remains unknown')
   // OPTIONAL, never required: a single-rate bill or a model that omits the key must
   // still be a valid response, not a permanent job failure over missing metadata.
   const body = src.slice(src.indexOf('const LEDGER_SCHEMA'))
