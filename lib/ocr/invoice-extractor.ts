@@ -696,7 +696,9 @@ async function extractLocal(
         // forced to review, so a joined heading region is only ever advisory.
         return {
           candidate: combined.candidate,
-          pagesProcessed: 0,
+          // Embedded text was extracted and parsed from every inspected page;
+          // zero here used to misleadingly look like a failed local OCR pass.
+          pagesProcessed: pagesText.length,
           multiInvoiceDetected: combined.multiInvoiceDetected,
           text: meaningfulPages.join('\n'),
           grandTotalCrop: null,
