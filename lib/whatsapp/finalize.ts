@@ -231,11 +231,11 @@ async function countJobs(db: Db, workspaceId: string, jobType: string, statuses:
 }
 
 /**
- * Re-affirm that every batch holding this workspace's invoices has a live
- * register job. Idempotent: terminal (completed/failed) register rows are freed
- * so a rebuilt batch re-queues, while a job already queued/processing is left
- * alone (the partial unique index would reject a duplicate anyway). Called on
- * Done so a batch whose earlier register ran before a sibling settled is rebuilt.
+ * Re-affirm that every batch holding this workspace's invoices has a queued
+ * register job. A currently processing job does NOT suppress a queued follow-up:
+ * it may have taken its source snapshot before a late extraction joined the batch.
+ * The claim RPC serializes the follow-up behind the current build. Called on Done
+ * as an additional recovery path for batches whose earlier register ran early.
  */
 export async function ensureBatchRegisters(db: Db, workspaceId: string, scope?: DeliveryScope): Promise<number> {
   const { data: rows, error } = await db
@@ -250,15 +250,15 @@ export async function ensureBatchRegisters(db: Db, workspaceId: string, scope?: 
   }
   let scheduled = 0
   for (const batchId of batchIds) {
-    await db.from('processing_jobs').delete()
-      .eq('workspace_id', workspaceId).eq('batch_id', batchId)
-      .eq('job_type', 'register_generation').in('status', ['completed', 'failed'])
-    const { data: live } = await db
+    // A queued job already guarantees a follow-up. A processing job does not:
+    // retain one queued rebuild behind it in case its build snapshot predates
+    // an invoice that has just joined this batch.
+    const { data: queued } = await db
       .from('processing_jobs').select('id')
       .eq('workspace_id', workspaceId).eq('batch_id', batchId)
-      .eq('job_type', 'register_generation').in('status', ['queued', 'processing'])
+      .eq('job_type', 'register_generation').eq('status', 'queued')
       .limit(1)
-    if ((live ?? []).length > 0) continue
+    if ((queued ?? []).length > 0) continue
     const { error: insErr } = await db.from('processing_jobs').insert({
       workspace_id: workspaceId, batch_id: batchId, invoice_id: null,
       job_type: 'register_generation', status: 'queued', max_attempts: 12,
