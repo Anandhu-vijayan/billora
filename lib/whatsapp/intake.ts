@@ -227,7 +227,9 @@ export async function isDailyIntakeLimitReached(
  * (status <> 'deleted') short-circuits. Tenant-scoped: an organization matches
  * within its own client; an individual (null client_id) matches null-client rows.
  *
- * Returns the matching invoice id, or null when there is no live duplicate.
+ * Returns the matching invoice's id, status and batch association, or null
+ * when there is no live duplicate. This lets callers distinguish an already
+ * exported invoice from one that is pending, failed, or still needs review.
  */
 export interface LiveFileDuplicate {
   id: string
