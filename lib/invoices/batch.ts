@@ -13,9 +13,11 @@
 //     stays unbatched and visible in review instead of being filed in a guessed month.
 //   * Batches are scoped to the invoice's OWN client + workspace, so an organization
 //     can never mix two clients in one workbook.
-//   * Every step is idempotent: retries, duplicate webhooks and concurrent workers
-//     reuse the same batch and never create a second register job (the DB partial
-//     unique index on (batch_id, job_type) collapses a racing insert to a no-op).
+//   * Register scheduling is coalesced, not lossy: at most one queued follow-up
+//     exists per batch. A new invoice may enqueue that follow-up WHILE a register
+//     is processing, so a build that started from an earlier membership snapshot
+//     cannot suppress the rebuild for a late-finishing extraction. The DB claim
+//     function prevents the follow-up from running until the current build settles.
 //
 // Type-only external imports keep this module in-process testable (the test
 // harness transpiles a single file and cannot resolve runtime `@/` imports).
@@ -46,16 +48,13 @@ export function monthBounds(dateIso: string): { start: string; end: string } {
 }
 
 /**
- * Schedule the batch's register workbook job. Scheduling is UNCONDITIONAL and
- * deduped (the partial unique index keeps at most one live register job per
- * batch), which avoids a multi-worker race: gating the enqueue on "no sibling
- * still processing" can deadlock when two extractions finish concurrently and
- * each observes the other as still in flight, so neither ever schedules.
- * Readiness ("build only once the batch quiesces") is enforced instead in
- * build_register, which requeues while any sibling extraction is outstanding.
- * We free the dedup slot of any terminal register row so a later re-run (for
- * example a second invoice approved after the first workbook shipped) can
- * re-enqueue; a concurrent 23505 is a benign no-op (a live job already exists).
+ * Schedule the batch's register workbook job. At most one QUEUED job is allowed
+ * per batch. If a register is already PROCESSING, we still insert one queued
+ * follow-up: an invoice extraction can join the batch after the current build
+ * took its membership snapshot, and suppressing that enqueue would permanently
+ * omit the late invoice. The claim RPC serializes register jobs per batch, so
+ * this follow-up cannot run until the current build settles. A concurrent 23505
+ * means another caller already created the queued follow-up and is a safe no-op.
  */
 export async function enqueueRegisterGeneration(
   db: Db,
@@ -64,18 +63,16 @@ export async function enqueueRegisterGeneration(
   assertLease?: () => Promise<void>,
 ): Promise<void> {
   await assertLease?.()
-  await db.from('processing_jobs')
-    .delete()
-    .eq('workspace_id', workspaceId)
-    .eq('batch_id', batchId)
-    .eq('job_type', 'register_generation')
-    .in('status', ['completed', 'failed'])
-  const { data: live } = await db
+  // Only a queued job occupies the coalescing slot. A processing job is NOT a
+  // reason to skip this insert: it may be building from a snapshot taken before
+  // this invoice joined the batch. The queued-only unique index permits exactly
+  // one follow-up while the claim RPC prevents overlapping builds.
+  const { data: queued } = await db
     .from('processing_jobs').select('id')
     .eq('workspace_id', workspaceId).eq('batch_id', batchId)
-    .eq('job_type', 'register_generation').in('status', ['queued', 'processing'])
+    .eq('job_type', 'register_generation').eq('status', 'queued')
     .limit(1)
-  if ((live ?? []).length > 0) return
+  if ((queued ?? []).length > 0) return
   await assertLease?.()
   // A generous attempt budget: readiness requeues are expected while siblings
   // are still extracting, and must not exhaust into a settled-failed register.
