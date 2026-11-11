@@ -1,6 +1,6 @@
 # Billora
 
-Billora is an invoice operations application built with Next.js and Supabase. The repository currently contains the web foundation and the initial Supabase schema. Authentication, workspace screens, invoice upload, and processing workers are not implemented yet; do not deploy it as a working invoice service until those workflows and their security controls are complete.
+Billora is a WhatsApp-first invoice-to-Excel service built with Next.js, Supabase/Postgres, private object storage, and durable database-backed processing jobs. It accepts invoice PDFs and images, extracts and validates invoice fields, supports human review, and generates monthly workbooks. The repository includes OCR, encryption, WhatsApp intake, worker, delivery, and workspace-scoped data-access code. A passing CI build is not a production security or compliance certification; use the release gates below before onboarding real customers.
 
 ## Requirements
 
@@ -30,26 +30,15 @@ app/
   lib/supabase/admin.ts          # lazy service_role client (server only)
   lib/supabase/server.ts         # back-compat re-export (lazy Proxy)
   lib/supabase/client.ts         # browser client (publishable key only)
-proxy.ts                       # request id + basic in-memory /api rate limiting
+proxy.ts                       # request id + shared Redis REST rate limiting in production
 scripts/smoke.mjs                # `npm run smoke` — hits both health endpoints
 scripts/secret-scan.mjs          # `npm run secret-scan` — blocks secret-looking staged diffs
 supabase/migrations/             # workspace-scoped schema + RLS (source of truth)
 ```
 
-## WhatsApp onboarding V1 (Phase 1)
+## WhatsApp invoice intake and processing
 
-Flow: `Hi` → Individual / Organization buttons → (org: name → client list / add client) → collecting.
-No document-type question in V1 — classification is automatic in a later phase.
-
-### Implemented commands
-- `Help` — state-aware help text, no state change.
-- `Cancel` — resets to `cancelled`; `Hi` restarts.
-
-### Deferred to next phase
-- `Done` — ends the current batch (needs batch lifecycle).
-- `Change client` / `Add client` as mid-collection commands — add-client only exists inside onboarding.
-- `Change type` — obsolete in V1 (no manual document types).
-- Media→batch linking (media still uploads via the existing pipeline; batch linkage is Phase 2).
+The current flow supports Individual and Organization workspaces, client selection, batch assignment, invoice PDF/image intake, exact-file duplicate detection, `Done`, `Review`, review editing/approval, register generation, and workbook delivery. The conversation and job state is persisted in Supabase so webhook retries and worker restarts do not rely on process memory. Check the conversation and migration code before changing commands or lifecycle rules; older phase notes in commit history may be obsolete.
 
 ### Manual migration (do NOT auto-apply)
 1. Review `supabase/migrations/20261010120000_whatsapp_onboarding_v1.sql`.
@@ -119,8 +108,9 @@ auto-approved only when every check passes:
 When the AI read fails a re-readable check (checksum, arithmetic, swapped
 parties, date), the handler makes **one** targeted second AI call that names the
 failed checks, adopts it only if it is strictly better, and skips it when the
-first call was slow. Not yet built (see notes below): image-quality gating,
-per-workspace AI consent, and a calibration set of real invoices.
+first call was slow. Raster image-quality gating is implemented. Per-workspace
+AI consent and a representative, labelled real-invoice calibration corpus remain
+outstanding; the operator-level AI flag is not a substitute for customer consent.
 
 Extraction accuracy against real Indian invoices is **not yet certified**; the
 deterministic parsing and review logic are unit-tested, but OCR/render quality
@@ -130,7 +120,7 @@ must still be validated on representative documents before production use.
 
 - `npm run lint` runs ESLint.
 - `npm run typecheck` runs the TypeScript compiler without emitting files.
-- `npm test` runs the zero-dependency onboarding contract tests (`node --test`).
+- `npm test` runs the invoice, OCR, deduplication, workbook, delivery, and security source-contract regression suite.
 - `npm run secret-scan` fails on secret-looking staged diffs.
 - `npm run check` runs secret-scan, lint, and typecheck.
 - `npm run build` creates an optimized production build.
@@ -144,7 +134,7 @@ must still be validated on representative documents before production use.
 - Zod-validated env at request time (`lib/env.ts`); one clear error instead of `supabaseUrl is required` crashes.
 - Lazy Supabase admin client; no secrets in browser bundles, no `NEXT_PUBLIC_` secrets.
 - Generic API error envelope; logs carry `x-request-id`, secrets auto-redacted by `lib/logger.ts`.
-- Security headers in `next.config.ts` (+ CSP and HSTS in production), `proxy.ts` rate-limits `/api/*` (60 req/min/IP, in-memory — use Redis/Upstash for multi-instance prod).
+- Security headers in `next.config.ts` (+ CSP and HSTS in production). `proxy.ts` uses an atomic Redis REST counter and HMAC-pseudonymised client-IP keys in production; configure `RATE_LIMIT_REDIS_REST_URL`, `RATE_LIMIT_REDIS_REST_TOKEN`, and `RATE_LIMIT_HMAC_KEY`. Production non-exempt API requests fail closed with 503 if the shared limiter is unavailable. The signed WhatsApp webhook and secret-protected worker have separate authentication controls.
 - `robots.ts` disallows indexing; error boundaries never render internals.
 - CI runs secret-scan + lint + typecheck + build; build uses placeholder public env only.
 
@@ -154,17 +144,22 @@ The initial migration is in `supabase/migrations`. It defines workspace-scoped r
 
 `supabase/config.toml` points its seed path at `./seed.sql`, which is intentionally absent — `supabase db reset` will warn but still work. Add a `supabase/seed.sql` with non-sensitive fixture rows if you want deterministic local resets.
 
-The schema expects invoice content to be encrypted by a trusted server or worker before storage. Key management, upload validation, retention enforcement, job execution, backups, and restore procedures are not implemented in this repository.
+Application-level AES-256-GCM encryption, upload validation, and database-backed job execution are implemented in the application code. Managed KMS integration and tested key rotation, retention/deletion enforcement, backup/restore drills, and a full operational audit are not established by the repository alone. Configure and verify the live Supabase project and hosting platform separately.
 
 ## Deployment gate
 
-Before serving real users or financial documents:
+Before opening general commercial access, complete and evidence these release gates:
 
-- Implement and test sign-in, session handling, workspace authorization, and account recovery.
-- Add authenticated invoice upload and processing paths with strict size/type validation, malware scanning, rate limits, and private object access.
-- Verify RLS behavior with tests for cross-workspace access and role changes.
-- Establish encryption-key storage and rotation, retention/deletion jobs, audit logging, monitoring, and backup/restore drills.
-- Configure production environment variables, HTTPS, Supabase redirect allow-lists, email delivery, and operational alerting.
-- Add end-to-end tests for critical user and data-isolation workflows.
+- Run end-to-end tests for five-file batches, concurrent webhook redelivery, simultaneous workers, worker crashes, stale leases, and register follow-up rebuilds against real PostgreSQL.
+- Add atomic webhook-event leases/claims; current insert-or-read intake is idempotent downstream but does not itself provide an exclusive processing lease for simultaneous deliveries.
+- Complete an endpoint-by-endpoint authorization review, including every service-role query, workspace membership/role changes, object access, and signed download lifecycle.
+- Implement and test retention/deletion across source files, extracted payloads, workbooks, logs, and backups; the presence of `retention_expires_at` alone does not enforce deletion.
+- Add per-workspace AI-processing consent and document Gemini/Supabase/Meta/hosting subprocessors, processing regions, retention and contract terms.
+- Publish legally reviewed Privacy Policy, Terms, and (for accounting-firm customers) Data Processing Agreement; establish rights/grievance handling and an incident-response process.
+- Assess DPDP Act/Rules and CERT-In applicability with Indian counsel; implement the required security logging, incident reporting and point-of-contact controls where applicable.
+- Configure Redis REST rate-limiter secrets in production, verify its outage behavior, and load-test rate limits and worker/provider concurrency.
+- Establish global worker/Gemini concurrency budgets, queue-age alerts, central monitoring, key rotation, backup verification and restore drills.
+- Verify production environment variables, HTTPS, Supabase redirect allow-lists, email delivery, storage bucket privacy, database region, and operational alerting.
+- Run a real representative invoice corpus evaluation. OCR unit tests do not certify extraction accuracy on unseen customer documents.
 
 The app sets baseline response security headers and does not expose stack traces in its error pages. Review headers and the platform configuration together before deployment; security headers alone do not replace authentication, authorization, or application-specific content security policy.
