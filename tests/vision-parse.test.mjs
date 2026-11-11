@@ -93,6 +93,9 @@ test('V4 genuine problems are still rejected', () => {
 test('V5 the prompt tells the model the tax regime rule so absent heads come back as explicit 0', () => {
   assert.match(src, /EITHER IGST OR CGST\+SGST/)
   assert.match(src, /return 0 for cgst_amount and sgst_amount/)
+  assert.match(src, /item table explicitly prints the GST rate, taxable value and tax amounts/)
+  assert.match(src, /GROUP rows by the exact printed rate AND treatment/)
+  assert.match(src, /never calculate a tax amount, infer a rate/)
 })
 
 test('V5 amount strings preserve decimal points and vendor extraction excludes buyer/header spillover', () => {
