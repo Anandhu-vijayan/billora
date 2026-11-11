@@ -172,7 +172,7 @@ test('DP-wire: route skips + acks an exact-file duplicate BEFORE upload/queue', 
   assert.ok(callIdx < uploadIdx, 'the duplicate check precedes the storage upload')
   assert.ok(callIdx < jobIdx, 'the duplicate check precedes the extraction-job insert')
   // a confirmed duplicate sends one ack and returns without filing a second row
-  assert.match(src, /if \(duplicateFileInvoiceId\)[\s\S]*?await sendText[\s\S]*?return;/)
+  assert.match(src, /if \(duplicateFileInvoice\)[\s\S]*?await sendText[\s\S]*?return;/)
 })
 
 test('DP-wire: extraction folds a possible-duplicate ADDITIVELY and writes the key fail-soft', () => {
