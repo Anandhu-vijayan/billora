@@ -256,3 +256,16 @@ test('DR-schema: duplicate_reviews migration is additive, tenant-scoped, and rea
     'writes stay service-role only')
   assert.doesNotMatch(src, /to anon\b/, 'anon gains nothing')
 })
+
+test('DP-wire: exact-file duplicate acknowledgement reports the existing invoice state', () => {
+  const intake = intakeSrc()
+  const route = routeSrc()
+  assert.match(intake, /\.select\('id,status,batch_id'\)/, 'duplicate lookup returns status and batch association')
+  assert.match(route, /duplicateFileInvoice\.status === 'needs_review'/, 'review-required duplicates are directed to Review')
+  assert.match(route, /duplicateFileInvoice\.status === 'failed'/, 'failed duplicates are not described as safely processed')
+  assert.match(route, /duplicateFileInvoice\.status === 'completed'[\s\S]*?send Done to refresh the register/,
+    'completed duplicates offer the existing register-recovery path')
+  assert.match(route, /duplicateFileInvoice\.status === 'received' \|\| duplicateFileInvoice\.status === 'queued' \|\| duplicateFileInvoice\.status === 'processing'/,
+    'in-flight duplicates are described as still processing')
+  assert.doesNotMatch(route, /nothing was lost\./, 'never claim an invoice is safe solely because its row exists')
+})
