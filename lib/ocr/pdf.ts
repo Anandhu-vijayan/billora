@@ -17,6 +17,7 @@
 // by source-contract tests, while its parsing output (text-parser.ts) is unit
 // tested directly.
 import { createRequire } from 'node:module'
+import { reconstructPdfText } from './pdf-text-layout'
 
 const PDFJS_LEGACY = 'pdfjs-dist/legacy/build/pdf.mjs'
 const CANVAS_PKG = '@napi-rs/canvas'
@@ -29,7 +30,7 @@ interface PdfDoc {
   getPage: (n: number) => Promise<PdfPage>
   destroy?: () => Promise<void>
 }
-interface PdfTextItem { str: string }
+interface PdfTextItem { str: string; transform?: number[]; width?: number; height?: number }
 interface PdfPage {
   getTextContent: () => Promise<{ items: PdfTextItem[] }>
   getViewport: (opts: { scale: number }) => { width: number; height: number }
@@ -112,7 +113,7 @@ export async function extractPdfTextLayerPages(
     for (let n = 1; n <= Math.min(doc.numPages, maxPages); n += 1) {
       const page = await doc.getPage(n)
       const content = await page.getTextContent()
-      chunks.push(content.items.map((it) => it.str).join('\n'))
+      chunks.push(reconstructPdfText(content.items))
     }
     return chunks
   } finally {
