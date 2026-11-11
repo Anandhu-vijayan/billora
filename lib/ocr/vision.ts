@@ -154,15 +154,21 @@ const VISION_PROMPT = [
   // through them — without tax_slices such a bill degrades to one unexplained
   // slab. Ask for it explicitly, with the same never-guess rule as everything
   // else on this page.
-  'RATE-WISE BREAKDOWN: if the document PRINTS a rate-wise / slab-wise tax summary',
-  '(a table or block grouping the taxable value and the tax amounts by GST rate,',
-  'e.g. "18% 7,500.00 675.00 675.00"), return tax_slices with ONE entry per',
-  'printed rate line: rate_percent and the amounts as decimal strings copied',
-  'exactly from the document, treatment',
-  '"local" when that row prints CGST and SGST and "interstate" when it prints',
-  'IGST. Copy those rows exactly — never split a single-rate invoice, never',
-  'derive a slab from an item line, never compute an amount the document does',
-  'not print. Return an EMPTY array when there is no printed rate-wise summary.',
+  'RATE-WISE BREAKDOWN: return tax_slices when EITHER (A) the document prints a',
+  'rate-wise / slab-wise tax summary, OR (B) its item table explicitly prints',
+  'the GST rate, taxable value and tax amounts for individual item rows.',
+  'For a summary, copy one printed rate row. For item-level evidence, GROUP rows',
+  'by the exact printed rate AND treatment, and SUM ONLY the printed taxable',
+  'values and printed CGST/SGST/IGST amounts in each group. This is aggregation',
+  'of printed figures, not inference: never calculate a tax amount, infer a rate',
+  'from an amount, or assign a rate that is not printed on that item row.',
+  'Return one slice per distinct rate/treatment with rate_percent, taxable_value,',
+  'and the printed tax heads as decimal strings; use treatment "local" when the',
+  'rows print CGST and SGST, and "interstate" when they print IGST.',
+  'Do NOT create slices if any required item-row rate/value/tax linkage is unclear,',
+  'if the table is unreadable, or if figures cannot be confidently assigned.',
+  'Return an EMPTY array when neither a printed summary nor complete item-level',
+  'rate/tax evidence exists. Never split the invoice into multiple invoice rows.',
 ].join(' ')
 
 const confidenceSchema = {
