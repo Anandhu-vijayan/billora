@@ -170,7 +170,7 @@ const VENDOR_SUFFIX =
  * widening the vocabulary cannot turn a table row into a supplier name.
  */
 const VENDOR_SUFFIX_WEAK =
-  /\b(supplies|associates|agencies|merchants|distributors|ventures|industries)\b/i
+  /\b(supplies|products|associates|agencies|merchants|distributors|ventures|industries)\b/i
 const VENDOR_LABEL = /\b(supplier|seller|vendor|from|billed by|invoice from|sold by)\b/i
 // Footer/signatory declarations are not supplier names. Examples: "For Supplier",
 // "For Seller", "For and on behalf of Blue Ridge Industries", and signature lines.
