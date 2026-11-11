@@ -229,15 +229,27 @@ export async function isDailyIntakeLimitReached(
  *
  * Returns the matching invoice id, or null when there is no live duplicate.
  */
+export interface LiveFileDuplicate {
+  id: string
+  status: 'received' | 'queued' | 'processing' | 'needs_review' | 'completed' | 'failed' | 'deleted'
+  batchId: string | null
+}
+
+/**
+ * Layer 1 of duplicate prevention: find the exact same live file in this
+ * workspace/client. Return its processing state as well as its id so the
+ * WhatsApp acknowledgement never claims an unexported invoice was "not lost".
+ * Lookup errors remain fail-open: a real invoice must never be blocked.
+ */
 export async function findLiveInvoiceByFileHash(
   db: Db,
   args: { workspaceId: string; clientId: string | null; fileSha256Hex: string },
-): Promise<string | null> {
+): Promise<LiveFileDuplicate | null> {
   if (!args.fileSha256Hex) return null
   try {
     let query = db
       .from('invoices')
-      .select('id')
+      .select('id,status,batch_id')
       .eq('workspace_id', args.workspaceId)
       .eq('file_sha256', `\\x${args.fileSha256Hex}`)
       .neq('status', 'deleted')
@@ -246,15 +258,17 @@ export async function findLiveInvoiceByFileHash(
       ? (query.eq('client_id', args.clientId) as typeof query)
       : (query.is('client_id', null) as typeof query)
     const { data, error } = await (query as unknown as {
-      maybeSingle: () => Promise<{ data: { id: string } | null; error: { message: string } | null }>
+      maybeSingle: () => Promise<{
+        data: { id: string; status: LiveFileDuplicate['status']; batch_id: string | null } | null
+        error: { message: string } | null
+      }>
     }).maybeSingle()
     if (error) {
       logger.warn('[Intake] exact-file duplicate lookup failed; proceeding (fail-open)', { code: error.message.slice(0, 80) })
       return null
     }
-    return data?.id ?? null
+    return data ? { id: data.id, status: data.status, batchId: data.batch_id } : null
   } catch (e) {
-    // Any unexpected throw still must not lose a real invoice.
     logger.warn('[Intake] exact-file duplicate lookup threw; proceeding (fail-open)', { error: e instanceof Error ? e.message : String(e) })
     return null
   }
