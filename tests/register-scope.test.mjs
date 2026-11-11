@@ -95,3 +95,25 @@ test('RS7 the register-scope migration is additive, forward-only, service-role s
   assert.ok(!/drop\s+(column|table|index)/i.test(executable), 'never destructive')
   assert.ok(!/\bgrant\b/i.test(executable), 'grants nothing new — no widened RLS surface')
 })
+
+
+test('RS8 a late invoice cannot be lost while its batch register is processing', () => {
+  const batch = batchSrc()
+  const finalize = finalizeSrc()
+  const queueMigration = src('../supabase/migrations/20261111100000_register_job_followup.sql')
+  const executable = queueMigration.split('\\n').filter((l) => !l.trim().startsWith('--')).join('\\n')
+
+  // Producers coalesce only queued work. A processing register must allow one
+  // queued follow-up rather than swallowing the late invoice's rebuild request.
+  assert.ok(batch.includes(".eq('job_type', 'register_generation').eq('status', 'queued')"))
+  assert.ok(!batch.includes(".in('status', ['queued', 'processing'])"))
+  assert.ok(finalize.includes(".eq('job_type', 'register_generation').eq('status', 'queued')"))
+  assert.ok(!finalize.includes(".in('status', ['queued', 'processing'])"))
+
+  // The DB allows one queued follow-up while retaining a processing job, and
+  // the claim RPC will not start that follow-up until the processing job settles.
+  assert.match(executable, /drop index if exists public\\.processing_jobs_batch_uniq/i)
+  assert.match(executable, /where batch_id is not null and invoice_id is null and job_type = 'register_generation' and status = 'queued'/i)
+  assert.match(executable, /j\\.job_type <> 'register_generation'[\\s\\S]*not exists[\\s\\S]*active\\.status = 'processing'/i)
+  assert.match(executable, /for update skip locked/i)
+})
