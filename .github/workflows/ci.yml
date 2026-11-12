@@ -19,6 +19,8 @@ jobs:
       - run: npm ci
       - name: Scan the complete working tree for committed secrets
         run: npm run secret-scan
+      - name: Audit production dependencies for high and critical vulnerabilities
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run check
       - run: npm test
       - run: npm run build
