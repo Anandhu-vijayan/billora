@@ -15,7 +15,7 @@ const patterns = [
   ['GitHub personal access token', /(?:ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,})/],
   ['Slack token', /xox[baprs]-[A-Za-z0-9-]{10,}/],
   ['Stripe secret key', /sk_(?:live|test)_[A-Za-z0-9]{16,}/],
-  ['Meta access token', /EA[A-Za-z0-9]{40,}/],
+  ['Meta access token', /EA[A-Za-z0-9]{80,}/],
   ['Private key material', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
 ]
 
