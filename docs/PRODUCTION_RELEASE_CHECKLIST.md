@@ -22,6 +22,12 @@ This checklist is an operational gate, not a certification. Complete it separate
 
 ## Invoice and queue verification
 
+- [ ] Apply `20261112120000_global_worker_concurrency.sql` before deploying code that sends the six-argument claim RPC; verify both the six-argument function and backward-compatible four-argument wrapper are service-role only.
+- [ ] Start with `JOB_GLOBAL_CONCURRENCY=5` and `JOB_WORKSPACE_CONCURRENCY=2`; these are conservative safety caps, not a certified capacity estimate. Increase only from measured staging results.
+- [ ] Run at least three simultaneous worker invocations across multiple instances. Confirm total `processing` jobs never exceeds the global cap and no workspace exceeds its cap, including when two workspaces submit at once.
+- [ ] Simulate 50 simultaneous senders / 250 files, then 100 senders / 500 files. Record webhook p50/p95, accepted/stored/queued counts, queue age, processing throughput, memory, DB connections, storage errors and Gemini throttles.
+- [ ] Confirm the queue drains after the burst without manual intervention and that one large workspace cannot starve smaller workspaces.
+
 - [ ] Upload five distinct invoice files in one WhatsApp burst. Reconcile received, stored, extracted, review-required and workbook row counts.
 - [ ] Resend one exact file. Confirm no second invoice or extraction job is created and the acknowledgement reflects the existing invoice status.
 - [ ] Redeliver the same provider message concurrently. Confirm one durable intake outcome and no duplicate side effects.
