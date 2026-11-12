@@ -19,7 +19,7 @@ import {
   listClients, createClient, verifyClientInWorkspace, setClientOwnGstin,
 } from '@/lib/whatsapp/provision';
 import {
-  claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed,
+  claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed, renewIntakeClaim,
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
   isDailyIntakeLimitReached, findLiveInvoiceByFileHash,
 } from '@/lib/whatsapp/intake';
@@ -769,17 +769,45 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
     logger.error('[WhatsApp] intake claim failed', { shortId, error: detail });
     return 'retryable';
   }
-  if (!intake.created && isDurablyAccepted(intake.row)) {
-    logger.info('[WhatsApp] duplicate accepted event skipped', { shortId });
-    return 'processed';
+  if (!intake.claimed) {
+    if (isDurablyAccepted(intake.row)) {
+      logger.info('[WhatsApp] duplicate accepted event skipped', { shortId });
+      return 'processed';
+    }
+    // Another invocation owns the live lease. A 503 asks Meta to retry; returning
+    // 200 could strand this event if its current owner crashes before acceptance.
+    logger.info('[WhatsApp] duplicate delivery deferred; active claim exists', {
+      shortId, priorStatus: intake.row.status, leaseExpiresAt: intake.row.claim_expires_at,
+    });
+    return 'retryable';
   }
-  if (!intake.created) {
-    logger.info('[WhatsApp] retry reprocessing', { shortId, priorStatus: intake.row.status });
+  const claimToken = intake.claimToken;
+  if (!claimToken) {
+    logger.error('[WhatsApp] acquired intake claim has no owner token', { shortId });
+    return 'retryable';
   }
-  // Any throw before markIntakeAccepted leaves status received/failed -> Meta retries.
+  if (!intake.created) logger.info('[WhatsApp] retry acquired exclusive claim', {
+    shortId, priorStatus: intake.row.status, attempt: intake.row.attempts,
+  });
+  let claimLost = false;
+  const heartbeat = setInterval(() => {
+    void renewIntakeClaim(db, providerMessageId, claimToken).then((renewed) => {
+      if (!renewed) {
+        claimLost = true;
+        logger.error('[WhatsApp] intake claim heartbeat rejected; owner is stale', { shortId });
+      }
+    }).catch((heartbeatError) => {
+      logger.warn('[WhatsApp] intake claim heartbeat failed', {
+        shortId, error: heartbeatError instanceof Error ? heartbeatError.message : 'unknown',
+      });
+    });
+  }, 45_000);
+  heartbeat.unref?.();
+  // A crash leaves a leased processing row; Meta redelivery can reclaim it after expiry.
   try {
     await processMessage(db, message, providerMessageId, shortId);
-    await markIntakeAccepted(db, providerMessageId);
+    if (claimLost) throw new Error('INTAKE_CLAIM_LOST: heartbeat rejected this invocation');
+    await markIntakeAccepted(db, providerMessageId, claimToken);
   } catch (e) {
     const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
     const code = (e instanceof Error ? e.message : detail).split(':')[0] || 'PROCESSING_ERROR';
@@ -794,7 +822,7 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       if (message.from) {
         await sendText(message.from, 'I could not retrieve that file right now (a system credential expired). Please resend the invoice in a few minutes.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, detail.slice(0, 120)).catch(() => undefined);
+      await markIntakeAccepted(db, providerMessageId, claimToken, detail.slice(0, 120)).catch(() => undefined);
       return 'processed';
     }
     if (isEncryptionConfigFailure(e)) {
@@ -811,7 +839,7 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       if (message.from) {
         await sendText(message.from, 'I could not file that invoice — a required system setting is missing on our side, so nothing was saved. The account owner needs to finish setup; please resend afterwards.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, 'ENCRYPTION_CONFIG').catch(() => undefined);
+      await markIntakeAccepted(db, providerMessageId, claimToken, 'ENCRYPTION_CONFIG').catch(() => undefined);
       return 'processed';
     }
     if (isStorageConfigFailure(e)) {
@@ -827,12 +855,14 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       if (message.from) {
         await sendText(message.from, 'I could not file that invoice — our private storage is mid-setup, so nothing was saved. The account owner needs to finish a configuration step; please resend afterwards.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, 'STORAGE_CONFIG').catch(() => undefined);
+      await markIntakeAccepted(db, providerMessageId, claimToken, 'STORAGE_CONFIG').catch(() => undefined);
       return 'processed';
     }
-    await markIntakeFailed(db, providerMessageId, code).catch(() => undefined);
+    await markIntakeFailed(db, providerMessageId, claimToken, code).catch(() => undefined);
     logger.error('[WhatsApp] processing failed, retryable', { shortId, error: code, detail: detail.slice(0, 200) });
     return 'retryable';
+  } finally {
+    clearInterval(heartbeat);
   }
   logger.info('[WhatsApp] accepted for queue', { shortId });
   return 'processed';
