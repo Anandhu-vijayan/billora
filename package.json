@@ -14,7 +14,7 @@
     "worker:poll": "node scripts/worker-poll.mjs",
     "eval": "node scripts/eval.mjs",
     "reencrypt:legacy": "node scripts/reencrypt-legacy.mjs",
-    "test": "node --test tests/security-hardening.test.mjs tests/onboarding.test.mjs tests/vision-api.test.mjs tests/vision-parse.test.mjs tests/extraction-validators.test.mjs tests/invoice-calc.test.mjs tests/multi-gst-rate.test.mjs tests/category-register.test.mjs tests/delivery-scope.test.mjs tests/delivery-coalesce.test.mjs tests/register-fingerprint.test.mjs tests/workbook-provenance.test.mjs tests/classification.test.mjs tests/dedup.test.mjs tests/workbook-deliveries.test.mjs tests/register-scope.test.mjs tests/regression/extraction-6-invoices.test.mjs"
+    "test": "node --test tests/security-hardening.test.mjs tests/onboarding.test.mjs tests/vision-api.test.mjs tests/vision-parse.test.mjs tests/extraction-validators.test.mjs tests/invoice-calc.test.mjs tests/multi-gst-rate.test.mjs tests/category-register.test.mjs tests/delivery-scope.test.mjs tests/delivery-coalesce.test.mjs tests/register-fingerprint.test.mjs tests/workbook-provenance.test.mjs tests/classification.test.mjs tests/dedup.test.mjs tests/workbook-deliveries.test.mjs tests/register-scope.test.mjs tests/regression/extraction-6-invoices.test.mjs tests/credit-debit-note.test.mjs tests/image-quality.test.mjs tests/multi-invoice.test.mjs tests/pdf-text-layout.test.mjs tests/review-link.test.mjs tests/stage-timing.test.mjs tests/tally-xml.test.mjs tests/vision-parallel.test.mjs tests/worker-concurrency.test.mjs tests/worker-wake.test.mjs"
   },
   "engines": {
     "node": ">=22.0.0"
