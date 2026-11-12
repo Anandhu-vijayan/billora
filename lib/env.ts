@@ -138,6 +138,8 @@ const serverSchema = z.object({
   // in lib/jobs/worker.ts (clamped to the per-tick limit), so a misconfiguration
   // can never fan out unbounded against Gemini/storage quota.
   JOB_CONCURRENCY: z.string().optional(),
+  JOB_GLOBAL_CONCURRENCY: z.coerce.number().int().min(1).max(25).default(5),
+  JOB_WORKSPACE_CONCURRENCY: z.coerce.number().int().min(1).max(25).default(2),
   JOB_TICK_BUDGET_MS: z.string().optional(),
   JOB_BACKOFF_BASE_SECONDS: z.string().optional(),
   JOB_BACKOFF_CAP_SECONDS: z.string().optional(),
