@@ -819,10 +819,17 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       logger.error('[WhatsApp] MEDIA_CREDENTIAL_BLOCKED: media unrecoverable with current token; operator must reissue WHATSAPP_ACCESS_TOKEN', {
         shortId, error: code, detail: detail.slice(0, 200),
       });
+      try {
+        await markIntakeAccepted(db, providerMessageId, claimToken, detail.slice(0, 120));
+      } catch (claimError) {
+        logger.warn('[WhatsApp] permanent media failure could not settle stale claim', {
+          shortId, error: claimError instanceof Error ? claimError.message : 'unknown',
+        });
+        return 'retryable';
+      }
       if (message.from) {
         await sendText(message.from, 'I could not retrieve that file right now (a system credential expired). Please resend the invoice in a few minutes.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, claimToken, detail.slice(0, 120)).catch(() => undefined);
       return 'processed';
     }
     if (isEncryptionConfigFailure(e)) {
@@ -836,10 +843,17 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       logger.error('[WhatsApp] ENCRYPTION_CONFIG: file encryption is not configured; nothing was stored — operator must set ENCRYPTION_MASTER_KEY + STORAGE_PATH_KEY and restart', {
         shortId, code: 'ENCRYPTION_CONFIG',
       });
+      try {
+        await markIntakeAccepted(db, providerMessageId, claimToken, 'ENCRYPTION_CONFIG');
+      } catch (claimError) {
+        logger.warn('[WhatsApp] encryption config failure could not settle stale claim', {
+          shortId, error: claimError instanceof Error ? claimError.message : 'unknown',
+        });
+        return 'retryable';
+      }
       if (message.from) {
         await sendText(message.from, 'I could not file that invoice — a required system setting is missing on our side, so nothing was saved. The account owner needs to finish setup; please resend afterwards.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, claimToken, 'ENCRYPTION_CONFIG').catch(() => undefined);
       return 'processed';
     }
     if (isStorageConfigFailure(e)) {
@@ -852,10 +866,17 @@ async function handleSingleMessage(db: Db, message: IncomingMessage): Promise<Me
       logger.error('[WhatsApp] STORAGE_CONFIG: private storage rejected the encrypted upload; operator must apply the invoices bucket migration', {
         shortId, code: 'STORAGE_CONFIG',
       });
+      try {
+        await markIntakeAccepted(db, providerMessageId, claimToken, 'STORAGE_CONFIG');
+      } catch (claimError) {
+        logger.warn('[WhatsApp] storage config failure could not settle stale claim', {
+          shortId, error: claimError instanceof Error ? claimError.message : 'unknown',
+        });
+        return 'retryable';
+      }
       if (message.from) {
         await sendText(message.from, 'I could not file that invoice — our private storage is mid-setup, so nothing was saved. The account owner needs to finish a configuration step; please resend afterwards.').catch(() => undefined);
       }
-      await markIntakeAccepted(db, providerMessageId, claimToken, 'STORAGE_CONFIG').catch(() => undefined);
       return 'processed';
     }
     await markIntakeFailed(db, providerMessageId, claimToken, code).catch(() => undefined);
