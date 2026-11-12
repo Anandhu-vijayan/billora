@@ -35,7 +35,7 @@ export const CONFIDENCE_SOURCES = ['local', 'ai', 'human'] as const
 export type ConfidenceSource = (typeof CONFIDENCE_SOURCES)[number]
 
 // webhook_events intake ledger (durable idempotency).
-export const INTAKE_STATUSES = ['received', 'accepted', 'failed'] as const
+export const INTAKE_STATUSES = ['received', 'processing', 'accepted', 'failed'] as const
 export type IntakeStatus = (typeof INTAKE_STATUSES)[number]
 
 // whatsapp_sessions conversation lifecycle (distinct from batch/invoice/job status).
