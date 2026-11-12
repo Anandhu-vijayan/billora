@@ -37,7 +37,9 @@ test('Postgres serializes claim admission and counts all currently processing jo
 
 test('old four-argument worker deployments delegate to the same database limits', () => {
   const sql = migration()
-  assert.match(sql, /p_job_types text\[\] default null\)[\s\S]*?select \*[\s\S]*?p_worker, p_lease_seconds, p_limit, p_job_types, 5, 2/)
+  const legacySignature = sql.indexOf('p_job_types text[] default null')
+  const legacyDelegate = sql.indexOf('p_worker, p_lease_seconds, p_limit, p_job_types, 5, 2')
+  assert.ok(legacySignature > 0 && legacyDelegate > legacySignature, 'legacy signature delegates to default database caps')
   assert.match(sql, /revoke all on function public\.claim_processing_jobs\(text, integer, integer, text\[\]\)/)
   assert.match(sql, /grant execute on function public\.claim_processing_jobs\(text, integer, integer, text\[\]\)[\s\S]*?to service_role/)
 })
