@@ -34,14 +34,18 @@ export function isPermanentJobFailure(error: unknown): boolean {
   return error instanceof Error && error.name === 'PermanentJobError'
 }
 
-const int = (raw: string | undefined, fallback: number): number => {
+const boundedInt = (raw: string | undefined, fallback: number): number => {
   const parsed = Number.parseInt(raw ?? '', 10)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 25) : fallback
 }
 
-export const JOB_LEASE_SECONDS = int(process.env.JOB_LEASE_SECONDS, 120)
-const BACKOFF_BASE_SECONDS = int(process.env.JOB_BACKOFF_BASE_SECONDS, 15)
-const BACKOFF_CAP_SECONDS = int(process.env.JOB_BACKOFF_CAP_SECONDS, 900)
+export const JOB_LEASE_SECONDS = boundedInt(process.env.JOB_LEASE_SECONDS, 120)
+const BACKOFF_BASE_SECONDS = boundedInt(process.env.JOB_BACKOFF_BASE_SECONDS, 15)
+const BACKOFF_CAP_SECONDS = boundedInt(process.env.JOB_BACKOFF_CAP_SECONDS, 900)
+// These limits are enforced again inside claim_processing_jobs, so overlapping
+// worker ticks/instances cannot multiply the configured concurrency.
+export const JOB_GLOBAL_CONCURRENCY = boundedInt(process.env.JOB_GLOBAL_CONCURRENCY, 5)
+export const JOB_WORKSPACE_CONCURRENCY = boundedInt(process.env.JOB_WORKSPACE_CONCURRENCY, 2)
 
 /** Exponential backoff on the attempt count: 15s, 30s, 60s … capped. */
 export function backoffSeconds(attempts: number): number {
@@ -64,6 +68,8 @@ export async function claimJobs(
     p_lease_seconds: args.leaseSeconds ?? JOB_LEASE_SECONDS,
     p_limit: args.limit ?? 1,
     p_job_types: args.jobTypes,
+    p_global_limit: JOB_GLOBAL_CONCURRENCY,
+    p_workspace_limit: JOB_WORKSPACE_CONCURRENCY,
   })
   if (error) throw new Error(`JOB_CLAIM_ERROR: ${error.message}`)
   return ((data ?? []) as unknown as ClaimedJob[]).map((row) => ({
