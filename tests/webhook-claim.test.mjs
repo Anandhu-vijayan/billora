@@ -25,7 +25,7 @@ test('claim RPC returns a UUID token only to the winner', async () => {
   assert.equal(result.row.status, 'processing')
 })
 
-test('busy claim does not expose the active owner's token', async () => {
+test("busy claim does not expose the active owner token", async () => {
   const db = { rpc: async () => ({ data: [{ claimed: false, created: false, event_id: 'e',
     provider_message_id: 'wamid.1', status: 'processing', attempts: 1,
     processed_at: null, claim_expires_at: '2026-11-12T12:03:00Z' }], error: null }) }
