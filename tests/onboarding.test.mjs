@@ -1312,7 +1312,7 @@ test('I10 intake persists the validated MIME and never loosens the transport', (
 test('I11 storage-config rejection settles final, never loops, stays narrow', () => {
   const src = routeSrc()
   assert.match(src, /isStorageConfigFailure\(e\)/)
-  assert.match(src, /markIntakeAccepted\(db, providerMessageId, 'STORAGE_CONFIG'\)/)
+  assert.match(src, /markIntakeAccepted\(db, providerMessageId, claimToken, 'STORAGE_CONFIG'\)/)
   // The helper only fires on a MIME/"not allowed"-style STORAGE_UPLOAD_ERROR, so
   // transient network and permission failures remain retryable.
   const fnStart = src.indexOf('function isStorageConfigFailure')
