@@ -1,9 +1,10 @@
 // lib/whatsapp/intake.ts — durable webhook intake ledger + invoice/job lifecycle.
 // webhook_events is the idempotency + recovery ledger:
-//   received  = row inserted, work not yet durably accepted
+//   received  = legacy/unclaimed row awaiting its first atomic claim
+//   processing = exclusively claimed with a renewable, expiring lease
 //   accepted  = onboarding state + (media: invoice + job rows) persisted
-//   failed    = attempt failed before durable acceptance; Meta retry reprocesses.
-// Only `accepted` suppresses reprocessing. Retries are idempotent.
+//   failed    = attempt failed before durable acceptance; Meta retry can reclaim.
+// Only `accepted` suppresses reprocessing. Claim-token fencing prevents stale writes.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { IntakeStatus } from '@/lib/statuses'
 import { randomUUID } from 'node:crypto'
@@ -35,16 +36,6 @@ type IntakeClaimRpcRow = {
 }
 
 type Db = SupabaseClient
-
-interface EventRow {
-  insert: (row: Record<string, unknown>) => Promise<{ data: unknown; error: { code?: string; message: string } | null }>
-  select: (cols: string) => unknown
-  update: (patch: Record<string, unknown>) => unknown
-}
-
-function eventsTable(db: Db) {
-  return db.from('webhook_events') as unknown as EventRow
-}
 
 /**
  * Atomic PostgreSQL claim. Only the winning invocation receives its UUID token.
