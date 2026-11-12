@@ -6,6 +6,7 @@
 // Only `accepted` suppresses reprocessing. Retries are idempotent.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { IntakeStatus } from '@/lib/statuses'
+import { randomUUID } from 'node:crypto'
 import { logger } from '../logger'
 import { wakeWorker } from '../jobs/wake'
 
@@ -17,6 +18,20 @@ export interface IntakeRow {
   status: IntakeStatus
   attempts: number
   processed_at: string | null
+  claim_expires_at: string | null
+}
+
+const INTAKE_CLAIM_LEASE_SECONDS = 180
+
+type IntakeClaimRpcRow = {
+  claimed: boolean
+  created: boolean
+  event_id: string
+  provider_message_id: string
+  status: IntakeStatus
+  attempts: number
+  processed_at: string | null
+  claim_expires_at: string | null
 }
 
 type Db = SupabaseClient
@@ -31,35 +46,38 @@ function eventsTable(db: Db) {
   return db.from('webhook_events') as unknown as EventRow
 }
 
-/** Insert-or-read the intake row. Returns the row + whether this delivery created it. */
+/**
+ * Atomic PostgreSQL claim. Only the winning invocation receives its UUID token.
+ * Expired claims can be reclaimed; all later writes are fenced by that token.
+ */
 export async function claimIntakeRow(
   db: Db,
   providerMessageId: string,
-): Promise<{ row: IntakeRow; created: boolean }> {
-  const table = eventsTable(db)
-  const inserted = await table.insert({ provider_message_id: providerMessageId, status: 'received' })
-  if (!inserted.error) {
-    const read = (await (table.select('id,provider_message_id,status,attempts,processed_at') as {
-      eq: (c: string, v: string) => {
-        maybeSingle: () => Promise<{ data: IntakeRow | null; error: { message: string } | null }>
-      }
-    })
-      .eq('provider_message_id', providerMessageId)
-      .maybeSingle())
-    if (read.error || !read.data) throw new Error(`INTAKE_READ_ERROR: ${read.error?.message ?? 'missing row'}`)
-    return { row: read.data, created: true }
+): Promise<{ row: IntakeRow; created: boolean; claimed: boolean; claimToken: string | null }> {
+  const claimToken = randomUUID()
+  const { data, error } = await db.rpc('claim_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_lease_seconds: INTAKE_CLAIM_LEASE_SECONDS,
+  }) as unknown as { data: IntakeClaimRpcRow[] | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_CLAIM_ERROR: ${error.message}`)
+  const result = Array.isArray(data) ? data[0] : null
+  if (!result?.event_id || typeof result.claimed !== 'boolean') {
+    throw new Error('INTAKE_CLAIM_ERROR: database returned an invalid claim result')
   }
-  if (inserted.error.code !== '23505') throw new Error(`INTAKE_INSERT_ERROR: ${inserted.error.message}`)
-  // Duplicate key: read the existing row to decide replay vs retry.
-  const existing = (await (table.select('id,provider_message_id,status,attempts,processed_at') as {
-    eq: (c: string, v: string) => {
-      maybeSingle: () => Promise<{ data: IntakeRow | null; error: { message: string } | null }>
-    }
-  })
-    .eq('provider_message_id', providerMessageId)
-    .maybeSingle())
-  if (existing.error || !existing.data) throw new Error(`INTAKE_READ_ERROR: ${existing.error?.message ?? 'missing row'}`)
-  return { row: existing.data, created: false }
+  return {
+    row: {
+      id: result.event_id,
+      provider_message_id: result.provider_message_id,
+      status: result.status,
+      attempts: result.attempts,
+      processed_at: result.processed_at,
+      claim_expires_at: result.claim_expires_at,
+    },
+    created: result.created,
+    claimed: result.claimed,
+    claimToken: result.claimed ? claimToken : null,
+  }
 }
 
 /** True only when a previous delivery durably accepted this message. */
@@ -68,31 +86,42 @@ export function isDurablyAccepted(row: IntakeRow): boolean {
 }
 
 /**
- * Durably accept the event. `errorCode` accepts a permanent failure as final
- * (recorded for audit) so Meta redelivery is suppressed without a retry loop.
+ * Renew only an unexpired claim. Expired owners cannot resurrect their lease.
  */
-export async function markIntakeAccepted(db: Db, providerMessageId: string, errorCode?: string): Promise<void> {
-  const { error } = (await (eventsTable(db).update({
-    status: 'accepted',
-    processed_at: new Date().toISOString(),
-    last_error_code: errorCode ? errorCode.slice(0, 120) : null,
-  }) as {
-    eq: (c: string, v: string) => Promise<{ error: { message: string } | null }>
-  }).eq('provider_message_id', providerMessageId))
-  if (error) throw new Error(`INTAKE_ACCEPT_ERROR: ${error.message}`)
+export async function renewIntakeClaim(db: Db, providerMessageId: string, claimToken: string): Promise<boolean> {
+  const { data, error } = await db.rpc('renew_whatsapp_webhook_event_claim', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_lease_seconds: INTAKE_CLAIM_LEASE_SECONDS,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_HEARTBEAT_ERROR: ${error.message}`)
+  return data === true
 }
 
-export async function markIntakeFailed(db: Db, providerMessageId: string, code: string): Promise<void> {
-  const current = await claimIntakeRow(db, providerMessageId).catch(() => null)
-  const attempts = (current?.row.attempts ?? 0) + 1
-  const { error } = (await (eventsTable(db).update({
-    status: 'failed',
-    attempts,
-    last_error_code: code.slice(0, 120),
-  }) as {
-    eq: (c: string, v: string) => Promise<{ error: { message: string } | null }>
-  }).eq('provider_message_id', providerMessageId))
+/** Complete only while this invocation owns the current, unexpired lease. */
+export async function markIntakeAccepted(
+  db: Db, providerMessageId: string, claimToken: string, errorCode?: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('complete_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_error_code: errorCode ? errorCode.slice(0, 120) : null,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_ACCEPT_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_CLAIM_LOST: event claim expired or belongs to another invocation')
+}
+
+/** Fail only while this invocation owns the current, unexpired lease. */
+export async function markIntakeFailed(
+  db: Db, providerMessageId: string, claimToken: string, code: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('fail_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_error_code: code.slice(0, 120),
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
   if (error) throw new Error(`INTAKE_FAIL_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_CLAIM_LOST: event claim expired or belongs to another invocation')
 }
 
 /**
