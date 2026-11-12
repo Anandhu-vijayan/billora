@@ -29,6 +29,8 @@ const statusesSrc = () => readFileSync(new URL('../lib/statuses.ts', import.meta
 const sendSrc = () => readFileSync(new URL('../lib/whatsapp/send.ts', import.meta.url), 'utf8')
 const sqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261010120000_whatsapp_onboarding_v1.sql', import.meta.url), 'utf8')
+const atomicWebhookSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261112130000_atomic_webhook_claims.sql', import.meta.url), 'utf8')
 const lifecycleSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261011000000_phase1_status_lifecycle.sql', import.meta.url), 'utf8')
 const p2SqlSrc = () => readFileSync(
@@ -311,7 +313,7 @@ test('D2 typed status enums match the DB CHECK constraints exactly', () => {
   for (const s of ['collecting', 'ready', 'processing', 'completed', 'needs_review', 'failed', 'cancelled']) {
     assert.ok(list('BATCH_STATUSES').includes(s), `canonical batch state ${s} missing`)
   }
-  for (const s of list('INTAKE_STATUSES')) assert.ok(sqlSrc().includes(`'${s}'`), `intake status ${s} missing from SQL`)
+  for (const s of list('INTAKE_STATUSES')) assert.ok((sqlSrc() + atomicWebhookSqlSrc()).includes(`'${s}'`), `intake status ${s} missing from SQL`)
   for (const s of list('CONVERSATION_STATES')) {
     // The state set is authoritative in phase2, then widened by later additive
     // migrations (the review-edit sub-state). Accept a state from EITHER so the
@@ -1062,7 +1064,7 @@ test('H1d a config failure settles the intake as final, notifies once, and never
   const start = src.indexOf('if (isEncryptionConfigFailure(e))')
   assert.ok(start > 0, 'the config-failure branch must exist in handleSingleMessage')
   const branch = src.slice(start, src.indexOf('await markIntakeFailed'))
-  assert.ok(branch.includes("markIntakeAccepted(db, providerMessageId, 'ENCRYPTION_CONFIG')"),
+  assert.ok(branch.includes("markIntakeAccepted(db, providerMessageId, claimToken, 'ENCRYPTION_CONFIG')"),
     'accepted as final with a stable sanitized audit code (no 503 -> no Meta redelivery loop)')
   assert.ok(branch.includes("return 'processed'"), 'never returns retryable for a permanent config fault')
   assert.ok(branch.includes('sendText(message.from'), 'the sender gets a truthful actionable reply')
