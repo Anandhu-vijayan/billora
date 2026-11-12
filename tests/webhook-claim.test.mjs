@@ -34,6 +34,37 @@ test('busy claim does not expose the active owner's token', async () => {
   assert.equal(result.claimToken, null)
 })
 
+test('heartbeat and terminal transitions require the same claim token', async () => {
+  const calls = []
+  const db = { rpc: async (name, args) => {
+    calls.push({ name, args })
+    return { data: true, error: null }
+  } }
+  assert.equal(await intake.renewIntakeClaim(db, 'wamid.2', 'owner-token'), true)
+  await intake.markIntakeAccepted(db, 'wamid.2', 'owner-token', 'CONFIG')
+  await intake.markIntakeFailed(db, 'wamid.2', 'owner-token', 'TEMPORARY')
+  assert.deepEqual(calls.map((c) => c.name), [
+    'renew_whatsapp_webhook_event_claim',
+    'complete_whatsapp_webhook_event',
+    'fail_whatsapp_webhook_event',
+  ])
+  assert.ok(calls.every((c) => c.args.p_claim_token === 'owner-token'))
+  assert.equal(calls[1].args.p_error_code, 'CONFIG')
+  assert.equal(calls[2].args.p_error_code, 'TEMPORARY')
+})
+
+test('a stale owner cannot report successful completion', async () => {
+  const db = { rpc: async () => ({ data: false, error: null }) }
+  await assert.rejects(
+    () => intake.markIntakeAccepted(db, 'wamid.3', 'stale-token'),
+    /INTAKE_CLAIM_LOST/,
+  )
+  await assert.rejects(
+    () => intake.markIntakeFailed(db, 'wamid.3', 'stale-token', 'ERROR'),
+    /INTAKE_CLAIM_LOST/,
+  )
+})
+
 test('heartbeat, completion and failure are fenced and attempts are not read-modify-written', () => {
   assert.match(intakeSource, /renew_whatsapp_webhook_event_claim/)
   assert.match(intakeSource, /complete_whatsapp_webhook_event/)
