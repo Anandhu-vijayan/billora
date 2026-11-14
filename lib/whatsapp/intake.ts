@@ -207,31 +207,83 @@ export async function recordMediaIntake(
   return { invoiceId, jobId, invoicePreexisting, jobPreexisting }
 }
 
+export interface DailyIntakeReservation {
+  allowed: boolean
+  scopeKey: string
+}
+
 /**
- * Abuse / provider-quota guard: has this workspace already filed `limit` NEW
- * invoices in the current UTC day? Enforced at intake, BEFORE any extraction
- * job is created, because the job is what actually spends (gated) Gemini quota
- * and OCR/storage. `limit <= 0` disables the guard. A webhook redelivery of
- * THIS objectPath is excluded from the count, so a Meta retry of a file that
- * already took its slot is never falsely rejected (recordMediaIntake dedups it
- * downstream anyway). Throws on a count failure — a silent pass would defeat
- * the whole point of the guard.
+ * Atomically reserve a workspace/day slot, or a sender/day slot while the
+ * workspace is still unknown. Reservations are keyed by provider message ID,
+ * so delivery retries reuse their original slot instead of racing a count.
  */
-export async function isDailyIntakeLimitReached(
+export async function reserveDailyIntake(
   db: Db,
-  args: { workspaceId: string; limit: number; objectPath: string },
-): Promise<boolean> {
-  if (!Number.isFinite(args.limit) || args.limit <= 0) return false
-  const dayStart = new Date()
-  dayStart.setUTCHours(0, 0, 0, 0)
-  const { count, error } = await db
-    .from('invoices')
-    .select('id', { count: 'exact', head: true })
-    .eq('workspace_id', args.workspaceId)
-    .gte('received_at', dayStart.toISOString())
-    .neq('file_object_path', args.objectPath)
-  if (error) throw new Error(`INTAKE_LIMIT_COUNT_ERROR: ${error.message}`)
-  return (count ?? 0) >= args.limit
+  args: {
+    providerMessageId: string
+    workspaceId: string | null
+    senderHmac: string
+    limit: number
+  },
+): Promise<DailyIntakeReservation> {
+  const scopeKey = args.workspaceId ? `workspace:${args.workspaceId}` : `sender:${args.senderHmac}`
+  const { data, error } = await db.rpc('reserve_whatsapp_daily_intake', {
+    p_provider_message_id: args.providerMessageId,
+    p_scope_key: scopeKey,
+    p_limit: args.limit,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RESERVE_ERROR: ${error.message}`)
+  return { allowed: data === true, scopeKey }
+}
+
+export async function commitDailyIntake(
+  db: Db, providerMessageId: string, scopeKey: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('commit_whatsapp_daily_intake', {
+    p_provider_message_id: providerMessageId,
+    p_scope_key: scopeKey,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_COMMIT_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_LIMIT_COMMIT_ERROR: reservation not found')
+}
+
+export async function releaseDailyIntake(db: Db, providerMessageId: string): Promise<void> {
+  const { error } = await db.rpc('release_whatsapp_daily_intake', {
+    p_provider_message_id: providerMessageId,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RELEASE_ERROR: ${error.message}`)
+}
+
+export async function releaseDailyIntakeScope(
+  db: Db, providerMessageId: string, scopeKey: string,
+): Promise<void> {
+  const { error } = await db.rpc('release_whatsapp_daily_intake_scope', {
+    p_provider_message_id: providerMessageId,
+    p_scope_key: scopeKey,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RELEASE_ERROR: ${error.message}`)
+}
+
+export async function beginStorageIntake(
+  db: Db, args: { providerMessageId: string; objectPath: string; kind: 'invoice' | 'pending' },
+): Promise<void> {
+  const { error } = await db.rpc('begin_whatsapp_intake_storage', {
+    p_provider_message_id: args.providerMessageId,
+    p_object_path: args.objectPath,
+    p_object_kind: args.kind,
+  })
+  if (error) throw new Error(`INTAKE_STORAGE_TRACK_ERROR: ${error.message}`)
+}
+
+export async function markStorageIntake(
+  db: Db, objectPath: string, state: 'uploaded' | 'linked',
+): Promise<void> {
+  const { data, error } = await db.rpc('mark_whatsapp_intake_storage', {
+    p_object_path: objectPath,
+    p_state: state,
+  })
+  if (error) throw new Error(`INTAKE_STORAGE_STATE_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_STORAGE_STATE_ERROR: intake ledger row missing')
 }
 
 /**
@@ -318,6 +370,7 @@ export async function recordPendingUpload(
     fileSha256Hex: string | null
     sizeBytes: number
     providerMediaId: string | null
+    providerMessageId: string
     keyVersion?: string | null
   },
 ): Promise<string> {
@@ -330,6 +383,7 @@ export async function recordPendingUpload(
     size_bytes: args.sizeBytes,
     file_encryption_key_version: args.keyVersion ?? null,
     provider_media_id: args.providerMediaId,
+    provider_message_id: args.providerMessageId,
   }, { onConflict: 'object_path' }).select('id').single() as unknown as { data: { id: string } | null; error: { message: string } | null })
   if (row.error || !row.data) throw new Error(`PENDING_UPLOAD_RECORD_ERROR: ${row.error?.message ?? 'missing id'}`)
   return row.data.id
@@ -354,11 +408,11 @@ export async function countWaitingUploads(db: Db, senderHmac: string): Promise<n
 export async function assignPendingUploads(
   db: Db,
   senderHmac: string,
-  args: { workspaceId: string; clientId: string | null },
+  args: { workspaceId: string; clientId: string | null; limit: number },
 ): Promise<number> {
   const { data: rows, error } = await db
     .from('pending_uploads')
-    .select('id,object_path,original_file_name,content_type,file_sha256,size_bytes,file_encryption_key_version')
+    .select('id,object_path,original_file_name,content_type,file_sha256,size_bytes,file_encryption_key_version,provider_message_id')
     .eq('sender_hmac', senderHmac)
     .eq('status', 'waiting_assignment')
     .order('created_at')
@@ -367,12 +421,23 @@ export async function assignPendingUploads(
   for (const row of (rows ?? []) as Array<{
     id: string; object_path: string; original_file_name: string | null;
     content_type: string; file_sha256: string | null;
-    size_bytes: number | null; file_encryption_key_version: string | null
+    size_bytes: number | null; file_encryption_key_version: string | null;
+    provider_message_id: string | null
   }>) {
+    const providerMessageId = row.provider_message_id ?? `legacy-pending:${row.id}`
+    const reservation = await reserveDailyIntake(db, {
+      providerMessageId, workspaceId: args.workspaceId, senderHmac, limit: args.limit,
+    })
+    if (!reservation.allowed) {
+      logger.warn('[Intake] held upload assignment deferred by daily quota', {
+        pendingId: row.id.slice(0, 8), workspaceId: args.workspaceId.slice(0, 8),
+      })
+      continue
+    }
     const shaHex = typeof row.file_sha256 === 'string'
       ? row.file_sha256.replace(/^\\x/i, '')
       : null
-    const { invoiceId } = await recordMediaIntake(db, {
+    const recorded = await recordMediaIntake(db, {
       workspaceId: args.workspaceId,
       clientId: args.clientId,
       objectPath: row.object_path,
@@ -382,9 +447,14 @@ export async function assignPendingUploads(
       keyVersion: row.file_encryption_key_version,
       sizeBytes: row.size_bytes,
     })
+    await commitDailyIntake(db, providerMessageId, reservation.scopeKey)
+    await markStorageIntake(db, row.object_path, 'linked')
+    if (reservation.scopeKey !== `sender:${senderHmac}`) {
+      await releaseDailyIntakeScope(db, providerMessageId, `sender:${senderHmac}`)
+    }
     const { error: updateError } = await db
       .from('pending_uploads')
-      .update({ status: 'assigned', assigned_invoice_id: invoiceId, updated_at: new Date().toISOString() })
+      .update({ status: 'assigned', assigned_invoice_id: recorded.invoiceId, updated_at: new Date().toISOString() })
       .eq('id', row.id)
       .eq('status', 'waiting_assignment')
     if (updateError) throw new Error(`PENDING_UPLOAD_ASSIGN_ERROR: ${updateError.message}`)

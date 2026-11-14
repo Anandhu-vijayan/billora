@@ -40,6 +40,7 @@ import {
   type InvoiceExtractionResult,
 } from '@/lib/ocr/invoice-extractor'
 import { VisionTransientError, VisionPermanentError } from '@/lib/ocr/vision'
+import { GEMINI_WORKSPACE_CONSENT_VERSION } from '@/lib/privacy/ai-consent'
 
 interface InvoiceRow {
   id: string
@@ -143,7 +144,22 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
   try {
     // AI stays strictly behind the operator gate and is NEVER default-on: the
     // engine only reaches Gemini when allowAI is true AND a paid tier is set.
-    const allowAI = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
+    const operatorAllowsAI = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
+    let allowAI = false
+    if (operatorAllowsAI) {
+      const { data: consent, error: consentError } = await db.from('workspaces')
+        .select('gemini_consent_at,gemini_consent_version')
+        .eq('id', workspaceId)
+        .maybeSingle()
+      if (consentError) throw new Error(`AI_CONSENT_READ_ERROR: ${consentError.message}`)
+      allowAI = consent?.gemini_consent_at != null
+        && consent.gemini_consent_version === GEMINI_WORKSPACE_CONSENT_VERSION
+      if (!allowAI) {
+        logger.info('[Extract] Gemini withheld because workspace consent is absent or outdated', {
+          workspaceId: workspaceId.slice(0, 8),
+        })
+      }
+    }
     if (allowAI && env.EXTRACTION_PROVIDER !== 'gemini') {
       throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
     }
@@ -579,4 +595,3 @@ async function queueReviewNotice(
     ? '[Extract] review notice queued for next inbound message'
     : '[Extract] review notice deferred: delivery state could not be saved', { invoiceId, jobId })
 }
-
