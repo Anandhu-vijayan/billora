@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  experimental: {
+    proxyClientMaxBodySize: "1mb",
+  },
   poweredByHeader: false,
   reactStrictMode: true,
   typedRoutes: true,
@@ -56,4 +59,3 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
-

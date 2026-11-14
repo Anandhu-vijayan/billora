@@ -24,11 +24,14 @@
 .DS_Store
 *.pem
 
-# debug
+# debug and local runtime output
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+*.log
+gemini-raw-response.json
+gemini-extracted-invoice.json
 
 # env files (can opt-in for committing if needed)
 .env*
@@ -56,4 +59,3 @@ supabase/.env
 !.vscode/extensions.json
 !.vscode/settings.json
 Thumbs.db
-

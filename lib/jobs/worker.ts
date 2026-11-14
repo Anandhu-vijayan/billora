@@ -24,6 +24,12 @@ import { recoverExpiredDeliveryLeases } from '@/lib/whatsapp/delivery-outbox'
 import {
   pushReadyRegistersForWorkspace, sweepDueDeliveries,
 } from '@/lib/jobs/handlers/deliver-register'
+import { replayPendingWebhookMessages } from '@/lib/whatsapp/webhook-inbox'
+import {
+  purgeOldIntakeQuotaHistory, reconcileOrphanedIntakeObjects, recoverStaleIntakeReservations,
+} from '@/lib/whatsapp/intake-reconciliation'
+import { purgeExpiredWebhookPayloads } from '@/lib/whatsapp/webhook-inbox'
+import { processRetentionMaintenance } from '@/lib/retention'
 
 type Db = SupabaseClient
 
@@ -299,6 +305,66 @@ export async function runWorkerTick(
   } catch (e: unknown) {
     logger.error('[Worker] delivery lease recovery failed', {
       error: e instanceof Error ? e.message : String(e),
+    })
+  }
+
+  try {
+    const replay = await replayPendingWebhookMessages(db, 1)
+    if (replay.attempted > 0) {
+      logger.info('[Worker] durable webhook inbox replay pass', replay)
+    }
+  } catch (e: unknown) {
+    logger.error('[Worker] durable webhook inbox replay failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
+    })
+  }
+
+  try {
+    const recovered = await recoverStaleIntakeReservations(db)
+    if (recovered > 0) logger.info('[Worker] stale intake quota reservations recovered', { recovered })
+  } catch (e: unknown) {
+    logger.error('[Worker] intake quota reservation recovery failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
+    })
+  }
+
+  try {
+    const reconciliation = await reconcileOrphanedIntakeObjects(db, 10)
+    if (reconciliation.claimed > 0) {
+      logger.info('[Worker] intake storage reconciliation pass', reconciliation)
+    }
+  } catch (e: unknown) {
+    logger.error('[Worker] intake storage reconciliation failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
+    })
+  }
+
+  try {
+    const [expiredPayloads, oldReservations] = await Promise.all([
+      purgeExpiredWebhookPayloads(db),
+      purgeOldIntakeQuotaHistory(db),
+    ])
+    if (expiredPayloads > 0 || oldReservations > 0) {
+      logger.info('[Worker] transient intake data expired', { expiredPayloads, oldReservations })
+    }
+  } catch (e: unknown) {
+    logger.error('[Worker] intake retention sweep failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
+    })
+  }
+
+  try {
+    const retention = await processRetentionMaintenance(db, 10)
+    if (retention.notices > 0 || retention.deletions > 0 || retention.failed > 0) {
+      logger.info('[Worker] review retention maintenance', {
+        notices: retention.notices,
+        deletions: retention.deletions,
+        failed: retention.failed,
+      })
+    }
+  } catch (e: unknown) {
+    logger.error('[Worker] review retention maintenance failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
     })
   }
 

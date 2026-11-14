@@ -29,6 +29,8 @@ const statusesSrc = () => readFileSync(new URL('../lib/statuses.ts', import.meta
 const sendSrc = () => readFileSync(new URL('../lib/whatsapp/send.ts', import.meta.url), 'utf8')
 const sqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261010120000_whatsapp_onboarding_v1.sql', import.meta.url), 'utf8')
+const atomicWebhookSqlSrc = () => readFileSync(
+  new URL('../supabase/migrations/20261112130000_atomic_webhook_claims.sql', import.meta.url), 'utf8')
 const lifecycleSqlSrc = () => readFileSync(
   new URL('../supabase/migrations/20261011000000_phase1_status_lifecycle.sql', import.meta.url), 'utf8')
 const p2SqlSrc = () => readFileSync(
@@ -311,7 +313,7 @@ test('D2 typed status enums match the DB CHECK constraints exactly', () => {
   for (const s of ['collecting', 'ready', 'processing', 'completed', 'needs_review', 'failed', 'cancelled']) {
     assert.ok(list('BATCH_STATUSES').includes(s), `canonical batch state ${s} missing`)
   }
-  for (const s of list('INTAKE_STATUSES')) assert.ok(sqlSrc().includes(`'${s}'`), `intake status ${s} missing from SQL`)
+  for (const s of list('INTAKE_STATUSES')) assert.ok((sqlSrc() + atomicWebhookSqlSrc()).includes(`'${s}'`), `intake status ${s} missing from SQL`)
   for (const s of list('CONVERSATION_STATES')) {
     // The state set is authoritative in phase2, then widened by later additive
     // migrations (the review-edit sub-state). Accept a state from EITHER so the
@@ -1062,7 +1064,7 @@ test('H1d a config failure settles the intake as final, notifies once, and never
   const start = src.indexOf('if (isEncryptionConfigFailure(e))')
   assert.ok(start > 0, 'the config-failure branch must exist in handleSingleMessage')
   const branch = src.slice(start, src.indexOf('await markIntakeFailed'))
-  assert.ok(branch.includes("markIntakeAccepted(db, providerMessageId, 'ENCRYPTION_CONFIG')"),
+  assert.ok(branch.includes("markIntakeAccepted(db, providerMessageId, claimToken, 'ENCRYPTION_CONFIG')"),
     'accepted as final with a stable sanitized audit code (no 503 -> no Meta redelivery loop)')
   assert.ok(branch.includes("return 'processed'"), 'never returns retryable for a permanent config fault')
   assert.ok(branch.includes('sendText(message.from'), 'the sender gets a truthful actionable reply')
@@ -1310,7 +1312,7 @@ test('I10 intake persists the validated MIME and never loosens the transport', (
 test('I11 storage-config rejection settles final, never loops, stays narrow', () => {
   const src = routeSrc()
   assert.match(src, /isStorageConfigFailure\(e\)/)
-  assert.match(src, /markIntakeAccepted\(db, providerMessageId, 'STORAGE_CONFIG'\)/)
+  assert.match(src, /markIntakeAccepted\(db, providerMessageId, claimToken, 'STORAGE_CONFIG'\)/)
   // The helper only fires on a MIME/"not allowed"-style STORAGE_UPLOAD_ERROR, so
   // transient network and permission failures remain retryable.
   const fnStart = src.indexOf('function isStorageConfigFailure')
@@ -2869,41 +2871,46 @@ test('P24 scanned-PDF fallback: pdf.js receives a COPY so the decrypted media bu
 })
 
 // ---- Daily intake rate limit (abuse / provider-quota guard) --------------
-test('RL1 daily intake guard counts workspace invoices, excludes this file, honors the cap', async () => {
-  const seen = []
-  const db = fakeDb(({ table, verb, filters }) => {
-    if (table === 'invoices' && verb === 'count') {
-      seen.push(filters)
-      const isTarget = filters.find((f) => f.eq && f.eq[0] === 'workspace_id')?.eq[1] === 'ws'
-      return { count: isTarget ? 5 : 0, error: null }
-    }
-    return { data: [], count: 0, error: null }
+test('RL1 daily intake guard uses idempotent atomic PostgreSQL reservations', async () => {
+  const calls = []
+  const db = { rpc: async (name, args) => {
+    calls.push({ name, args })
+    return { data: true, error: null }
+  } }
+  const first = await intakeMod.reserveDailyIntake(db, {
+    providerMessageId: 'wamid.1', workspaceId: 'ws', senderHmac: 'sender-hmac', limit: 5,
   })
-  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 10, objectPath: 'p' }), false, 'under the cap -> allowed')
-  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 5, objectPath: 'p' }), true, 'at the cap -> blocked')
-  const f = seen[0]
-  assert.ok(f.some((x) => x.neq && x.neq[0] === 'file_object_path'), 'excludes this file so a Meta retry is not double-counted')
-  assert.ok(f.some((x) => x.gte && x.gte[0] === 'received_at'), 'bounds the count to the current UTC day')
+  const retry = await intakeMod.reserveDailyIntake(db, {
+    providerMessageId: 'wamid.1', workspaceId: 'ws', senderHmac: 'sender-hmac', limit: 5,
+  })
+  assert.deepEqual(first, { allowed: true, scopeKey: 'workspace:ws' })
+  assert.deepEqual(retry, first, 'redelivery reuses the same reservation key')
+  assert.ok(calls.every((call) => call.name === 'reserve_whatsapp_daily_intake'))
+  assert.ok(calls.every((call) => call.args.p_provider_message_id === 'wamid.1'))
+  assert.ok(calls.every((call) => call.args.p_limit === 5))
 })
 
-test('RL2 limit <= 0 disables the guard without a query; a count error throws (never a silent pass)', async () => {
-  let queried = false
-  const db = fakeDb(() => { queried = true; return { count: 9999, error: null } })
-  assert.equal(await intakeMod.isDailyIntakeLimitReached(db, { workspaceId: 'ws', limit: 0, objectPath: 'p' }), false)
-  assert.equal(queried, false, 'a disabled guard must not even read the table')
-  const errDb = fakeDb(() => ({ count: null, error: { message: 'boom' } }))
+test('RL2 quota reserve errors are explicit and a full quota is denied', async () => {
+  const deniedDb = { rpc: async () => ({ data: false, error: null }) }
+  const denied = await intakeMod.reserveDailyIntake(deniedDb, {
+    providerMessageId: 'wamid.full', workspaceId: null, senderHmac: 'sender-hmac', limit: 5,
+  })
+  assert.deepEqual(denied, { allowed: false, scopeKey: 'sender:sender-hmac' })
+  const errDb = { rpc: async () => ({ data: null, error: { message: 'boom' } }) }
   await assert.rejects(
-    () => intakeMod.isDailyIntakeLimitReached(errDb, { workspaceId: 'ws', limit: 10, objectPath: 'p' }),
-    /INTAKE_LIMIT_COUNT_ERROR/,
+    () => intakeMod.reserveDailyIntake(errDb, {
+      providerMessageId: 'wamid.error', workspaceId: 'ws', senderHmac: 'sender-hmac', limit: 5,
+    }),
+    /INTAKE_LIMIT_RESERVE_ERROR/,
   )
 })
 
-test('RL3 route.ts enforces the cap before storing/enqueueing, and env + example document it', () => {
+test('RL3 route reserves quota before object storage and intake linkage', () => {
   const r = routeSrc()
-  const call = r.indexOf('await isDailyIntakeLimitReached(db,')
+  const call = r.indexOf('await reserveDailyIntake(db, {', r.indexOf('const objectPath = deriveObjectKey'))
   const enc = r.indexOf('const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath })')
-  assert.ok(call > 0, 'route.ts calls the guard')
-  assert.ok(enc > call, 'the cap is enforced BEFORE the container is encrypted/stored and the job enqueued')
+  assert.ok(call > 0, 'route.ts reserves a quota slot')
+  assert.ok(enc > call, 'the quota is reserved BEFORE the container is encrypted/stored and job enqueued')
   assert.ok(r.includes('const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();'), 'cap read from validated env')
   assert.match(envSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY: z\.coerce\.number\(\)\.int\(\)\.min\(0\)\.default\(200\)/)
   assert.match(envExampleSrc(), /WHATSAPP_MAX_INVOICES_PER_DAY=200/)

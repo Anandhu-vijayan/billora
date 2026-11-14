@@ -44,6 +44,47 @@ async function fetchWithTimeout(url: string, token: string): Promise<Response> {
 // (same families as send.ts): an expired token never becomes valid again.
 const PERMANENT_GRAPH_CODES = new Set([102, 190, 200, 210, 463, 464, 2068])
 
+async function readLimitedBody(response: Response, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel('media exceeds configured size limit')
+    throw new OversizeMediaError(
+      'MEDIA_BODY_TOO_LARGE',
+      `That file is too large for me to process (over ${Math.floor(maxBytes / (1024 * 1024))} MB). Please resend a smaller PDF, JPG or PNG.`,
+    )
+  }
+  if (!response.body) throw new Error('MEDIA_DOWNLOAD_ERROR: response body is missing')
+
+  const reader = response.body.getReader()
+  const chunks: Buffer[] = []
+  let total = 0
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    void reader.cancel('media download timed out')
+  }, FETCH_TIMEOUT_MS)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel('media exceeds configured size limit')
+        throw new OversizeMediaError(
+          'MEDIA_BODY_TOO_LARGE',
+          `That file is too large for me to process (over ${Math.floor(maxBytes / (1024 * 1024))} MB). Please resend a smaller PDF, JPG or PNG.`,
+        )
+      }
+      chunks.push(Buffer.from(value))
+    }
+    if (timedOut) throw new Error('MEDIA_DOWNLOAD_ERROR: body read timed out')
+  } finally {
+    clearTimeout(timeout)
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks, total)
+}
+
 export function isPermanentMediaFailure(error: unknown): boolean {
   return error instanceof Error && error.name === 'MediaPermanentError'
 }
@@ -110,13 +151,14 @@ export async function downloadWhatsAppMedia(args: {
   }
   const fileRes = await fetchWithTimeout(meta.url, accessToken)
   if (!fileRes.ok) {
+    await fileRes.body?.cancel()
     if (fileRes.status === 401 || fileRes.status === 403) {
       throw new MediaPermanentError(`MEDIA_DOWNLOAD_ERROR: HTTP ${fileRes.status} (credential rejected)`)
     }
     throw new Error(`MEDIA_DOWNLOAD_ERROR: HTTP ${fileRes.status}`)
   }
-  const bytes = await fileRes.arrayBuffer()
-  if (bytes.byteLength === 0) throw new Error('MEDIA_DOWNLOAD_ERROR: empty body')
+  const buffer = await readLimitedBody(fileRes, MAX_FILE_BYTES)
+  if (buffer.byteLength === 0) throw new Error('MEDIA_DOWNLOAD_ERROR: empty body')
 
   const mimeType = meta.mime_type || declaredMime || 'application/octet-stream'
   const extension = extensionForMime(mimeType)
@@ -124,11 +166,11 @@ export async function downloadWhatsAppMedia(args: {
   const contentType = contentTypeForMime(headerMime || mimeType, extension)
 
   const downloaded: DownloadedMedia = {
-    buffer: Buffer.from(bytes),
+    buffer,
     mimeType,
     extension,
     contentType,
-    size: bytes.byteLength,
+    size: buffer.byteLength,
   }
   logger.info('[WhatsApp] media downloaded', {
     mimeType: downloaded.mimeType,

@@ -1,11 +1,13 @@
 // lib/whatsapp/intake.ts — durable webhook intake ledger + invoice/job lifecycle.
 // webhook_events is the idempotency + recovery ledger:
-//   received  = row inserted, work not yet durably accepted
+//   received  = legacy/unclaimed row awaiting its first atomic claim
+//   processing = exclusively claimed with a renewable, expiring lease
 //   accepted  = onboarding state + (media: invoice + job rows) persisted
-//   failed    = attempt failed before durable acceptance; Meta retry reprocesses.
-// Only `accepted` suppresses reprocessing. Retries are idempotent.
+//   failed    = attempt failed before durable acceptance; Meta retry can reclaim.
+// Only `accepted` suppresses reprocessing. Claim-token fencing prevents stale writes.
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { IntakeStatus } from '@/lib/statuses'
+import { randomUUID } from 'node:crypto'
 import { logger } from '../logger'
 import { wakeWorker } from '../jobs/wake'
 
@@ -17,49 +19,56 @@ export interface IntakeRow {
   status: IntakeStatus
   attempts: number
   processed_at: string | null
+  claim_expires_at: string | null
+}
+
+const INTAKE_CLAIM_LEASE_SECONDS = 180
+
+type IntakeClaimRpcRow = {
+  claimed: boolean
+  created: boolean
+  event_id: string
+  provider_message_id: string
+  status: IntakeStatus
+  attempts: number
+  processed_at: string | null
+  claim_expires_at: string | null
 }
 
 type Db = SupabaseClient
 
-interface EventRow {
-  insert: (row: Record<string, unknown>) => Promise<{ data: unknown; error: { code?: string; message: string } | null }>
-  select: (cols: string) => unknown
-  update: (patch: Record<string, unknown>) => unknown
-}
-
-function eventsTable(db: Db) {
-  return db.from('webhook_events') as unknown as EventRow
-}
-
-/** Insert-or-read the intake row. Returns the row + whether this delivery created it. */
+/**
+ * Atomic PostgreSQL claim. Only the winning invocation receives its UUID token.
+ * Expired claims can be reclaimed; all later writes are fenced by that token.
+ */
 export async function claimIntakeRow(
   db: Db,
   providerMessageId: string,
-): Promise<{ row: IntakeRow; created: boolean }> {
-  const table = eventsTable(db)
-  const inserted = await table.insert({ provider_message_id: providerMessageId, status: 'received' })
-  if (!inserted.error) {
-    const read = (await (table.select('id,provider_message_id,status,attempts,processed_at') as {
-      eq: (c: string, v: string) => {
-        maybeSingle: () => Promise<{ data: IntakeRow | null; error: { message: string } | null }>
-      }
-    })
-      .eq('provider_message_id', providerMessageId)
-      .maybeSingle())
-    if (read.error || !read.data) throw new Error(`INTAKE_READ_ERROR: ${read.error?.message ?? 'missing row'}`)
-    return { row: read.data, created: true }
+): Promise<{ row: IntakeRow; created: boolean; claimed: boolean; claimToken: string | null }> {
+  const claimToken = randomUUID()
+  const { data, error } = await db.rpc('claim_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_lease_seconds: INTAKE_CLAIM_LEASE_SECONDS,
+  }) as unknown as { data: IntakeClaimRpcRow[] | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_CLAIM_ERROR: ${error.message}`)
+  const result = Array.isArray(data) ? data[0] : null
+  if (!result?.event_id || typeof result.claimed !== 'boolean') {
+    throw new Error('INTAKE_CLAIM_ERROR: database returned an invalid claim result')
   }
-  if (inserted.error.code !== '23505') throw new Error(`INTAKE_INSERT_ERROR: ${inserted.error.message}`)
-  // Duplicate key: read the existing row to decide replay vs retry.
-  const existing = (await (table.select('id,provider_message_id,status,attempts,processed_at') as {
-    eq: (c: string, v: string) => {
-      maybeSingle: () => Promise<{ data: IntakeRow | null; error: { message: string } | null }>
-    }
-  })
-    .eq('provider_message_id', providerMessageId)
-    .maybeSingle())
-  if (existing.error || !existing.data) throw new Error(`INTAKE_READ_ERROR: ${existing.error?.message ?? 'missing row'}`)
-  return { row: existing.data, created: false }
+  return {
+    row: {
+      id: result.event_id,
+      provider_message_id: result.provider_message_id,
+      status: result.status,
+      attempts: result.attempts,
+      processed_at: result.processed_at,
+      claim_expires_at: result.claim_expires_at,
+    },
+    created: result.created,
+    claimed: result.claimed,
+    claimToken: result.claimed ? claimToken : null,
+  }
 }
 
 /** True only when a previous delivery durably accepted this message. */
@@ -68,31 +77,42 @@ export function isDurablyAccepted(row: IntakeRow): boolean {
 }
 
 /**
- * Durably accept the event. `errorCode` accepts a permanent failure as final
- * (recorded for audit) so Meta redelivery is suppressed without a retry loop.
+ * Renew only an unexpired claim. Expired owners cannot resurrect their lease.
  */
-export async function markIntakeAccepted(db: Db, providerMessageId: string, errorCode?: string): Promise<void> {
-  const { error } = (await (eventsTable(db).update({
-    status: 'accepted',
-    processed_at: new Date().toISOString(),
-    last_error_code: errorCode ? errorCode.slice(0, 120) : null,
-  }) as {
-    eq: (c: string, v: string) => Promise<{ error: { message: string } | null }>
-  }).eq('provider_message_id', providerMessageId))
-  if (error) throw new Error(`INTAKE_ACCEPT_ERROR: ${error.message}`)
+export async function renewIntakeClaim(db: Db, providerMessageId: string, claimToken: string): Promise<boolean> {
+  const { data, error } = await db.rpc('renew_whatsapp_webhook_event_claim', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_lease_seconds: INTAKE_CLAIM_LEASE_SECONDS,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_HEARTBEAT_ERROR: ${error.message}`)
+  return data === true
 }
 
-export async function markIntakeFailed(db: Db, providerMessageId: string, code: string): Promise<void> {
-  const current = await claimIntakeRow(db, providerMessageId).catch(() => null)
-  const attempts = (current?.row.attempts ?? 0) + 1
-  const { error } = (await (eventsTable(db).update({
-    status: 'failed',
-    attempts,
-    last_error_code: code.slice(0, 120),
-  }) as {
-    eq: (c: string, v: string) => Promise<{ error: { message: string } | null }>
-  }).eq('provider_message_id', providerMessageId))
+/** Complete only while this invocation owns the current, unexpired lease. */
+export async function markIntakeAccepted(
+  db: Db, providerMessageId: string, claimToken: string, errorCode?: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('complete_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_error_code: errorCode ? errorCode.slice(0, 120) : null,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`INTAKE_ACCEPT_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_CLAIM_LOST: event claim expired or belongs to another invocation')
+}
+
+/** Fail only while this invocation owns the current, unexpired lease. */
+export async function markIntakeFailed(
+  db: Db, providerMessageId: string, claimToken: string, code: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('fail_whatsapp_webhook_event', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+    p_error_code: code.slice(0, 120),
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
   if (error) throw new Error(`INTAKE_FAIL_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_CLAIM_LOST: event claim expired or belongs to another invocation')
 }
 
 /**
@@ -187,31 +207,83 @@ export async function recordMediaIntake(
   return { invoiceId, jobId, invoicePreexisting, jobPreexisting }
 }
 
+export interface DailyIntakeReservation {
+  allowed: boolean
+  scopeKey: string
+}
+
 /**
- * Abuse / provider-quota guard: has this workspace already filed `limit` NEW
- * invoices in the current UTC day? Enforced at intake, BEFORE any extraction
- * job is created, because the job is what actually spends (gated) Gemini quota
- * and OCR/storage. `limit <= 0` disables the guard. A webhook redelivery of
- * THIS objectPath is excluded from the count, so a Meta retry of a file that
- * already took its slot is never falsely rejected (recordMediaIntake dedups it
- * downstream anyway). Throws on a count failure — a silent pass would defeat
- * the whole point of the guard.
+ * Atomically reserve a workspace/day slot, or a sender/day slot while the
+ * workspace is still unknown. Reservations are keyed by provider message ID,
+ * so delivery retries reuse their original slot instead of racing a count.
  */
-export async function isDailyIntakeLimitReached(
+export async function reserveDailyIntake(
   db: Db,
-  args: { workspaceId: string; limit: number; objectPath: string },
-): Promise<boolean> {
-  if (!Number.isFinite(args.limit) || args.limit <= 0) return false
-  const dayStart = new Date()
-  dayStart.setUTCHours(0, 0, 0, 0)
-  const { count, error } = await db
-    .from('invoices')
-    .select('id', { count: 'exact', head: true })
-    .eq('workspace_id', args.workspaceId)
-    .gte('received_at', dayStart.toISOString())
-    .neq('file_object_path', args.objectPath)
-  if (error) throw new Error(`INTAKE_LIMIT_COUNT_ERROR: ${error.message}`)
-  return (count ?? 0) >= args.limit
+  args: {
+    providerMessageId: string
+    workspaceId: string | null
+    senderHmac: string
+    limit: number
+  },
+): Promise<DailyIntakeReservation> {
+  const scopeKey = args.workspaceId ? `workspace:${args.workspaceId}` : `sender:${args.senderHmac}`
+  const { data, error } = await db.rpc('reserve_whatsapp_daily_intake', {
+    p_provider_message_id: args.providerMessageId,
+    p_scope_key: scopeKey,
+    p_limit: args.limit,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RESERVE_ERROR: ${error.message}`)
+  return { allowed: data === true, scopeKey }
+}
+
+export async function commitDailyIntake(
+  db: Db, providerMessageId: string, scopeKey: string,
+): Promise<void> {
+  const { data, error } = await db.rpc('commit_whatsapp_daily_intake', {
+    p_provider_message_id: providerMessageId,
+    p_scope_key: scopeKey,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_COMMIT_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_LIMIT_COMMIT_ERROR: reservation not found')
+}
+
+export async function releaseDailyIntake(db: Db, providerMessageId: string): Promise<void> {
+  const { error } = await db.rpc('release_whatsapp_daily_intake', {
+    p_provider_message_id: providerMessageId,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RELEASE_ERROR: ${error.message}`)
+}
+
+export async function releaseDailyIntakeScope(
+  db: Db, providerMessageId: string, scopeKey: string,
+): Promise<void> {
+  const { error } = await db.rpc('release_whatsapp_daily_intake_scope', {
+    p_provider_message_id: providerMessageId,
+    p_scope_key: scopeKey,
+  })
+  if (error) throw new Error(`INTAKE_LIMIT_RELEASE_ERROR: ${error.message}`)
+}
+
+export async function beginStorageIntake(
+  db: Db, args: { providerMessageId: string; objectPath: string; kind: 'invoice' | 'pending' },
+): Promise<void> {
+  const { error } = await db.rpc('begin_whatsapp_intake_storage', {
+    p_provider_message_id: args.providerMessageId,
+    p_object_path: args.objectPath,
+    p_object_kind: args.kind,
+  })
+  if (error) throw new Error(`INTAKE_STORAGE_TRACK_ERROR: ${error.message}`)
+}
+
+export async function markStorageIntake(
+  db: Db, objectPath: string, state: 'uploaded' | 'linked',
+): Promise<void> {
+  const { data, error } = await db.rpc('mark_whatsapp_intake_storage', {
+    p_object_path: objectPath,
+    p_state: state,
+  })
+  if (error) throw new Error(`INTAKE_STORAGE_STATE_ERROR: ${error.message}`)
+  if (data !== true) throw new Error('INTAKE_STORAGE_STATE_ERROR: intake ledger row missing')
 }
 
 /**
@@ -298,6 +370,7 @@ export async function recordPendingUpload(
     fileSha256Hex: string | null
     sizeBytes: number
     providerMediaId: string | null
+    providerMessageId: string
     keyVersion?: string | null
   },
 ): Promise<string> {
@@ -310,6 +383,7 @@ export async function recordPendingUpload(
     size_bytes: args.sizeBytes,
     file_encryption_key_version: args.keyVersion ?? null,
     provider_media_id: args.providerMediaId,
+    provider_message_id: args.providerMessageId,
   }, { onConflict: 'object_path' }).select('id').single() as unknown as { data: { id: string } | null; error: { message: string } | null })
   if (row.error || !row.data) throw new Error(`PENDING_UPLOAD_RECORD_ERROR: ${row.error?.message ?? 'missing id'}`)
   return row.data.id
@@ -334,11 +408,11 @@ export async function countWaitingUploads(db: Db, senderHmac: string): Promise<n
 export async function assignPendingUploads(
   db: Db,
   senderHmac: string,
-  args: { workspaceId: string; clientId: string | null },
+  args: { workspaceId: string; clientId: string | null; limit: number },
 ): Promise<number> {
   const { data: rows, error } = await db
     .from('pending_uploads')
-    .select('id,object_path,original_file_name,content_type,file_sha256,size_bytes,file_encryption_key_version')
+    .select('id,object_path,original_file_name,content_type,file_sha256,size_bytes,file_encryption_key_version,provider_message_id')
     .eq('sender_hmac', senderHmac)
     .eq('status', 'waiting_assignment')
     .order('created_at')
@@ -347,12 +421,23 @@ export async function assignPendingUploads(
   for (const row of (rows ?? []) as Array<{
     id: string; object_path: string; original_file_name: string | null;
     content_type: string; file_sha256: string | null;
-    size_bytes: number | null; file_encryption_key_version: string | null
+    size_bytes: number | null; file_encryption_key_version: string | null;
+    provider_message_id: string | null
   }>) {
+    const providerMessageId = row.provider_message_id ?? `legacy-pending:${row.id}`
+    const reservation = await reserveDailyIntake(db, {
+      providerMessageId, workspaceId: args.workspaceId, senderHmac, limit: args.limit,
+    })
+    if (!reservation.allowed) {
+      logger.warn('[Intake] held upload assignment deferred by daily quota', {
+        pendingId: row.id.slice(0, 8), workspaceId: args.workspaceId.slice(0, 8),
+      })
+      continue
+    }
     const shaHex = typeof row.file_sha256 === 'string'
       ? row.file_sha256.replace(/^\\x/i, '')
       : null
-    const { invoiceId } = await recordMediaIntake(db, {
+    const recorded = await recordMediaIntake(db, {
       workspaceId: args.workspaceId,
       clientId: args.clientId,
       objectPath: row.object_path,
@@ -362,9 +447,14 @@ export async function assignPendingUploads(
       keyVersion: row.file_encryption_key_version,
       sizeBytes: row.size_bytes,
     })
+    await commitDailyIntake(db, providerMessageId, reservation.scopeKey)
+    await markStorageIntake(db, row.object_path, 'linked')
+    if (reservation.scopeKey !== `sender:${senderHmac}`) {
+      await releaseDailyIntakeScope(db, providerMessageId, `sender:${senderHmac}`)
+    }
     const { error: updateError } = await db
       .from('pending_uploads')
-      .update({ status: 'assigned', assigned_invoice_id: invoiceId, updated_at: new Date().toISOString() })
+      .update({ status: 'assigned', assigned_invoice_id: recorded.invoiceId, updated_at: new Date().toISOString() })
       .eq('id', row.id)
       .eq('status', 'waiting_assignment')
     if (updateError) throw new Error(`PENDING_UPLOAD_ASSIGN_ERROR: ${updateError.message}`)

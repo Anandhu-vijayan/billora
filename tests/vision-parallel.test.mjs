@@ -43,10 +43,11 @@ test('P2-11 an unused speculative call cannot raise an unhandled rejection', () 
   assert.match(extractor(), /speculativeAi\.catch\(\(\) => undefined\)/)
 })
 
-test('P2-11 the V6 Gemini-payload invariant still holds (exactly two vision copies)', () => {
+test('P2-11 the Gemini image-preparation invariant still holds (one shared first-pass preparation)', () => {
   const src = extractor()
-  // One in runVisionFirstPass (the shared first pass), one in the bounded retry.
-  assert.equal((src.match(/prepareImageForVision\(buffer\)/g) ?? []).length, 2, 'first and second AI pass only')
+  // Only the shared first pass normalizes the full source image. The bounded retry
+  // sends either the original document or a targeted crop directly to the vision helper.
+  assert.equal((src.match(/prepareImageForVision\(buffer\)/g) ?? []).length, 1, 'one normalization site shared by speculative and non-speculative first pass')
   assert.ok(/async function runVisionFirstPass/.test(src), 'first pass is factored into a helper')
   assert.ok(!/buffer: normalized,\s*mimeType: 'image\/png'/.test(src), 'the OCR PNG is still never sent to Gemini')
 })
