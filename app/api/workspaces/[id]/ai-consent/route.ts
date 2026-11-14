@@ -5,6 +5,7 @@ import {
   GEMINI_WORKSPACE_CONSENT_NOTICE,
   GEMINI_WORKSPACE_CONSENT_VERSION,
 } from '@/lib/privacy/ai-consent'
+import { appendWorkspaceConsentAudit } from '@/lib/privacy/consent-audit'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -104,6 +105,20 @@ export async function PUT(
     logger.error('[WorkspacePrivacy] consent update failed', { code: error.code ?? null })
     return response(500, 'WORKSPACE_PRIVACY_UNAVAILABLE')
   }
+  try {
+    await appendWorkspaceConsentAudit(
+      result.db,
+      id,
+      result.userId,
+      'enabled',
+      GEMINI_WORKSPACE_CONSENT_VERSION,
+      { source: 'workspace-ai-consent' },
+    )
+  } catch (auditError) {
+    logger.error('[WorkspacePrivacy] consent audit append failed', {
+      error: auditError instanceof Error ? auditError.message : String(auditError),
+    })
+  }
   return NextResponse.json({ ok: true, enabled: true }, { headers })
 }
 
@@ -130,6 +145,20 @@ export async function DELETE(
   if (error) {
     logger.error('[WorkspacePrivacy] consent withdrawal failed', { code: error.code ?? null })
     return response(500, 'WORKSPACE_PRIVACY_UNAVAILABLE')
+  }
+  try {
+    await appendWorkspaceConsentAudit(
+      result.db,
+      id,
+      result.userId,
+      'withdrawn',
+      GEMINI_WORKSPACE_CONSENT_VERSION,
+      { source: 'workspace-ai-consent' },
+    )
+  } catch (auditError) {
+    logger.error('[WorkspacePrivacy] consent withdrawal audit append failed', {
+      error: auditError instanceof Error ? auditError.message : String(auditError),
+    })
   }
   return NextResponse.json({ ok: true, enabled: false }, { headers })
 }

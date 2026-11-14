@@ -124,15 +124,52 @@ function appOrigin(): string {
   return url.origin
 }
 
+export async function claimReplayableWebhookMessages(
+  db: Db,
+  limit = 1,
+): Promise<Array<ReplayRow & { claim_token: string }>> {
+  const { data, error } = await db.rpc('claim_replayable_whatsapp_payloads', {
+    p_limit: Math.min(Math.max(Math.trunc(limit), 1), 10),
+    p_lease_seconds: 300,
+  }) as unknown as {
+    data: Array<ReplayRow & { claim_token: string }> | null
+    error: { message: string } | null
+  }
+  if (error) throw new Error(`WEBHOOK_REPLAY_CLAIM_ERROR: ${error.message}`)
+  return data ?? []
+}
+
+export async function finishReplayableWebhookMessage(
+  db: Db,
+  providerMessageId: string,
+  claimToken: string,
+): Promise<boolean> {
+  const { data, error } = await db.rpc('finish_replayable_whatsapp_payload', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`WEBHOOK_REPLAY_FINISH_ERROR: ${error.message}`)
+  return data === true
+}
+
+export async function releaseReplayableWebhookMessage(
+  db: Db,
+  providerMessageId: string,
+  claimToken: string,
+): Promise<boolean> {
+  const { data, error } = await db.rpc('release_replayable_whatsapp_payload', {
+    p_provider_message_id: providerMessageId,
+    p_claim_token: claimToken,
+  }) as unknown as { data: boolean | null; error: { message: string } | null }
+  if (error) throw new Error(`WEBHOOK_REPLAY_RELEASE_ERROR: ${error.message}`)
+  return data === true
+}
+
 export async function replayPendingWebhookMessages(
   db: Db,
   limit = 1,
 ): Promise<{ attempted: number; accepted: number; deferred: number }> {
-  const { data, error } = await db.rpc('list_replayable_whatsapp_payloads', {
-    p_limit: Math.min(Math.max(Math.trunc(limit), 1), 10),
-  })
-  if (error) throw new Error(`WEBHOOK_REPLAY_LIST_ERROR: ${error.message}`)
-  const rows = (data ?? []) as ReplayRow[]
+  const rows = await claimReplayableWebhookMessages(db, limit)
   if (rows.length === 0) return { attempted: 0, accepted: 0, deferred: 0 }
 
   const appSecret = process.env.WHATSAPP_APP_SECRET
@@ -166,6 +203,7 @@ export async function replayPendingWebhookMessages(
         signal: AbortSignal.timeout(REPLAY_TIMEOUT_MS),
       })
       if (!response.ok) {
+        await releaseReplayableWebhookMessage(db, row.provider_message_id, row.claim_token)
         deferred += 1
         logger.warn('[WebhookInbox] replay deferred', {
           status: response.status,
@@ -173,8 +211,11 @@ export async function replayPendingWebhookMessages(
         })
         continue
       }
-      accepted += 1
+      const completed = await finishReplayableWebhookMessage(db, row.provider_message_id, row.claim_token)
+      if (completed) accepted += 1
+      else deferred += 1
     } catch (error) {
+      await releaseReplayableWebhookMessage(db, row.provider_message_id, row.claim_token).catch(() => undefined)
       deferred += 1
       logger.error('[WebhookInbox] replay failed', {
         eventState: row.event_status,

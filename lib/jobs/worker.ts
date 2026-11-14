@@ -29,6 +29,7 @@ import {
   purgeOldIntakeQuotaHistory, reconcileOrphanedIntakeObjects, recoverStaleIntakeReservations,
 } from '@/lib/whatsapp/intake-reconciliation'
 import { purgeExpiredWebhookPayloads } from '@/lib/whatsapp/webhook-inbox'
+import { processRetentionMaintenance } from '@/lib/retention'
 
 type Db = SupabaseClient
 
@@ -348,6 +349,21 @@ export async function runWorkerTick(
     }
   } catch (e: unknown) {
     logger.error('[Worker] intake retention sweep failed', {
+      error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
+    })
+  }
+
+  try {
+    const retention = await processRetentionMaintenance(db, 10)
+    if (retention.notices > 0 || retention.deletions > 0 || retention.failed > 0) {
+      logger.info('[Worker] review retention maintenance', {
+        notices: retention.notices,
+        deletions: retention.deletions,
+        failed: retention.failed,
+      })
+    }
+  } catch (e: unknown) {
+    logger.error('[Worker] review retention maintenance failed', {
       error: e instanceof Error ? e.message.split(':')[0] : 'UNKNOWN',
     })
   }

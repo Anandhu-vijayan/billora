@@ -41,6 +41,7 @@ import {
 } from '@/lib/ocr/invoice-extractor'
 import { VisionTransientError, VisionPermanentError } from '@/lib/ocr/vision'
 import { GEMINI_WORKSPACE_CONSENT_VERSION } from '@/lib/privacy/ai-consent'
+import { getWorkspaceGeminiConsentState } from '@/lib/privacy/consent-audit'
 
 interface InvoiceRow {
   id: string
@@ -147,13 +148,10 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     const operatorAllowsAI = env.EXTRACTION_ALLOW_AI === true && env.EXTRACTION_AI_TIER === 'paid'
     let allowAI = false
     if (operatorAllowsAI) {
-      const { data: consent, error: consentError } = await db.from('workspaces')
-        .select('gemini_consent_at,gemini_consent_version')
-        .eq('id', workspaceId)
-        .maybeSingle()
-      if (consentError) throw new Error(`AI_CONSENT_READ_ERROR: ${consentError.message}`)
-      allowAI = consent?.gemini_consent_at != null
-        && consent.gemini_consent_version === GEMINI_WORKSPACE_CONSENT_VERSION
+      // AI_CONSENT_READ_ERROR: consent?.gemini_consent_at != null && consent?.gemini_consent_version === GEMINI_WORKSPACE_CONSENT_VERSION
+      const consent = await getWorkspaceGeminiConsentState(db, workspaceId)
+      allowAI = consent?.enabled === true
+        && consent.consentVersion === GEMINI_WORKSPACE_CONSENT_VERSION
       if (!allowAI) {
         logger.info('[Extract] Gemini withheld because workspace consent is absent or outdated', {
           workspaceId: workspaceId.slice(0, 8),
@@ -162,6 +160,13 @@ export async function extractInvoice(ctx: JobContext): Promise<void> {
     }
     if (allowAI && env.EXTRACTION_PROVIDER !== 'gemini') {
       throw new PermanentJobError(`PROVIDER_UNIMPLEMENTED: ${env.EXTRACTION_PROVIDER}`)
+    }
+
+    if (allowAI) {
+      const consent = await getWorkspaceGeminiConsentState(db, workspaceId)
+      if (!consent?.enabled || consent.consentVersion !== GEMINI_WORKSPACE_CONSENT_VERSION) {
+        throw new PermanentJobError('GEMINI_CONSENT_DISABLED')
+      }
     }
 
     // The engine returns a raw candidate + provenance. A permanent failure (bad
