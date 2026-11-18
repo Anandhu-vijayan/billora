@@ -21,7 +21,8 @@ import {
 import {
   claimIntakeRow, isDurablyAccepted, markIntakeAccepted, markIntakeFailed, renewIntakeClaim,
   recordMediaIntake, recordPendingUpload, countWaitingUploads, assignPendingUploads,
-  isDailyIntakeLimitReached, findLiveInvoiceByFileHash,
+  reserveDailyIntake, commitDailyIntake, beginStorageIntake, markStorageIntake,
+  findLiveInvoiceByFileHash,
 } from '@/lib/whatsapp/intake';
 import {
   ensureBatchRegisters, collectFinalizeState, composeDoneMessage, composeReviewMessage,
@@ -39,6 +40,10 @@ import { setProactiveConsent, loadProactiveIdentity, openWaId } from '@/lib/what
 import { suggestOwnGstin } from '@/lib/invoices/own-gstin-suggest';
 import { deliverWorkbookToWhatsApp } from '@/lib/exports/deliver';
 import { flushPendingDeliveries } from '@/lib/jobs/handlers/deliver-register';
+import { storeReplayableWebhookMessage } from '@/lib/whatsapp/webhook-inbox';
+
+const WEBHOOK_BODY_MAX_BYTES = 1024 * 1024;
+export const maxDuration = 60;
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -150,7 +155,9 @@ async function handleOnboardingSideEffects(
     workspaceId = await ensureIndividualWorkspace(db, hmac);
     result.workspaceId = workspaceId;
     // Individuals carry no client ambiguity: file held uploads immediately.
-    assignedNow = await assignPendingUploads(db, hmac, { workspaceId, clientId: null });
+    assignedNow = await assignPendingUploads(db, hmac, {
+      workspaceId, clientId: null, limit: getEnv().WHATSAPP_MAX_INVOICES_PER_DAY,
+    });
   } else if (result.note.startsWith('org-name:')) {
     const ensured = await ensureOrganizationWorkspace(db, hmac, result.note.slice(9));
     workspaceId = ensured.workspaceId;
@@ -178,7 +185,9 @@ async function handleOnboardingSideEffects(
     } else {
       clientId = pendingClientId;
       result.clientId = clientId;
-      assignedNow = await assignPendingUploads(db, hmac, { workspaceId, clientId });
+      assignedNow = await assignPendingUploads(db, hmac, {
+        workspaceId, clientId, limit: getEnv().WHATSAPP_MAX_INVOICES_PER_DAY,
+      });
       pendingClientId = null;
     }
   } else if (result.note === 'pending-confirm-no') {
@@ -680,7 +689,11 @@ async function handleOnboardingSideEffects(
 
 export async function POST(request: Request) {
   try {
-    const rawText = await request.text();
+    const body = await readRequestBodyLimited(request, WEBHOOK_BODY_MAX_BYTES);
+    if (!body) {
+      return NextResponse.json({ status: 'SKIPPED_EMPTY_BODY' }, { status: 200 });
+    }
+    const rawText = body.toString('utf8');
     if (!rawText || rawText.trim().length === 0) {
       return NextResponse.json({ status: 'SKIPPED_EMPTY_BODY' }, { status: 200 });
     }
@@ -726,12 +739,46 @@ export async function POST(request: Request) {
       return NextResponse.json({ status: 'SKIPPED_STATUS_UPDATE' }, { status: 200 });
     }
     const db = getSupabaseAdmin();
+    // Persist every normalized message before claiming or doing synchronous
+    // intake work. The worker can replay these encrypted envelopes if this
+    // invocation dies and Meta does not redeliver the webhook.
+    for (const message of messages) {
+      if (!message?.id) continue;
+      await storeReplayableWebhookMessage(db, message.id, { ...message, id: message.id });
+    }
     // Process EVERY message in the delivery: a 503 makes Meta redeliver the
     // whole payload and the intake ledger skips messages already accepted.
     let retryable = false;
     for (const message of messages) {
       if (!message?.id) continue;
       if (await handleSingleMessage(db, message) === 'retryable') retryable = true;
+    }
+
+    async function readRequestBodyLimited(request: Request, maxBytes: number): Promise<Buffer | null> {
+      const declaredLength = Number(request.headers.get('content-length'))
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error('WEBHOOK_BODY_TOO_LARGE')
+      }
+      if (!request.body) return null
+
+      const reader = request.body.getReader()
+      const chunks: Buffer[] = []
+      let total = 0
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          total += value.byteLength
+          if (total > maxBytes) {
+            await reader.cancel('webhook body exceeds limit')
+            throw new Error('WEBHOOK_BODY_TOO_LARGE')
+          }
+          chunks.push(Buffer.from(value))
+        }
+      } finally {
+        reader.releaseLock()
+      }
+      return total === 0 ? null : Buffer.concat(chunks, total)
     }
     if (retryable) {
       return NextResponse.json({ status: 'RETRYABLE_PROCESSING_ERROR' }, { status: 503 });
@@ -1068,8 +1115,23 @@ async function processMessage(
   // Deterministic private hold path: redelivery of the same provider media id
   // resolves to the same opaque object + upserts the same row — never a
   // duplicate hold, and never collides with an unrelated file.
-  const holdMedia = async (): Promise<string> => {
+  const holdMedia = async (): Promise<string | null> => {
     const pendingPath = deriveObjectKey('pending', mediaId, pathKeyHex);
+    const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();
+    const reservation = await reserveDailyIntake(db, {
+      providerMessageId,
+      workspaceId,
+      senderHmac: mHmac,
+      limit: WHATSAPP_MAX_INVOICES_PER_DAY,
+    });
+    if (!reservation.allowed) {
+      logger.info('[WhatsApp] held media blocked: daily intake limit reached', {
+        shortId, limit: WHATSAPP_MAX_INVOICES_PER_DAY,
+      });
+      await sendText(message.from!, `You've reached today's limit of ${WHATSAPP_MAX_INVOICES_PER_DAY} invoices. Please try again tomorrow.`);
+      return null;
+    }
+    await beginStorageIntake(db, { providerMessageId, objectPath: pendingPath, kind: 'pending' });
     const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: pendingPath });
     const { error: pendingUploadError } = await db.storage.from(invoiceBucket)
       .upload(pendingPath, enc.container, {
@@ -1077,17 +1139,20 @@ async function processMessage(
         metadata: { original_mime: validated.mime, original_extension: validated.extension },
       });
     if (pendingUploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${pendingUploadError.message}`);
+    await markStorageIntake(db, pendingPath, 'uploaded');
     await recordPendingUpload(db, {
       senderHmac: mHmac, objectPath: pendingPath, originalFileName: media?.filename ?? null,
       contentType: downloaded.contentType, fileSha256Hex: sha256Hex,
-      sizeBytes: enc.sizeBytes, providerMediaId: mediaId, keyVersion: enc.keyVersion,
+      sizeBytes: enc.sizeBytes, providerMediaId: mediaId, providerMessageId, keyVersion: enc.keyVersion,
     });
+    await commitDailyIntake(db, providerMessageId, reservation.scopeKey);
+    await markStorageIntake(db, pendingPath, 'linked');
     return pendingPath;
   };
 
   if (!workspaceId) {
     // Account type unknown: preserve the file, then continue/ask setup.
-    await holdMedia();
+    if (!(await holdMedia())) return;
     if (mSession.state === 'awaiting_account_type') {
       await sendText(message.from, 'I saved that invoice safely. Finish setup above — pick Individual or Organization — and I will file it automatically.');
     } else {
@@ -1100,7 +1165,7 @@ async function processMessage(
   const accountType = await loadAccountType(db, mHmac);
   if (accountType === 'organization' && !clientId) {
     // Client unresolved: hold and ask. NEVER guess a client.
-    await holdMedia();
+    if (!(await holdMedia())) return;
     await saveSession(db, mHmac, mSession.last_provider_message_id, {
       state: 'awaiting_client_select', workspace_id: workspaceId, client_id: clientId,
       batch_id: mSession.batch_id, pending_client_id: mSession.pending_client_id,
@@ -1140,17 +1205,17 @@ async function processMessage(
     return;
   }
   const objectPath = deriveObjectKey('invoices', mediaId, pathKeyHex);
-  // Abuse / provider-quota guard, enforced here — before the extraction job is
-  // created — because that job is what spends (gated) Gemini quota plus OCR and
-  // storage. The daily cap is workspace-scoped and env-configurable; a redelivery
-  // of an already-stored file is excluded from the count so Meta retries stay
-  // idempotent. Limit <= 0 disables the guard.
   const { WHATSAPP_MAX_INVOICES_PER_DAY } = getEnv();
-  if (await isDailyIntakeLimitReached(db, { workspaceId, limit: WHATSAPP_MAX_INVOICES_PER_DAY, objectPath })) {
+  const reservation = await reserveDailyIntake(db, {
+    providerMessageId, workspaceId, senderHmac: mHmac,
+    limit: WHATSAPP_MAX_INVOICES_PER_DAY,
+  });
+  if (!reservation.allowed) {
     logger.info('[WhatsApp] media intake blocked: daily invoice limit reached', { shortId, limit: WHATSAPP_MAX_INVOICES_PER_DAY });
     await sendText(message.from, `You've reached today's limit of ${WHATSAPP_MAX_INVOICES_PER_DAY} invoices. Please try again tomorrow — anything you already sent is safe and still processing.`);
     return;
   }
+  await beginStorageIntake(db, { providerMessageId, objectPath, kind: 'invoice' });
   const enc = encryptFile(downloaded.buffer, masterKeyHex, { context: objectPath });
   const { error: uploadError } = await db.storage.from(invoiceBucket)
     .upload(objectPath, enc.container, {
@@ -1158,11 +1223,14 @@ async function processMessage(
       metadata: { original_mime: validated.mime, original_extension: validated.extension },
     });
   if (uploadError) throw new Error(`STORAGE_UPLOAD_ERROR: ${uploadError.message}`);
-  const recorded = await recordMediaIntake(db, {
+    await markStorageIntake(db, objectPath, 'uploaded');
+    const recorded = await recordMediaIntake(db, {
     workspaceId, clientId, objectPath,
     originalFileName: media?.filename ?? null, contentType: downloaded.contentType,
     fileSha256Hex: sha256Hex, keyVersion: enc.keyVersion, sizeBytes: enc.sizeBytes,
   });
+  await commitDailyIntake(db, providerMessageId, reservation.scopeKey);
+  await markStorageIntake(db, objectPath, 'linked');
   const waiting = await countWaitingUploads(db, mHmac).catch(() => 0);
   const deduped = recorded.invoicePreexisting || recorded.jobPreexisting;
   logger.info('[WhatsApp] media intake recorded', {
@@ -1205,4 +1273,3 @@ function isStorageConfigFailure(error: unknown): boolean {
   return /(mime|content[ -]?type|file type)/i.test(message)
     && /(not allowed|not supported|unsupported)/i.test(message);
 }
-
