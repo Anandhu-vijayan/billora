@@ -130,6 +130,31 @@ export async function POST(req: Request): Promise<Response> {
     })
 
     const sha256Hex = createHash('sha256').update(plain).digest('hex')
+
+    // Exact-file duplicate guard: the random storage object key below must not
+    // allow the same bytes to be ingested twice into the test workspace.
+    const { data: duplicate, error: duplicateError } = await db
+      .from('invoices')
+      .select('id,status')
+      .eq('workspace_id', workspaceId)
+      .eq('file_sha256', `\\x${sha256Hex}`)
+      .neq('status', 'deleted')
+      .limit(1)
+      .maybeSingle()
+
+    if (duplicateError) {
+      console.error('[TestUpload] duplicate lookup failed', { code: duplicateError.code ?? 'unknown' })
+      return fail(503, 'DUPLICATE_CHECK_UNAVAILABLE')
+    }
+    if (duplicate) {
+      return NextResponse.json({
+        ok: false,
+        error: { code: 'DUPLICATE_FILE' },
+        existingInvoiceId: duplicate.id,
+        existingInvoiceStatus: duplicate.status,
+      }, { status: 409, headers: { 'Cache-Control': 'no-store' } })
+    }
+
     const { masterKeyHex } = resolveFileKeyConfig()
 
     // Random per-upload object key: no caller-controlled storage paths.
@@ -146,7 +171,7 @@ export async function POST(req: Request): Promise<Response> {
       .upload(objectPath, encrypted, {
         contentType: 'application/octet-stream',
         upsert: false,
-        cacheControl: 'private, max-age=0',
+        cacheControl: '0',
       })
 
     if (uploadError) {
