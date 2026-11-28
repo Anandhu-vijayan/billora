@@ -20,7 +20,7 @@ if (!fs.existsSync(manifestPath)) {
   throw new Error("fixtures.json is missing. Run the fixture discovery step first.");
 }
 
-const fixtures = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+const fixtures = JSON.parse(fs.readFileSync(manifestPath, "utf8").replace(/^\uFEFF/, ""));
 
 if (!Array.isArray(fixtures) || fixtures.length !== 5) {
   throw new Error(`Expected exactly 5 fixtures; found ${fixtures?.length ?? 0}.`);
